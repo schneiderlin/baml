@@ -202,7 +202,7 @@ function ai.Agent.Runner<Out>.run(self: ai.Agent<#0>, spec: ai.FunctionSpec<#0>)
         169   load_type 1                                
         170   load_var2 1 2                              
         171   load_var 5                                 (j)
-        172   make_closure 2263 captures=3 ntypeargs=1   
+        172   make_closure 2265 captures=3 ntypeargs=1   
         173   call 16 ntypeargs=3                        (baml.Array.map)
         174   store_var 14                               (futures)
 
@@ -251,7 +251,7 @@ function ai.Agent.Runner<Out>.run(self: ai.Agent<#0>, spec: ai.FunctionSpec<#0>)
         211   load_var 11                                (calls)
         212   load_type 1                                
         213   load_var 20                                (f)
-        214   make_closure 2264 captures=1 ntypeargs=1   
+        214   make_closure 2266 captures=1 ntypeargs=1   
         215   call 19 ntypeargs=2                        (baml.Array.find)
 
   327   216   store_var 21                               (_59)
@@ -522,7 +522,7 @@ function ai.Agent._attempt_turn(self: ai.Agent<#0>, c: ai.Client, spec: ai.Funct
   243   154   load_var 7                         (turn)
         155   load_field 1                       (stop_reason)
         156   load_const 14                      (ai.content.StopReason.MaxTokens)
-        157   alloc_variant 774                  (ai.content.StopReason)
+        157   alloc_variant 776                  (ai.content.StopReason)
         158   call 672 ntypeargs=0               (baml.ops.equals_equals)
 
   242   159   jump_if_false +2                   (to 161)
@@ -532,7 +532,7 @@ function ai.Agent._attempt_turn(self: ai.Agent<#0>, c: ai.Client, spec: ai.Funct
   244   162   load_var 7                         (turn)
         163   load_field 1                       (stop_reason)
         164   load_const 15                      (ai.content.StopReason.Refused)
-        165   alloc_variant 774                  (ai.content.StopReason)
+        165   alloc_variant 776                  (ai.content.StopReason)
         166   call 672 ntypeargs=0               (baml.ops.equals_equals)
 
   242   167   jump_if_false +2                   (to 169)
@@ -1212,7 +1212,7 @@ function ai.Agent._run_one_tool(self: ai.Agent<#0>, tb: ai.tools.Toolbox, call: 
        58    store_var 11            (_20)
        59    load_var 11             (_20)
        60    load_const 6            (ai.tools.ErrorMode.Raise)
-       61    alloc_variant 775       (ai.tools.ErrorMode)
+       61    alloc_variant 777       (ai.tools.ErrorMode)
        62    call 672 ntypeargs=0    (baml.ops.equals_equals)
        63    pop_jump_if_false +2    (to 65)
        64    jump +4                 (to 68)
@@ -1300,7 +1300,7 @@ function ai.Agent.new(max_steps: int, client: ai.Client | null, tool_errors: ai.
        15   pop_jump_if_false +4                       (to 19)
 
   32   16   load_const 3                               (ai.tools.ErrorMode.Report)
-       17   alloc_variant 775                          (ai.tools.ErrorMode)
+       17   alloc_variant 777                          (ai.tools.ErrorMode)
        18   store_var 3                                (tool_errors)
        19   load_var 4                                 (on_event)
        20   load_const 0                               (<omitted>)
@@ -1317,7 +1317,7 @@ function ai.Agent.new(max_steps: int, client: ai.Client | null, tool_errors: ai.
        29   pop_jump_if_false +4                       (to 33)
 
   41   30   load_type 4                                
-       31   make_closure 2209 captures=0 ntypeargs=1   
+       31   make_closure 2211 captures=0 ntypeargs=1   
        32   store_var 5                                (_10)
 
   35   33   load_var2 1 2                              
@@ -1729,7 +1729,7 @@ function ai.clients.Fallback._try(self: ai.clients.Fallback, input: ai.ModelTurn
         48   store_var 11                       (_17)
         49   load_var 11                        (_17)
         50   load_const 6                       (ai.errors.RetrySafety.Safe)
-        51   alloc_variant 776                  (ai.errors.RetrySafety)
+        51   alloc_variant 778                  (ai.errors.RetrySafety)
         52   call 672 ntypeargs=0               (baml.ops.equals_equals)
 
   199   53   pop_jump_if_false +2               (to 55)
@@ -1824,7 +1824,7 @@ function ai.clients.Retry._attempt(self: ai.clients.Retry, input: ai.ModelTurnIn
         28   store_var 7                        (_11)
         29   load_var 7                         (_11)
         30   load_const 5                       (ai.errors.RetrySafety.Safe)
-        31   alloc_variant 776                  (ai.errors.RetrySafety)
+        31   alloc_variant 778                  (ai.errors.RetrySafety)
         32   call 672 ntypeargs=0               (baml.ops.equals_equals)
 
   118   33   jump_if_false +5                   (to 38)
@@ -2271,7 +2271,7 @@ function ai.content.Media.new(value: image | audio | video | pdf, provider_id: s
 
 function ai.errors.InvalidRequest.Failure.retry_safety(self: ai.errors.InvalidRequest) -> ai.errors.RetrySafety {
   54   0   load_const 0        (ai.errors.RetrySafety.Safe)
-       1   alloc_variant 776   (ai.errors.RetrySafety)
+       1   alloc_variant 778   (ai.errors.RetrySafety)
        2   store_var 2         (_0)
        3   load_var 2          (_0)
        4   return              
@@ -2279,7 +2279,7 @@ function ai.errors.InvalidRequest.Failure.retry_safety(self: ai.errors.InvalidRe
 
 function ai.errors.NetworkFailure.Failure.retry_safety(self: ai.errors.NetworkFailure) -> ai.errors.RetrySafety {
   42   0   load_const 0        (ai.errors.RetrySafety.Safe)
-       1   alloc_variant 776   (ai.errors.RetrySafety)
+       1   alloc_variant 778   (ai.errors.RetrySafety)
        2   store_var 2         (_0)
        3   load_var 2          (_0)
        4   return              
@@ -2287,7 +2287,7 @@ function ai.errors.NetworkFailure.Failure.retry_safety(self: ai.errors.NetworkFa
 
 function ai.errors.ParseFailed.Failure.retry_safety(self: ai.errors.ParseFailed) -> ai.errors.RetrySafety {
   75   0   load_const 0        (ai.errors.RetrySafety.Safe)
-       1   alloc_variant 776   (ai.errors.RetrySafety)
+       1   alloc_variant 778   (ai.errors.RetrySafety)
        2   store_var 2         (_0)
        3   load_var 2          (_0)
        4   return              
@@ -2295,7 +2295,7 @@ function ai.errors.ParseFailed.Failure.retry_safety(self: ai.errors.ParseFailed)
 
 function ai.errors.RateLimited.Failure.retry_safety(self: ai.errors.RateLimited) -> ai.errors.RetrySafety {
   31   0   load_const 0        (ai.errors.RetrySafety.Safe)
-       1   alloc_variant 776   (ai.errors.RetrySafety)
+       1   alloc_variant 778   (ai.errors.RetrySafety)
        2   store_var 2         (_0)
        3   load_var 2          (_0)
        4   return              
@@ -2303,7 +2303,7 @@ function ai.errors.RateLimited.Failure.retry_safety(self: ai.errors.RateLimited)
 
 function ai.errors.Refused.Failure.retry_safety(self: ai.errors.Refused) -> ai.errors.RetrySafety {
   65   0   load_const 0        (ai.errors.RetrySafety.Safe)
-       1   alloc_variant 776   (ai.errors.RetrySafety)
+       1   alloc_variant 778   (ai.errors.RetrySafety)
        2   store_var 2         (_0)
        3   load_var 2          (_0)
        4   return              
@@ -2311,7 +2311,7 @@ function ai.errors.Refused.Failure.retry_safety(self: ai.errors.Refused) -> ai.e
 
 function ai.errors.StepBudgetExceeded.Failure.retry_safety(self: ai.errors.StepBudgetExceeded) -> ai.errors.RetrySafety {
   88   0   load_const 0        (ai.errors.RetrySafety.Unsafe)
-       1   alloc_variant 776   (ai.errors.RetrySafety)
+       1   alloc_variant 778   (ai.errors.RetrySafety)
        2   store_var 2         (_0)
        3   load_var 2          (_0)
        4   return              
@@ -2319,7 +2319,7 @@ function ai.errors.StepBudgetExceeded.Failure.retry_safety(self: ai.errors.StepB
 
 function ai.errors.StreamingUnsupported.Failure.retry_safety(self: ai.errors.StreamingUnsupported) -> ai.errors.RetrySafety {
   117   0   load_const 0        (ai.errors.RetrySafety.Safe)
-        1   alloc_variant 776   (ai.errors.RetrySafety)
+        1   alloc_variant 778   (ai.errors.RetrySafety)
         2   store_var 2         (_0)
         3   load_var 2          (_0)
         4   return              
@@ -2327,7 +2327,7 @@ function ai.errors.StreamingUnsupported.Failure.retry_safety(self: ai.errors.Str
 
 function ai.errors.ToolFailedError.Failure.retry_safety(self: ai.errors.ToolFailedError) -> ai.errors.RetrySafety {
   104   0   load_const 0        (ai.errors.RetrySafety.Unsafe)
-        1   alloc_variant 776   (ai.errors.RetrySafety)
+        1   alloc_variant 778   (ai.errors.RetrySafety)
         2   store_var 2         (_0)
         3   load_var 2          (_0)
         4   return              
@@ -3752,7 +3752,7 @@ function ai.internal._proxy(conn: ai.mcp.McpConnection, name: string) -> (map<st
        5    store_var 2           
 
   12   6    load_var2 1 2         
-       7    make_closure 4341 2   
+       7    make_closure 4343 2   
        8    store_var 3           (_0)
        9    load_var 3            (_0)
        10   return                
@@ -5148,7 +5148,7 @@ function ai.prompt(body: ((string) -> ai.Role throws never, ai.Context) -> baml.
        2   store_var 1           
 
   84   3   load_var 1            (body)
-       4   make_closure 2109 1   
+       4   make_closure 2111 1   
        5   store_var 3           (render)
 
   88   6   load_var 3            (render)
@@ -5255,10 +5255,10 @@ function ai.stream.Stream.next(self: ai.stream.Stream<#0, #1>) -> #0 | ai.stream
         43   load_const 0                     (true)
         44   store_field 3                    (_finished)
 
-  355   45   alloc_instance 411 ntypeargs=0   (ai.stream.Done)
+  355   45   alloc_instance 413 ntypeargs=0   (ai.stream.Done)
         46   jump +2                          (to 48)
 
-  350   47   alloc_instance 411 ntypeargs=0   (ai.stream.Done)
+  350   47   alloc_instance 413 ntypeargs=0   (ai.stream.Done)
         48   return                           
 }
 
@@ -5416,7 +5416,7 @@ function ai.stream.TurnStream.final_turn(self: ai.stream.TurnStream) -> ai.Model
         56   cmp_op ==              
         57   pop_jump_if_false +4   (to 61)
         58   load_const 3           (ai.content.StopReason.Complete)
-        59   alloc_variant 774      (ai.content.StopReason)
+        59   alloc_variant 776      (ai.content.StopReason)
         60   store_var 7            (_24)
 
   330   61   load_var 1             (self)
@@ -5532,7 +5532,7 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string | ai.st
         40    call 961 ntypeargs=0               (ai.stream.TurnStream._finish)
         41    pop 1                              
 
-  290   42    alloc_instance 411 ntypeargs=0     (ai.stream.Done)
+  290   42    alloc_instance 413 ntypeargs=0     (ai.stream.Done)
         43    jump +166                          (to 209)
 
   282   44    load_var 27                        (_59)
@@ -5619,7 +5619,7 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string | ai.st
         115   call 962 ntypeargs=0               (ai.stream.TurnStream._check_terminal)
         116   pop 1                              
 
-  264   117   alloc_instance 411 ntypeargs=0     (ai.stream.Done)
+  264   117   alloc_instance 413 ntypeargs=0     (ai.stream.Done)
         118   jump +91                           (to 209)
 
   227   119   load_type 12                       
@@ -5663,7 +5663,7 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string | ai.st
         153   call 961 ntypeargs=0               (ai.stream.TurnStream._finish)
         154   pop 1                              
 
-  249   155   alloc_instance 411 ntypeargs=0     (ai.stream.Done)
+  249   155   alloc_instance 413 ntypeargs=0     (ai.stream.Done)
         156   jump +53                           (to 209)
 
   229   157   load_var 9                         (_19)
@@ -5728,7 +5728,7 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string | ai.st
         206   load_field 0                       (text)
         207   jump +2                            (to 209)
 
-  223   208   alloc_instance 411 ntypeargs=0     (ai.stream.Done)
+  223   208   alloc_instance 413 ntypeargs=0     (ai.stream.Done)
         209   return                             
 }
 
@@ -5845,7 +5845,7 @@ function ai.stream.from_spec(spec: ai.FunctionSpec<#1>, client: ai.stream.Stream
   436   81    load_type 8                                
         82    load_type 2                                
         83    load_var 14                                (turns)
-        84    make_closure 2290 captures=1 ntypeargs=2   
+        84    make_closure 2292 captures=1 ntypeargs=2   
         85    load_var 19                                (_36)
         86    load_const 9                               ("")
         87    load_const 10                              (false)
@@ -5970,7 +5970,7 @@ function ai.tools.Toolbox.get(self: ai.tools.Toolbox, name: string) -> ai.tools.
         5    load_var 1            (self)
         6    load_field 0          (entries)
         7    load_var 2            (name)
-        8    make_closure 2135 1   
+        8    make_closure 2137 1   
         9    call 19 ntypeargs=2   (baml.Array.find)
         10   return                
 }
@@ -8688,27 +8688,27 @@ function anthropic.internal._anthropic_stop_reason(s: string) -> ai.content.Stop
         19   jump +4                (to 23)
 
   802   20   load_const 4           (ai.content.StopReason.MaxTokens)
-        21   alloc_variant 774      (ai.content.StopReason)
+        21   alloc_variant 776      (ai.content.StopReason)
 
   797   22   jump +12               (to 34)
 
   800   23   load_const 5           (ai.content.StopReason.Refused)
-        24   alloc_variant 774      (ai.content.StopReason)
+        24   alloc_variant 776      (ai.content.StopReason)
 
   797   25   jump +9                (to 34)
 
   799   26   load_const 6           (ai.content.StopReason.ToolUse)
-        27   alloc_variant 774      (ai.content.StopReason)
+        27   alloc_variant 776      (ai.content.StopReason)
 
   797   28   jump +6                (to 34)
 
   798   29   load_const 7           (ai.content.StopReason.Complete)
-        30   alloc_variant 774      (ai.content.StopReason)
+        30   alloc_variant 776      (ai.content.StopReason)
 
   797   31   jump +3                (to 34)
 
   798   32   load_const 7           (ai.content.StopReason.Complete)
-        33   alloc_variant 774      (ai.content.StopReason)
+        33   alloc_variant 776      (ai.content.StopReason)
         34   return                 
 }
 
@@ -8920,7 +8920,7 @@ function anthropic.internal.anthropic_decode_batch(batch: string, state: anthrop
 
   1170   85    load_type 0                        
          86    load_var 4                         (out)
-         87    alloc_instance 410 ntypeargs=0     (ai.stream.TurnDone)
+         87    alloc_instance 412 ntypeargs=0     (ai.stream.TurnDone)
          88    call 4 ntypeargs=1                 (baml.Array.push)
          89    pop 1                              
          90    jump -81                           (to 9)
@@ -9899,7 +9899,7 @@ function anthropic.internal.anthropic_parse(resp: anthropic.internal.AnthropicRe
         114   jump +4                            (to 118)
 
   837   115   load_const 16                      (ai.content.StopReason.Complete)
-        116   alloc_variant 774                  (ai.content.StopReason)
+        116   alloc_variant 776                  (ai.content.StopReason)
         117   store_var 15                       (stop)
 
   841   118   load_var 1                         (resp)
@@ -10040,7 +10040,7 @@ function anthropic.internal.invoke_stream(c: anthropic.AnthropicClient, input: a
 
   1238   40   load_var2 3 7           
 
-  1239   41   make_closure 3356 1     
+  1239   41   make_closure 3358 1     
          42   load_const 8            ("anthropic")
 
   1237   43   call 959 ntypeargs=0    (ai.stream.TurnStream.from_sse)
@@ -10426,7 +10426,7 @@ function aws.BedrockClient.resolved_endpoint_url(self: aws.BedrockClient) -> str
 function aws.internal.ContentBlock.of_audio(audio: aws.internal.AudioBlock) -> aws.internal.ContentBlock {
   175   0   call 1286 ntypeargs=0            (aws.internal._empty_content_block)
         1   store_var 2                      (_2)
-        2   alloc_instance 730 ntypeargs=0   (aws.internal.ContentBlock)
+        2   alloc_instance 732 ntypeargs=0   (aws.internal.ContentBlock)
         3   load_var 2                       (_2)
         4   init_spread 0                    (.text, .image, .video, .document)
         5   load_var 1                       (audio)
@@ -10439,7 +10439,7 @@ function aws.internal.ContentBlock.of_audio(audio: aws.internal.AudioBlock) -> a
 function aws.internal.ContentBlock.of_cache_point() -> aws.internal.ContentBlock {
   187   0   call 1286 ntypeargs=0            (aws.internal._empty_content_block)
         1   store_var 1                      (_1)
-        2   alloc_instance 730 ntypeargs=0   (aws.internal.ContentBlock)
+        2   alloc_instance 732 ntypeargs=0   (aws.internal.ContentBlock)
         3   load_var 1                       (_1)
         4   init_spread 0                    (.text, .image, .video, .document, .audio, .toolUse, .toolResult)
         5   load_const 0                     ("default")
@@ -10451,7 +10451,7 @@ function aws.internal.ContentBlock.of_cache_point() -> aws.internal.ContentBlock
 function aws.internal.ContentBlock.of_document(document: aws.internal.DocumentBlock) -> aws.internal.ContentBlock {
   171   0   call 1286 ntypeargs=0            (aws.internal._empty_content_block)
         1   store_var 2                      (_2)
-        2   alloc_instance 730 ntypeargs=0   (aws.internal.ContentBlock)
+        2   alloc_instance 732 ntypeargs=0   (aws.internal.ContentBlock)
         3   load_var 2                       (_2)
         4   init_spread 0                    (.text, .image, .video)
         5   load_var 1                       (document)
@@ -10464,7 +10464,7 @@ function aws.internal.ContentBlock.of_document(document: aws.internal.DocumentBl
 function aws.internal.ContentBlock.of_image(image: aws.internal.ImageBlock) -> aws.internal.ContentBlock {
   163   0   call 1286 ntypeargs=0            (aws.internal._empty_content_block)
         1   store_var 2                      (_2)
-        2   alloc_instance 730 ntypeargs=0   (aws.internal.ContentBlock)
+        2   alloc_instance 732 ntypeargs=0   (aws.internal.ContentBlock)
         3   load_var 2                       (_2)
         4   init_spread 0                    (.text)
         5   load_var 1                       (image)
@@ -10477,7 +10477,7 @@ function aws.internal.ContentBlock.of_image(image: aws.internal.ImageBlock) -> a
 function aws.internal.ContentBlock.of_text(text: string) -> aws.internal.ContentBlock {
   159   0   call 1286 ntypeargs=0            (aws.internal._empty_content_block)
         1   store_var 2                      (_2)
-        2   alloc_instance 730 ntypeargs=0   (aws.internal.ContentBlock)
+        2   alloc_instance 732 ntypeargs=0   (aws.internal.ContentBlock)
         3   load_var 1                       (text)
         4   init_field 0                     (text)
         5   load_var 2                       (_2)
@@ -10488,7 +10488,7 @@ function aws.internal.ContentBlock.of_text(text: string) -> aws.internal.Content
 function aws.internal.ContentBlock.of_tool_result(tool_result: aws.internal.ToolResultBlock) -> aws.internal.ContentBlock {
   183   0   call 1286 ntypeargs=0            (aws.internal._empty_content_block)
         1   store_var 2                      (_2)
-        2   alloc_instance 730 ntypeargs=0   (aws.internal.ContentBlock)
+        2   alloc_instance 732 ntypeargs=0   (aws.internal.ContentBlock)
         3   load_var 2                       (_2)
         4   init_spread 0                    (.text, .image, .video, .document, .audio, .toolUse)
         5   load_var 1                       (tool_result)
@@ -10501,7 +10501,7 @@ function aws.internal.ContentBlock.of_tool_result(tool_result: aws.internal.Tool
 function aws.internal.ContentBlock.of_tool_use(tool_use: aws.internal.ToolUseBlock) -> aws.internal.ContentBlock {
   179   0   call 1286 ntypeargs=0            (aws.internal._empty_content_block)
         1   store_var 2                      (_2)
-        2   alloc_instance 730 ntypeargs=0   (aws.internal.ContentBlock)
+        2   alloc_instance 732 ntypeargs=0   (aws.internal.ContentBlock)
         3   load_var 2                       (_2)
         4   init_spread 0                    (.text, .image, .video, .document, .audio)
         5   load_var 1                       (tool_use)
@@ -10514,7 +10514,7 @@ function aws.internal.ContentBlock.of_tool_use(tool_use: aws.internal.ToolUseBlo
 function aws.internal.ContentBlock.of_video(video: aws.internal.VideoBlock) -> aws.internal.ContentBlock {
   167   0   call 1286 ntypeargs=0            (aws.internal._empty_content_block)
         1   store_var 2                      (_2)
-        2   alloc_instance 730 ntypeargs=0   (aws.internal.ContentBlock)
+        2   alloc_instance 732 ntypeargs=0   (aws.internal.ContentBlock)
         3   load_var 2                       (_2)
         4   init_spread 0                    (.text, .image)
         5   load_var 1                       (video)
@@ -13416,7 +13416,7 @@ function aws.internal.parse_response(response: aws.internal.ConverseResponse) ->
          161   jump +4                            (to 165)
 
   1302   162   load_const 15                      (ai.content.StopReason.Complete)
-         163   alloc_variant 774                  (ai.content.StopReason)
+         163   alloc_variant 776                  (ai.content.StopReason)
          164   store_var 27                       (stop)
 
   1306   165   load_var 1                         (response)
@@ -13598,37 +13598,37 @@ function aws.internal.stop_reason(raw: string) -> ai.content.StopReason {
          29   jump +4                 (to 33)
 
   1242   30   load_const 5            (ai.content.StopReason.Complete)
-         31   alloc_variant 774       (ai.content.StopReason)
+         31   alloc_variant 776       (ai.content.StopReason)
 
   1230   32   jump +18                (to 50)
 
   1240   33   load_const 6            (ai.content.StopReason.Refused)
-         34   alloc_variant 774       (ai.content.StopReason)
+         34   alloc_variant 776       (ai.content.StopReason)
 
   1230   35   jump +15                (to 50)
 
   1236   36   load_const 6            (ai.content.StopReason.Refused)
-         37   alloc_variant 774       (ai.content.StopReason)
+         37   alloc_variant 776       (ai.content.StopReason)
 
   1230   38   jump +12                (to 50)
 
   1236   39   load_const 6            (ai.content.StopReason.Refused)
-         40   alloc_variant 774       (ai.content.StopReason)
+         40   alloc_variant 776       (ai.content.StopReason)
 
   1230   41   jump +9                 (to 50)
 
   1235   42   load_const 7            (ai.content.StopReason.MaxTokens)
-         43   alloc_variant 774       (ai.content.StopReason)
+         43   alloc_variant 776       (ai.content.StopReason)
 
   1230   44   jump +6                 (to 50)
 
   1235   45   load_const 7            (ai.content.StopReason.MaxTokens)
-         46   alloc_variant 774       (ai.content.StopReason)
+         46   alloc_variant 776       (ai.content.StopReason)
 
   1230   47   jump +3                 (to 50)
 
   1231   48   load_const 8            (ai.content.StopReason.ToolUse)
-         49   alloc_variant 774       (ai.content.StopReason)
+         49   alloc_variant 776       (ai.content.StopReason)
          50   return                  
 }
 
@@ -14327,7 +14327,7 @@ function claude_code.internal.allowed_mcp_tools(c: claude_code.ClaudeCodeClient)
         8    load_type 2           
         9    load_var 3            (_3)
 
-  224   10   make_closure 4211 0   
+  224   10   make_closure 4213 0   
 
   223   11   call 16 ntypeargs=3   (baml.Array.map)
         12   store_var 2           (_2)
@@ -15063,7 +15063,7 @@ function claude_code.internal.invoke(c: claude_code.ClaudeCodeClient, input: ai.
         398   store_var 58                       (content)
 
   353   399   load_const 56                      (ai.content.StopReason.Complete)
-        400   alloc_variant 774                  (ai.content.StopReason)
+        400   alloc_variant 776                  (ai.content.StopReason)
         401   store_var 59                       (stop)
 
   354   402   load_var 5                         (has_tools)
@@ -15209,7 +15209,7 @@ function claude_code.internal.invoke(c: claude_code.ClaudeCodeClient, input: ai.
   359   521   jump -73                           (to 448)
 
   377   522   load_const 21                      (ai.content.StopReason.ToolUse)
-        523   alloc_variant 774                  (ai.content.StopReason)
+        523   alloc_variant 776                  (ai.content.StopReason)
         524   store_var 59                       (stop)
 
   384   525   load_var2 58 59                    
@@ -16482,19 +16482,19 @@ function google.internal._gm_decode_batch(batch: string, provider: string) -> (a
   1012   194   jump +12                           (to 206)
 
   1013   195   load_const 12                      (ai.content.StopReason.Complete)
-         196   alloc_variant 774                  (ai.content.StopReason)
+         196   alloc_variant 776                  (ai.content.StopReason)
          197   store_var 29                       (stop)
 
   1012   198   jump +8                            (to 206)
 
   1011   199   load_const 23                      (ai.content.StopReason.Refused)
-         200   alloc_variant 774                  (ai.content.StopReason)
+         200   alloc_variant 776                  (ai.content.StopReason)
          201   store_var 29                       (stop)
 
   1010   202   jump +4                            (to 206)
 
   1009   203   load_const 24                      (ai.content.StopReason.MaxTokens)
-         204   alloc_variant 774                  (ai.content.StopReason)
+         204   alloc_variant 776                  (ai.content.StopReason)
          205   store_var 29                       (stop)
 
   1017   206   load_var 10                        (resp)
@@ -16558,7 +16558,7 @@ function google.internal._gm_decode_batch(batch: string, provider: string) -> (a
 
   1034   256   load_type 0                        
          257   load_var 4                         (out)
-         258   alloc_instance 410 ntypeargs=0     (ai.stream.TurnDone)
+         258   alloc_instance 412 ntypeargs=0     (ai.stream.TurnDone)
          259   call 4 ntypeargs=1                 (baml.Array.push)
          260   pop 1                              
          261   jump -252                          (to 9)
@@ -17311,7 +17311,7 @@ function google.internal._gm_strip_nulls(value: baml.json.json, opaque: bool) ->
         20   load_type 2                        
         21   load_type 3                        
         22   load_var 13                        (items)
-        23   make_closure 3391 0                
+        23   make_closure 3393 0                
         24   call 16 ntypeargs=3                (baml.Array.map)
         25   jump +52                           (to 77)
 
@@ -19159,22 +19159,22 @@ function google.internal.google_parse(resp: google.internal.GmResponse, seq: int
         265   jump +4                            (to 269)
 
   906   266   load_const 5                       (ai.content.StopReason.Complete)
-        267   alloc_variant 774                  (ai.content.StopReason)
+        267   alloc_variant 776                  (ai.content.StopReason)
 
   903   268   jump +9                            (to 277)
 
   904   269   load_const 28                      (ai.content.StopReason.Refused)
-        270   alloc_variant 774                  (ai.content.StopReason)
+        270   alloc_variant 776                  (ai.content.StopReason)
 
   903   271   jump +6                            (to 277)
 
   902   272   load_const 29                      (ai.content.StopReason.MaxTokens)
-        273   alloc_variant 774                  (ai.content.StopReason)
+        273   alloc_variant 776                  (ai.content.StopReason)
 
   901   274   jump +3                            (to 277)
 
   900   275   load_const 16                      (ai.content.StopReason.ToolUse)
-        276   alloc_variant 774                  (ai.content.StopReason)
+        276   alloc_variant 776                  (ai.content.StopReason)
 
   908   277   store_var 41                       (_128)
         278   load_var 1                         (resp)
@@ -19307,7 +19307,7 @@ function google.internal.vertex_invoke_stream(c: google.VertexClient, input: ai.
 
   362   22   load_var2 3 4           
 
-  363   23   make_closure 3630 1     
+  363   23   make_closure 3632 1     
         24   load_const 5            ("vertex")
 
   361   25   call 959 ntypeargs=0    (ai.stream.TurnStream.from_sse)
@@ -19593,7 +19593,7 @@ function openai.AzureClient.compat(self: openai.AzureClient) -> openai.internal.
         23   load_var 5              (_10)
         24   load_const 4            (<omitted>)
         25   load_const 1            (openai.internal.ChatAuth.ApiKeyHeader)
-        26   alloc_variant 777       (openai.internal.ChatAuth)
+        26   alloc_variant 779       (openai.internal.ChatAuth)
         27   load_const 5            ("AZURE_OPENAI_API_KEY")
         28   load_const 6            (true)
         29   load_const 4            (<omitted>)
@@ -21271,7 +21271,7 @@ function openai.internal.ChatCompat.new(provider: string, base_url: string, path
         9    pop_jump_if_false +4    (to 13)
 
   117   10   load_const 2            (openai.internal.ChatAuth.Bearer)
-        11   alloc_variant 777       (openai.internal.ChatAuth)
+        11   alloc_variant 779       (openai.internal.ChatAuth)
         12   store_var 4             (auth)
         13   load_var 5              (api_key_env)
         14   load_const 0            (<omitted>)
@@ -21554,7 +21554,7 @@ function openai.internal.ChatStreamDecoder._absorb_call(self: openai.internal.Ch
          16    load_field 1            (calls)
 
   1398   17    load_var 4              (index)
-         18    make_closure 3022 1     
+         18    make_closure 3024 1     
 
   1397   19    call 19 ntypeargs=2     (baml.Array.find)
 
@@ -21929,7 +21929,7 @@ function openai.internal.ChatStreamDecoder.decode(self: openai.internal.ChatStre
 
   1427   220   load_type 0                        
          221   load_var 4                         (out)
-         222   alloc_instance 410 ntypeargs=0     (ai.stream.TurnDone)
+         222   alloc_instance 412 ntypeargs=0     (ai.stream.TurnDone)
          223   call 4 ntypeargs=1                 (baml.Array.push)
          224   pop 1                              
          225   jump -216                          (to 9)
@@ -22178,7 +22178,7 @@ function openai.internal._chat_apply_directives(j: baml.json.json) -> baml.json.
         17    load_type 2                        
         18    load_type 3                        
         19    load_var 18                        (items)
-        20    make_closure 2932 0                
+        20    make_closure 2934 0                
         21    call 16 ntypeargs=3                (baml.Array.map)
         22    jump +88                           (to 110)
 
@@ -23167,7 +23167,7 @@ function openai.internal._chat_prune_nulls(j: baml.json.json) -> baml.json.json 
         17   load_type 2                        
         18   load_type 3                        
         19   load_var 11                        (items)
-        20   make_closure 2938 0                
+        20   make_closure 2940 0                
         21   call 16 ntypeargs=3                (baml.Array.map)
         22   jump +58                           (to 80)
 
@@ -26443,7 +26443,7 @@ function openai.internal._openai_stream_events(event: openai.internal.OaStreamEv
 
   1088   129   load_type 0                      
          130   load_var 5                       (out)
-         131   alloc_instance 410 ntypeargs=0   (ai.stream.TurnDone)
+         131   alloc_instance 412 ntypeargs=0   (ai.stream.TurnDone)
          132   call 4 ntypeargs=1               (baml.Array.push)
          133   pop 1                            
          134   jump +202                        (to 336)
@@ -26503,7 +26503,7 @@ function openai.internal._openai_stream_events(event: openai.internal.OaStreamEv
 
   1088   180   load_type 0                      
          181   load_var 5                       (out)
-         182   alloc_instance 410 ntypeargs=0   (ai.stream.TurnDone)
+         182   alloc_instance 412 ntypeargs=0   (ai.stream.TurnDone)
          183   call 4 ntypeargs=1               (baml.Array.push)
          184   pop 1                            
          185   jump +151                        (to 336)
@@ -27351,7 +27351,7 @@ function openai.internal.chat_invoke_stream(compat: openai.internal.ChatCompat, 
          26   throw                   
 
   1551   27   load_var 5              (decoder)
-         28   make_closure 3044 1     
+         28   make_closure 3046 1     
 
   1552   29   load_var 1              (compat)
          30   load_field 0            (provider)
@@ -28155,7 +28155,7 @@ function openai.internal.chat_parse(response: openai.internal.CcResponse, provid
          306   jump +5                            (to 311)
 
   1260   307   load_const 4                       (ai.content.StopReason.Complete)
-         308   alloc_variant 774                  (ai.content.StopReason)
+         308   alloc_variant 776                  (ai.content.StopReason)
          309   store_var 51                       (stop)
 
   1258   310   jump +13                           (to 323)
@@ -28167,13 +28167,13 @@ function openai.internal.chat_parse(response: openai.internal.CcResponse, provid
          315   jump +8                            (to 323)
 
   1256   316   load_const 27                      (ai.content.StopReason.Refused)
-         317   alloc_variant 774                  (ai.content.StopReason)
+         317   alloc_variant 776                  (ai.content.StopReason)
          318   store_var 51                       (stop)
 
   1255   319   jump +4                            (to 323)
 
   1254   320   load_const 8                       (ai.content.StopReason.ToolUse)
-         321   alloc_variant 774                  (ai.content.StopReason)
+         321   alloc_variant 776                  (ai.content.StopReason)
          322   store_var 51                       (stop)
 
   1264   323   load_var 1                         (response)
@@ -28321,32 +28321,32 @@ function openai.internal.chat_stop_reason(reason: string) -> ai.content.StopReas
          24   jump +4                (to 28)
 
   1109   25   load_const 5           (ai.content.StopReason.Complete)
-         26   alloc_variant 774      (ai.content.StopReason)
+         26   alloc_variant 776      (ai.content.StopReason)
 
   1105   27   jump +15               (to 42)
 
   1108   28   load_const 6           (ai.content.StopReason.Refused)
-         29   alloc_variant 774      (ai.content.StopReason)
+         29   alloc_variant 776      (ai.content.StopReason)
 
   1105   30   jump +12               (to 42)
 
   1107   31   load_const 7           (ai.content.StopReason.MaxTokens)
-         32   alloc_variant 774      (ai.content.StopReason)
+         32   alloc_variant 776      (ai.content.StopReason)
 
   1105   33   jump +9                (to 42)
 
   1107   34   load_const 7           (ai.content.StopReason.MaxTokens)
-         35   alloc_variant 774      (ai.content.StopReason)
+         35   alloc_variant 776      (ai.content.StopReason)
 
   1105   36   jump +6                (to 42)
 
   1106   37   load_const 8           (ai.content.StopReason.ToolUse)
-         38   alloc_variant 774      (ai.content.StopReason)
+         38   alloc_variant 776      (ai.content.StopReason)
 
   1105   39   jump +3                (to 42)
 
   1106   40   load_const 8           (ai.content.StopReason.ToolUse)
-         41   alloc_variant 774      (ai.content.StopReason)
+         41   alloc_variant 776      (ai.content.StopReason)
          42   return                 
 }
 
@@ -28480,7 +28480,7 @@ function openai.internal.images_parse(c: openai.ImageClient, resp: openai.intern
 
   392   97    load_var 7                         (content)
         98    load_const 9                       (ai.content.StopReason.Complete)
-        99    alloc_variant 774                  (ai.content.StopReason)
+        99    alloc_variant 776                  (ai.content.StopReason)
 
   394   100   load_var 14                        (usage)
         101   init_instance 1                    (ai.ModelTurn .content, .stop_reason, .usage)
@@ -28671,7 +28671,7 @@ function openai.internal.invoke_stream(c: openai.ResponsesClient, input: ai.Mode
 
   1163   16   load_var2 3 5           
 
-  1164   17   make_closure 2752 1     
+  1164   17   make_closure 2754 1     
          18   load_const 1            ("openai")
 
   1162   19   call 959 ntypeargs=0    (ai.stream.TurnStream.from_sse)
@@ -29279,7 +29279,7 @@ function openai.internal.openai_parse(resp: openai.internal.OaResponse) -> ai.Mo
         280   jump +5                            (to 285)
 
   913   281   load_const 37                      (ai.content.StopReason.Complete)
-        282   alloc_variant 774                  (ai.content.StopReason)
+        282   alloc_variant 776                  (ai.content.StopReason)
         283   store_var 39                       (stop)
 
   906   284   jump +38                           (to 322)
@@ -29308,25 +29308,25 @@ function openai.internal.openai_parse(resp: openai.internal.OaResponse) -> ai.Mo
         306   jump +5                            (to 311)
 
   910   307   load_const 40                      (ai.content.StopReason.MaxTokens)
-        308   alloc_variant 774                  (ai.content.StopReason)
+        308   alloc_variant 776                  (ai.content.StopReason)
         309   store_var 39                       (stop)
 
   907   310   jump +12                           (to 322)
 
   908   311   load_const 41                      (ai.content.StopReason.Refused)
-        312   alloc_variant 774                  (ai.content.StopReason)
+        312   alloc_variant 776                  (ai.content.StopReason)
         313   store_var 39                       (stop)
 
   907   314   jump +8                            (to 322)
 
   905   315   load_const 41                      (ai.content.StopReason.Refused)
-        316   alloc_variant 774                  (ai.content.StopReason)
+        316   alloc_variant 776                  (ai.content.StopReason)
         317   store_var 39                       (stop)
 
   904   318   jump +4                            (to 322)
 
   903   319   load_const 15                      (ai.content.StopReason.ToolUse)
-        320   alloc_variant 774                  (ai.content.StopReason)
+        320   alloc_variant 776                  (ai.content.StopReason)
         321   store_var 39                       (stop)
 
   915   322   load_var 1                         (resp)
@@ -29458,7 +29458,7 @@ function testing.$invoke_collector(collector: (testing.TestCollector) -> void th
 }
 
 function testing.FailFast() -> (testing.TestSetChild[]) -> testing.TestSetReport throws never {
-  104   0   make_closure 2060 0   
+  104   0   make_closure 2062 0   
         1   store_var 1           (_0)
         2   load_var 1            (_0)
         3   return                
@@ -29485,7 +29485,7 @@ function testing.PassRate(threshold: float) -> (testing.TestSetChild[]) -> testi
        15   pop 1                  
 
   76   16   load_var 1             (threshold)
-       17   make_closure 2055 1    
+       17   make_closure 2057 1    
        18   store_var 2            (_0)
        19   load_var 2             (_0)
        20   return                 
@@ -29526,7 +29526,7 @@ function testing.Quorum(n: int, m: int) -> (() -> testing.TestReport throws neve
        27   pop 1                  
 
   10   28   load_var2 1 2          
-       29   make_closure 2039 2    
+       29   make_closure 2041 2    
        30   store_var 3            (_0)
        31   load_var 3             (_0)
        32   return                 
@@ -29547,14 +29547,14 @@ function testing.Retry(max_attempts: int) -> (() -> testing.TestReport throws ne
        9    pop 1                  
 
   42   10   load_var 1             (max_attempts)
-       11   make_closure 2049 1    
+       11   make_closure 2051 1    
        12   store_var 2            (_0)
        13   load_var 2             (_0)
        14   return                 
 }
 
 function testing.Sequential() -> (testing.TestSetChild[]) -> testing.TestSetReport throws never {
-  98   0   make_closure 2058 0   
+  98   0   make_closure 2060 0   
        1   store_var 1           (_0)
        2   load_var 1            (_0)
        3   return                
@@ -32151,7 +32151,7 @@ function testing.run_children_parallel(children: testing.TestSetChild[]) -> test
         24   store_deref 5                      
 
   486   25   load_var 5                         (child)
-        26   make_closure 1940 1                
+        26   make_closure 1942 1                
         27   load_const 6                       (null)
         28   load_const 6                       (null)
         29   load_type 7                        
@@ -32253,7 +32253,7 @@ function testing.run_test(body: () -> void throws unknown, runner: ((() -> testi
         2    store_var 1            
 
   496   3    load_var 1             (body)
-        4    make_closure 1952 1    
+        4    make_closure 1954 1    
         5    store_var 3            (base_run)
 
   527   6    load_var 2             (runner)
@@ -32527,7 +32527,7 @@ function testing.test_child(name: string, body: () -> void throws unknown, runne
   364   6    load_var2 1 2         
 
   366   7    load_var 3            (runner)
-        8    make_closure 1917 2   
+        8    make_closure 1919 2   
         9    init_instance 0       (testing.TestSetChild .name, .run)
         10   store_var 4           (_0)
         11   load_var 4            (_0)
@@ -32546,7 +32546,7 @@ function testing.testset_child(registry: testing.TestRegistry, ts: testing.TestS
         7    load_field 0          (name)
 
   375   8    load_var2 1 2         
-        9    make_closure 1919 2   
+        9    make_closure 1921 2   
         10   init_instance 0       (testing.TestSetChild .name, .run)
         11   store_var 3           (_0)
         12   load_var 3            (_0)
@@ -32569,7 +32569,7 @@ function testing.testset_child_selected(registry: testing.TestRegistry, ts: test
 
   391   11   load_var2 1 2         
         12   load_var 3            (names)
-        13   make_closure 1921 3   
+        13   make_closure 1923 3   
         14   init_instance 0       (testing.TestSetChild .name, .run)
         15   store_var 4           (_0)
         16   load_var 4            (_0)
@@ -34141,7 +34141,7 @@ function vercel.internal.gateway_images_parse(c: vercel.AiGatewayImageClient, re
 
   445   142   load_var 14                        (content)
         143   load_const 20                      (ai.content.StopReason.Complete)
-        144   alloc_variant 774                  (ai.content.StopReason)
+        144   alloc_variant 776                  (ai.content.StopReason)
 
   447   145   load_var 20                        (usage)
         146   init_instance 1                    (ai.ModelTurn .content, .stop_reason, .usage)
