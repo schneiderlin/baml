@@ -251,6 +251,7 @@ pub fn ppir_expansion_items(db: &dyn Db, file: SourceFile) -> PpirExpansionItems
                 stream_class.fields.retain_mut(|field| {
                     let ppir_ty = PpirTy::from_type_expr(&field.type_expr);
                     let ctx = ExpandCtx {
+                        db,
                         package_name: &package_name,
                         namespace_path: &pkg_info.namespace_path,
                         package_items,
@@ -331,6 +332,7 @@ pub fn ppir_expansion_items(db: &dyn Db, file: SourceFile) -> PpirExpansionItems
                 );
 
                 let ctx = ExpandCtx {
+                    db,
                     package_name: &package_name,
                     namespace_path: &pkg_info.namespace_path,
                     package_items,
@@ -399,6 +401,7 @@ pub fn ppir_expansion_items(db: &dyn Db, file: SourceFile) -> PpirExpansionItems
                 // Compute the stream-expanded return type.
                 let ppir_ty = PpirTy::from_type_expr(return_type_spanned);
                 let ctx = ExpandCtx {
+                    db,
                     package_name: &package_name,
                     namespace_path: &pkg_info.namespace_path,
                     package_items,
