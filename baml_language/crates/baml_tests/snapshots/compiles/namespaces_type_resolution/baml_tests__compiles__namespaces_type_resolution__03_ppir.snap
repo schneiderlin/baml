@@ -208,7 +208,7 @@ class user.llm.LlmWithCrossNsFields$stream {
   auth_config: root.auth.Config$stream | null
   nested_client: root.llm.openai.Client$stream | null
   own_status: user.llm.Status | null
-  own_alias: root.Config$stream | null
+  own_alias: user.llm.Config$stream | null
   root_alias: root.Config$stream | null
 }
 class user.llm.LlmWithRootAlias {
