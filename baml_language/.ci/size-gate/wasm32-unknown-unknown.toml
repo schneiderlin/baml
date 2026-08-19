@@ -1,10 +1,7 @@
 version = 1
-recorded_at = "2026-08-16T04:00:02Z"
-git_sha = "2273e45dbf4e23231743f428bd2e53d978b91e9a"
+recorded_at = "2026-08-19T09:29:14Z"
+git_sha = "78459a1400403af46e1758657615f3f70e5a332a"
 
-# Re-recorded from CI run 31925567696: Package.compile's compiler-built stdlib
-# prefix is embedded in bex_project so first-call runtime compilation does not
-# rebuild the full stdlib.
 [artifacts.bridge_wasm]
-file_bytes = "20.3 MiB"
-gzip_bytes = "5.1 MiB"
+file_bytes = "20.4 MiB"
+gzip_bytes = "5.2 MiB"
