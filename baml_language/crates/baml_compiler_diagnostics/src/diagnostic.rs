@@ -368,6 +368,8 @@ pub enum DiagnosticId {
     ConflictingTypeDefinitionAtRender,
     /// A top-level declaration ($init) can reach a yielding io sysop.
     InitIoNotAllowed,
+    /// A declaration uses a reserved name (builtin type name or keyword).
+    ReservedName,
 }
 
 impl DiagnosticId {
@@ -546,6 +548,7 @@ impl DiagnosticId {
             DiagnosticId::OpenInterfaceAtRender => "E0161",
             DiagnosticId::ConflictingTypeDefinitionAtRender => "E0162",
             DiagnosticId::InitIoNotAllowed => "E0163",
+            DiagnosticId::ReservedName => "E0164",
             DiagnosticId::GenericBoundNotInterface => "E0145",
             DiagnosticId::GenericSysOpMethodInInterfaceImpl => "E0153",
 
