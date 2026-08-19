@@ -102,6 +102,33 @@ fn find_callee_generic_args(callee_node: &SyntaxNode) -> Option<SyntaxNode> {
     }
 }
 
+/// Read back what the author wrote around an `unreflect(...)` type-argument
+/// slot, so an E0167 report can spell the fix in their own source rather than
+/// a reconstruction. `expr` must contain `slot`; anything else degrades to the
+/// generic suggestion.
+fn unreflect_rewrite(
+    expr: &SyntaxNode,
+    slot: &SyntaxNode,
+) -> baml_compiler_diagnostics::runtime_type::RuntimeTypeNameRewrite {
+    use baml_compiler_diagnostics::runtime_type::RuntimeTypeNameRewrite;
+
+    let expr_range = expr.span_range();
+    let slot_range = slot.span_range();
+    if !expr_range.contains_range(slot_range) {
+        return RuntimeTypeNameRewrite::default();
+    }
+    let node_text = expr.text().to_string();
+    let base = usize::from(expr.text_range().start());
+    let Some(written) =
+        node_text.get(usize::from(expr_range.start()) - base..usize::from(expr_range.end()) - base)
+    else {
+        return RuntimeTypeNameRewrite::default();
+    };
+    let start = usize::from(slot_range.start() - expr_range.start());
+    let end = usize::from(slot_range.end() - expr_range.start());
+    RuntimeTypeNameRewrite::from_source(written, start..end)
+}
+
 /// Lower a CST `ExprFunctionBody` to an owned `ExprBody` + parallel `AstSourceMap`.
 pub(crate) fn lower(
     expr_body: &baml_compiler_syntax::ast::ExprFunctionBody,
@@ -343,7 +370,7 @@ pub(crate) fn lower_client_initializer(
 ///         // space) so it can never shadow a user identifier
 ///         let ctx = ai.internal.SpecCtx { output_format: output_format };
 ///         let tagged = baml.TaggedString { ...the function's prompt... };
-///         ai.internal.assemble_prompt(tagged.parts, tagged.values)
+///         ai.internal.assemble_llm_prompt(tagged.parts, tagged.values)
 ///     },
 ///     toolbox: ai.Toolbox.new([ai.tool(a), ...]),
 ///     default_client: openai.ResponsesClient.new(model = "gpt-4o-mini"),
@@ -526,7 +553,7 @@ pub(crate) fn synthesize_llm_spec_body(
         Expr::Path(vec![
             Name::new("ai"),
             Name::new("internal"),
-            Name::new("assemble_prompt"),
+            Name::new("assemble_llm_prompt"),
         ]),
         prompt_start,
     );
@@ -724,7 +751,7 @@ pub(crate) fn synthesize_llm_spec_body(
 /// `Fn$spec(p...).prompt(ai.wire.render_output_format(type.of<Out>()))`.
 pub(crate) fn synthesize_spec_render_prompt_body(
     function_name: &str,
-    param_names: &[Name],
+    params: &[Param],
     generic_param_names: &[Name],
     out_type: Option<crate::ast::TypeExpr>,
     span: TextRange,
@@ -737,10 +764,7 @@ pub(crate) fn synthesize_spec_render_prompt_body(
         Expr::Path(vec![Name::new(format!("{function_name}$spec"))]),
         span,
     );
-    let spec_args: Vec<CallArg> = param_names
-        .iter()
-        .map(|n| CallArg::positional(ctx.alloc_expr(Expr::Path(vec![n.clone()]), span)))
-        .collect();
+    let spec_args = companion_param_call_args(&mut ctx, params, span);
     let spec_call = ctx.alloc_expr(
         Expr::Call {
             callee: spec_callee,
@@ -794,6 +818,50 @@ pub(crate) fn synthesize_spec_render_prompt_body(
     (body, source_map)
 }
 
+/// Synthesize the `$build_request` companion body:
+/// `Fn$spec(p...).build_request(override_client = client)`.
+pub(crate) fn synthesize_spec_build_request_body(
+    function_name: &str,
+    params: &[Param],
+    generic_param_names: &[Name],
+    span: TextRange,
+) -> (ExprBody, AstSourceMap) {
+    use crate::ast::CallArg;
+
+    let mut ctx = LoweringContext::new();
+    let spec_callee = ctx.alloc_expr(
+        Expr::Path(vec![Name::new(format!("{function_name}$spec"))]),
+        span,
+    );
+    let spec_args = companion_param_call_args(&mut ctx, params, span);
+    let spec_call = ctx.alloc_expr(
+        Expr::Call {
+            callee: spec_callee,
+            type_args: static_type_args(generic_param_names, span),
+            args: spec_args,
+        },
+        span,
+    );
+    let build_callee = ctx.alloc_expr(
+        Expr::MemberAccess {
+            base: spec_call,
+            member: Name::new("build_request"),
+        },
+        span,
+    );
+    let client_ref = ctx.alloc_expr(Expr::Path(vec![Name::new("client")]), span);
+    let call = ctx.alloc_expr(
+        Expr::Call {
+            callee: build_callee,
+            type_args: vec![],
+            args: vec![CallArg::named("override_client", client_ref)],
+        },
+        span,
+    );
+    let (body, source_map, _diags, _env_refs) = ctx.finish(Some(call));
+    (body, source_map)
+}
+
 /// Synthesize the `$parse` companion body: a network-free parse of an
 /// existing JSON/SAP string into the function's return type —
 /// `baml.sap.parse<Out>(json)`.
@@ -837,13 +905,11 @@ pub(crate) fn synthesize_spec_parse_body(
 /// `Agent.run` falls back to the spec's default client when it is null.
 pub(crate) fn synthesize_spec_agent_run_body(
     function_name: &str,
-    param_names: &[Name],
+    params: &[Param],
     generic_param_names: &[Name],
     out_type: Option<crate::ast::TypeExpr>,
     span: TextRange,
 ) -> (ExprBody, AstSourceMap) {
-    use crate::ast::CallArg;
-
     let mut ctx = LoweringContext::new();
 
     // Fn$spec(p1, p2, ...)
@@ -851,13 +917,7 @@ pub(crate) fn synthesize_spec_agent_run_body(
         Expr::Path(vec![Name::new(format!("{function_name}$spec"))]),
         span,
     );
-    let spec_args: Vec<CallArg> = param_names
-        .iter()
-        .map(|n| {
-            let id = ctx.alloc_expr(Expr::Path(vec![n.clone()]), span);
-            CallArg::positional(id)
-        })
-        .collect();
+    let spec_args = companion_param_call_args(&mut ctx, params, span);
     let spec_call = ctx.alloc_expr(
         Expr::Call {
             callee: spec_callee,
@@ -930,13 +990,11 @@ pub(crate) fn synthesize_spec_agent_run_body(
 /// is null.
 pub fn synthesize_spec_stream_body(
     function_name: &str,
-    param_names: &[Name],
+    params: &[Param],
     generic_param_names: &[Name],
     type_args: Vec<crate::ast::TypeExpr>,
     span: TextRange,
 ) -> (ExprBody, AstSourceMap) {
-    use crate::ast::CallArg;
-
     let mut ctx = LoweringContext::new();
 
     // Fn$spec(p1, p2, ...)
@@ -944,13 +1002,7 @@ pub fn synthesize_spec_stream_body(
         Expr::Path(vec![Name::new(format!("{function_name}$spec"))]),
         span,
     );
-    let spec_args: Vec<CallArg> = param_names
-        .iter()
-        .map(|n| {
-            let id = ctx.alloc_expr(Expr::Path(vec![n.clone()]), span);
-            CallArg::positional(id)
-        })
-        .collect();
+    let spec_args = companion_param_call_args(&mut ctx, params, span);
     let spec_call = ctx.alloc_expr(
         Expr::Call {
             callee: spec_callee,
@@ -1001,6 +1053,27 @@ fn static_type_args(names: &[Name], span: TextRange) -> Vec<TypeArg> {
             }
             .at(span)
             .into()
+        })
+        .collect()
+}
+
+/// Re-apply parameter defaults when a generated companion calls its `$spec`.
+/// Required parameters can stay positional; defaulted parameters are named so
+/// the callee's default metadata remains visible to argument lowering.
+fn companion_param_call_args(
+    ctx: &mut LoweringContext,
+    params: &[Param],
+    span: TextRange,
+) -> Vec<CallArg> {
+    params
+        .iter()
+        .map(|param| {
+            let value = ctx.alloc_expr(Expr::Path(vec![param.name.clone()]), span);
+            if param.default.is_some() {
+                CallArg::named(param.name.clone(), value)
+            } else {
+                CallArg::positional(value)
+            }
         })
         .collect()
 }
@@ -3301,6 +3374,9 @@ impl LoweringContext {
                                 })
                         })
                         .unwrap_or_else(|| self.alloc_expr(Expr::Missing, node.span_range()));
+                    self.source_map
+                        .unreflect_arg_spans
+                        .insert(operand, node.span_range());
                     args.push(TypeArg::Unreflect(operand));
                 }
                 _ => {}
@@ -4806,6 +4882,7 @@ impl LoweringContext {
             node: &SyntaxNode,
             path_segments: &mut Vec<Name>,
             type_args: &mut Vec<TypeExpr>,
+            unreflect_slots: &mut Vec<SyntaxNode>,
             diags: &mut Vec<LoweringDiagnostic>,
         ) {
             for elem in node.children_with_tokens() {
@@ -4816,15 +4893,36 @@ impl LoweringContext {
                     rowan::NodeOrToken::Node(args_node)
                         if args_node.kind() == SyntaxKind::GENERIC_ARGS =>
                     {
+                        // A class literal cannot carry a runtime type
+                        // argument (see the E0167 report below), but the slot
+                        // still holds its place: dropping it would leave the
+                        // turbofish short and inference would report a
+                        // missing type parameter on top of the real finding.
                         *type_args = args_node
                             .children()
-                            .filter(|n| n.kind() == SyntaxKind::TYPE_EXPR)
-                            .filter_map(baml_compiler_syntax::ast::TypeExpr::cast)
-                            .map(|te| crate::lower_type_expr::lower_type_expr_node(&te, diags))
+                            .filter_map(|arg| match arg.kind() {
+                                SyntaxKind::TYPE_EXPR => {
+                                    baml_compiler_syntax::ast::TypeExpr::cast(arg).map(|te| {
+                                        crate::lower_type_expr::lower_type_expr_node(&te, diags)
+                                    })
+                                }
+                                SyntaxKind::UNREFLECT_ARG => {
+                                    let span = arg.span_range();
+                                    unreflect_slots.push(arg);
+                                    Some(TypeExprKind::Error { attrs: Vec::new() }.at(span))
+                                }
+                                _ => None,
+                            })
                             .collect();
                     }
                     rowan::NodeOrToken::Node(child_node) => {
-                        collect_constructor_path(&child_node, path_segments, type_args, diags);
+                        collect_constructor_path(
+                            &child_node,
+                            path_segments,
+                            type_args,
+                            unreflect_slots,
+                            diags,
+                        );
                     }
                     rowan::NodeOrToken::Token(_) => {}
                 }
@@ -4837,6 +4935,7 @@ impl LoweringContext {
         let mut position = 0;
         let mut type_args: Vec<TypeExpr> = vec![];
         let mut type_path_segments: Vec<Name> = vec![];
+        let mut unreflect_slots: Vec<SyntaxNode> = vec![];
 
         // Look for the optional type name (first WORD or path before the brace):
         //   - A simple WORD token: `MyClass { ... }` → `TypePath::bare`.
@@ -4859,10 +4958,19 @@ impl LoweringContext {
                         &child_node,
                         &mut type_path_segments,
                         &mut type_args,
+                        &mut unreflect_slots,
                         &mut self.diags,
                     );
                 }
             }
+        }
+        for slot in &unreflect_slots {
+            let rewrite = unreflect_rewrite(node, slot);
+            self.diags.push(LoweringDiagnostic::RuntimeTypeMustBeNamed {
+                carrier: rewrite.carrier,
+                named: rewrite.named,
+                span: slot.span_range(),
+            });
         }
         debug_assert!(!type_path_segments.is_empty());
         // The parser only emits an object literal when a type name precedes the
