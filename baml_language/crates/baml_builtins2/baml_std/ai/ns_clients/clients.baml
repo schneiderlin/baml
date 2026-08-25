@@ -265,14 +265,15 @@ class Retry {
                 retry: retry,
                 current: null,
                 emitted: false,
-                pending_text: [],
-                pending_cursor: 0,
                 terminal: [],
                 terminal_cursor: 0,
                 finished: false,
                 calls: [],
             };
-            let stream = root.stream.TurnStream.from_event_source(relay.next_event);
+            let stream = root.stream.TurnStream.from_event_source(
+                relay.next_event,
+                close = relay.close_current,
+            );
             // one list, two holders: the relay appends, final_turn() reads
             stream._calls = relay.calls;
             stream
@@ -510,35 +511,33 @@ class Fallback {
                 retry: advance,
                 current: null,
                 emitted: false,
-                pending_text: [],
-                pending_cursor: 0,
                 terminal: [],
                 terminal_cursor: 0,
                 finished: false,
                 calls: [],
             };
-            let stream = root.stream.TurnStream.from_event_source(relay.next_event);
+            let stream = root.stream.TurnStream.from_event_source(
+                relay.next_event,
+                close = relay.close_current,
+            );
             stream._calls = relay.calls;
             stream
         }
     }
 }
 
-/// Pulls one selected stream through a reliability policy. A typed, safely
-/// retryable failure may replace the selected stream only before the first text
-/// delta has been returned. Once any delta is visible, every later failure is
-/// terminal: replaying would duplicate a prefix and there is no resumable-stream
-/// contract at the client boundary.
+// Pulls one selected stream through a reliability policy. A typed, safely
+// retryable failure may replace the selected stream only before the first
+// content event has been returned. Once text, reasoning, or tool activity is
+// visible, every later failure is terminal: replaying would duplicate a prefix
+// and there is no resumable-stream contract at the client boundary.
 class StreamRelay {
     open: () -> root.stream.TurnStream throws root.errors.InvokeError,
     retry: (root.errors.Failure) -> bool throws root.errors.InvokeError,
     current: root.stream.TurnStream?,
     emitted: bool,
-    // Deltas from the current stream's last batch not yet re-emitted:
-    // next() returns every ready delta at once; next_event relays them
-    // one TextDelta at a time so downstream granularity is preserved.
-    pending_text: string[],
-    pending_cursor: int,
+    // A stream without an explicit terminal event still needs its final
+    // metadata relayed before Done.
     terminal: root.stream.Event[],
     terminal_cursor: int,
     finished: bool,
@@ -549,7 +548,7 @@ class StreamRelay {
 
     function close_current(self) -> void {
         if let stream: root.stream.TurnStream = self.current {
-            stream._finish();
+            stream.close();
         }
     }
 
@@ -580,14 +579,9 @@ class StreamRelay {
         }
     }
 
-    function next_event(self) -> root.stream.Event | root.stream.Done {
-        if (self.pending_cursor < self.pending_text.length()) {
-            let text = self.pending_text.at(self.pending_cursor)
-                ?? baml.sys.panic("StreamRelay lost a pending delta");
-            self.pending_cursor += 1;
-            self.emitted = true;
-            return root.stream.TextDelta { text: text };
-        }
+    function next_event(
+        self,
+    ) -> root.stream.Event | root.stream.Done throws root.errors.InvokeError {
         if (self.terminal_cursor < self.terminal.length()) {
             let event = self.terminal.at(self.terminal_cursor)
                 ?? baml.sys.panic("StreamRelay lost a terminal event");
@@ -609,17 +603,41 @@ class StreamRelay {
             }
         }
         if let stream: root.stream.TurnStream = self.current {
-            let next: string[] | root.stream.Done | StreamRelayError = stream.next() catch_all (e) {
+            let next: root.stream.Event | root.stream.Done | StreamRelayError = stream.next_event() catch_all (e) {
                 _ => StreamRelayError { error: e },
             };
             match (next) {
-                let batch: string[] => {
+                let event: root.stream.TextDelta => {
                     self.emitted = true;
-                    self.pending_text = batch;
-                    self.pending_cursor = 1;
-                    root.stream.TextDelta {
-                        text: batch.at(0) ?? baml.sys.panic("StreamRelay received an empty batch"),
+                    event
+                },
+                let event: root.stream.ReasoningDelta => {
+                    self.emitted = true;
+                    event
+                },
+                let event: root.stream.ToolUseDelta => {
+                    self.emitted = true;
+                    event
+                },
+                let event: root.stream.ToolUseDone => {
+                    self.emitted = true;
+                    event
+                },
+                let event: root.stream.TurnMeta => event,
+                let event: root.stream.TurnDone => {
+                    let final: root.ModelTurn | StreamRelayError = stream.final_turn() catch_all (e) {
+                        _ => StreamRelayError { error: e },
+                    };
+                    if let failed: StreamRelayError = final {
+                        self.recover(failed.error);
+                        return self.next_event();
+                    } else if let turn: root.ModelTurn = final {
+                        self.finished = true;
+                        for (let call in turn.calls) {
+                            self.calls.push(call);
+                        }
                     }
+                    event
                 },
                 let done: root.stream.Done => {
                     let final: root.ModelTurn | StreamRelayError = stream.final_turn() catch_all (e) {
@@ -639,6 +657,8 @@ class StreamRelay {
                                     stop_reason: turn.stop_reason,
                                     input_tokens: turn.usage?.input_tokens,
                                     output_tokens: turn.usage?.output_tokens,
+                                    cached_input_tokens: turn.usage?.cached_input_tokens,
+                                    reasoning_tokens: turn.usage?.reasoning_tokens,
                                 },
                                 root.stream.TurnDone {  },
                             ];

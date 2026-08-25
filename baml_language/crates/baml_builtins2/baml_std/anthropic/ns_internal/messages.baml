@@ -1116,6 +1116,8 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
                                 stop_reason: null,
                                 input_tokens: event.message?.usage?.input_tokens,
                                 output_tokens: event.message?.usage?.output_tokens,
+                                cached_input_tokens: event.message?.usage?.cache_read_input_tokens,
+                                reasoning_tokens: event.message?.usage?.output_tokens_details?.thinking_tokens,
                             },
                         );
                         null
@@ -1125,18 +1127,31 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
                             let kind = block.type ?? "";
                             match (kind) {
                                 "tool_use" => {
+                                    let index = event.index ?? state.tool_calls.length();
                                     state.tool_calls.push(
                                         AnthStreamToolCall {
-                                            index: event.index ?? state.tool_calls.length(),
+                                            index: index,
                                             id: block.id ?? "",
                                             name: block.name ?? "",
                                             args_json: "",
                                         },
                                     );
+                                    out.push(
+                                        ai.stream.ToolUseDelta {
+                                            index: index,
+                                            id: block.id,
+                                            name: block.name,
+                                            arguments: null,
+                                        },
+                                    );
                                     null
                                 },
                                 "thinking" => {
-                                    state.thinking = `${state.thinking}${block.thinking ?? ""}`;
+                                    let summary = block.thinking ?? "";
+                                    state.thinking = `${state.thinking}${summary}`;
+                                    if (summary != "") {
+                                        out.push(ai.stream.ReasoningDelta { summary: summary });
+                                    }
                                     null
                                 },
                                 _ => {
@@ -1167,14 +1182,27 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
                                 },
                                 "input_json_delta" => {
                                     if let call: AnthStreamToolCall = _anth_stream_call_at(state, event.index) {
-                                        call.args_json = `${call.args_json}${d.partial_json ?? ""}`;
+                                        let fragment = d.partial_json ?? "";
+                                        call.args_json = `${call.args_json}${fragment}`;
+                                        out.push(
+                                            ai.stream.ToolUseDelta {
+                                                index: call.index,
+                                                id: null,
+                                                name: null,
+                                                arguments: d.partial_json,
+                                            },
+                                        );
                                     }
                                     null
                                 },
                                 "thinking_delta" => {
-                                    // Deliberately NOT a TextDelta: thinking is not part
-                                    // of the answer the parser will see.
-                                    state.thinking = `${state.thinking}${d.thinking ?? ""}`;
+                                    // Reasoning is observable but remains separate from
+                                    // answer text and typed SAP parsing.
+                                    let summary = d.thinking ?? "";
+                                    state.thinking = `${state.thinking}${summary}`;
+                                    if (summary != "") {
+                                        out.push(ai.stream.ReasoningDelta { summary: summary });
+                                    }
                                     null
                                 },
                                 "signature_delta" => {
@@ -1212,11 +1240,16 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
                                 stop_reason: stop,
                                 input_tokens: event.usage?.input_tokens,
                                 output_tokens: event.usage?.output_tokens,
+                                cached_input_tokens: event.usage?.cache_read_input_tokens,
+                                reasoning_tokens: event.usage?.output_tokens_details?.thinking_tokens,
                             },
                         );
                         null
                     },
                     "message_stop" => {
+                        for (let tool_use in state.tool_uses()) {
+                            out.push(ai.stream.ToolUseDone { tool_use: tool_use });
+                        }
                         out.push(ai.stream.TurnDone {  });
                         null
                     },

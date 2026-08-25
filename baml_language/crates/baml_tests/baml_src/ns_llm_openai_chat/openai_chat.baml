@@ -1189,6 +1189,80 @@ test "chat_sse_assembles_tool_calls" {
     )
 }
 
+// The public TurnStream contract carries reasoning and tool activity all the
+// way through the OpenAI-compatible client. final_turn reconstructs canonical
+// Reasoning/ToolUse blocks; legacy terminal text remains separate and empty.
+function chat_stream_preserves_reasoning_and_tools() -> string {
+    root.llm_mock.mock_sse_serve(
+        [
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{"reasoning_content":"plan "}}]}`),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{"reasoning_content":"first"}}]}`),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"chat_get_weather\",\"arguments\":\"\"}}]}}]}"),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}"),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]}}]}"),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`),
+            root.llm_mock.sse_data(`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":3}}}`),
+            root.llm_mock.sse_data(`[DONE]`),
+        ],
+        (mock: root.llm_mock.MockSseServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let stream = cl.invoke_stream(_chat_input("hi"));
+            let seen: string[] = [];
+            while (true) {
+                match (stream.next_event()) {
+                    let reasoning: ai.stream.ReasoningDelta => {
+                        seen.push(`r:${reasoning.summary}`);
+                        null
+                    },
+                    let delta: ai.stream.ToolUseDelta => {
+                        seen.push(`td:${delta.index}:${delta.id ?? "-"}:${delta.name ?? "-"}:${delta.arguments ?? "-"}`);
+                        null
+                    },
+                    let done: ai.stream.ToolUseDone => {
+                        seen.push(`tool:${done.tool_use.id}:${done.tool_use.name}`);
+                        null
+                    },
+                    let meta: ai.stream.TurnMeta => {
+                        if let stop: ai.content.StopReason = meta.stop_reason {
+                            seen.push(`stop:${stop}`);
+                        }
+                        null
+                    },
+                    let done: ai.stream.TurnDone => {
+                        seen.push("turn-done");
+                        null
+                    },
+                    let done: ai.stream.Done => {
+                        break;
+                    },
+                    _ => null,
+                };
+            }
+            let turn = stream.final_turn();
+            let reasoning = "";
+            for (let block in turn.content) {
+                if let thought: ai.content.Reasoning = block {
+                    reasoning = thought.summary;
+                }
+            }
+            let tool = turn.tool_uses().at(0);
+            [
+                `events=${seen.join(",")}`,
+                `reasoning=${reasoning}`,
+                `text=${turn.terminal_text() ?? "null"}`,
+                `tool=${tool?.id ?? "-"}/${tool?.name ?? "-"}/${baml.json.stringify(baml.json.to_json(tool?.args))}`,
+                `usage=${turn.usage?.input_tokens ?? -1}/${turn.usage?.output_tokens ?? -1}/${turn.usage?.cached_input_tokens ?? -1}/${turn.usage?.reasoning_tokens ?? -1}`,
+            ].join("|")
+        },
+    )
+}
+
+test "chat_stream_preserves_reasoning_and_tools" {
+    let got = chat_stream_preserves_reasoning_and_tools();
+    assert.contains(got, "events=r:plan ,r:first,td:0:call_7:chat_get_weather:,td:0:-:-:{\"city\":,td:0:-:-:\"Paris\"},tool:call_7:chat_get_weather,stop:ToolUse,turn-done|");
+    assert.contains(got, "reasoning=plan first|text=|tool=call_7/chat_get_weather/{\"city\":\"Paris\"}|usage=11/8/5/3")
+}
+
 // ─── through the runner ──────────────────────────────────────────────────────
 
 // The whole path: spec -> prompt -> request -> canned response -> SAP -> value.

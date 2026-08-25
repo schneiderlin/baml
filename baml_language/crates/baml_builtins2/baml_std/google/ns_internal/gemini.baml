@@ -1039,6 +1039,9 @@ function _gm_decode_batch(batch: string, provider: string) -> ai.stream.Event[] 
             for (let p in parts) {
                 if let t: string = p.text {
                     if (p.thought ?? false) {
+                        if (t != "") {
+                            out.push(ai.stream.ReasoningDelta { summary: t });
+                        }
                         null
                     } else {
                         out.push(ai.stream.TextDelta { text: t });
@@ -1066,6 +1069,8 @@ function _gm_decode_batch(batch: string, provider: string) -> ai.stream.Event[] 
                         stop_reason: stop,
                         input_tokens: usage?.promptTokenCount,
                         output_tokens: usage?.candidatesTokenCount,
+                        cached_input_tokens: usage?.cachedContentTokenCount,
+                        reasoning_tokens: usage?.thoughtsTokenCount,
                     },
                 );
                 null
