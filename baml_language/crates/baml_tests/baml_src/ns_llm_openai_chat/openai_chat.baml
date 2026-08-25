@@ -1124,17 +1124,18 @@ test "chat_generic_stream_time_to_first_token_timeout_ms" {
     assert.equal(chat_generic_stream_time_to_first_token_timeout_ms(), "20|Timeout")
 }
 
-// Streamed tool calls arrive as id/name once and argument fragments after.
-// `ai.stream.StreamEvent` cannot carry them to the runner yet (PLAN §6), so they
-// are buffered in the decoder and readable when the turn ends — this drives the
-// decoder over a real SSE connection and asserts the assembled call.
-function chat_sse_assembles_tool_calls() -> string {
+// Streamed tool calls arrive as id/name once and argument fragments after. They
+// are buffered in the decoder and emitted when the turn ends — this drives the
+// decoder over a real SSE connection and asserts the assembled call. The wire
+// content remains authoritative when a compatible provider supplies a
+// nonstandard finish reason.
+function chat_sse_assembles_tool_calls(finish_reason: string = "tool_calls") -> string {
     root.llm_mock.mock_sse_serve(
         [
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"chat_get_weather\",\"arguments\":\"\"}}]}}]}"),
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}"),
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]}}]}"),
-            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"${finish_reason}"}]}`),
             root.llm_mock.sse_data(`[DONE]`),
         ],
         (mock: root.llm_mock.MockSseServer) -> {
@@ -1147,6 +1148,7 @@ function chat_sse_assembles_tool_calls() -> string {
             };
             let sse = baml.http.fetch_sse(request);
             let stops: string[] = [];
+            let completed: string[] = [];
             while (true) {
                 match (sse.next()) {
                     null => {
@@ -1159,6 +1161,10 @@ function chat_sse_assembles_tool_calls() -> string {
                                     if let reason: ai.content.StopReason = meta.stop_reason {
                                         stops.push(`${reason}`);
                                     }
+                                    null
+                                },
+                                let done: ai.stream.ToolUseDone => {
+                                    completed.push(`${done.tool_use.id}/${done.tool_use.name}`);
                                     null
                                 },
                                 _ => null,
@@ -1176,6 +1182,7 @@ function chat_sse_assembles_tool_calls() -> string {
                 use?.id ?? "-",
                 use?.name ?? "-",
                 baml.json.stringify(baml.json.to_json(use?.args)),
+                completed.join(","),
                 stops.join(","),
             ].join("|")
         },
@@ -1185,7 +1192,14 @@ function chat_sse_assembles_tool_calls() -> string {
 test "chat_sse_assembles_tool_calls" {
     assert.equal(
         chat_sse_assembles_tool_calls(),
-        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|ToolUse",
+        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|call_7/chat_get_weather|ToolUse",
+    )
+}
+
+test "chat_sse_trusts_complete_tool_call_over_nonstandard_finish_reason" {
+    assert.equal(
+        chat_sse_assembles_tool_calls(finish_reason = "unexpected_state"),
+        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|call_7/chat_get_weather|ToolUse",
     )
 }
 
