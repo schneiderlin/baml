@@ -9,6 +9,13 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+#[cfg(feature = "bundle-http")]
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{LazyLock, Mutex, atomic::AtomicU64},
+};
+
 use bex_heap::{BexExternalValue, BexHeap};
 use sys_ops::io::{
     self, CallId, SysOpContext, SysOpOutput, VmBamlError, VmPanic, VmRustFnError, owned,
@@ -23,6 +30,80 @@ const MAX_READ_CHUNK: usize = 64 * 1024;
 // BufReader over-reads into its internal buffer across multiple io.input() calls.
 static STDIN_READER: OnceLock<tokio::sync::Mutex<tokio::io::BufReader<tokio::io::Stdin>>> =
     OnceLock::new();
+
+#[cfg(feature = "bundle-http")]
+const KIMI_WIRE_TRACE_PATH_ENV: &str = "BAML_KIMI_WIRE_TRACE_PATH";
+
+#[cfg(feature = "bundle-http")]
+static KIMI_WIRE_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "bundle-http")]
+static KIMI_WIRE_TRACE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[cfg(feature = "bundle-http")]
+fn kimi_wire_trace_path(url: &str) -> Option<PathBuf> {
+    let path = std::env::var_os(KIMI_WIRE_TRACE_PATH_ENV)?;
+    let url = reqwest::Url::parse(url).ok()?;
+    (url.host_str() == Some("api.kimi.com")).then(|| PathBuf::from(path))
+}
+
+#[cfg(feature = "bundle-http")]
+fn kimi_wire_header_value(key: &str, value: &str) -> String {
+    if [
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "api-key",
+        "cookie",
+        "set-cookie",
+    ]
+    .iter()
+    .any(|sensitive| key.eq_ignore_ascii_case(sensitive))
+    {
+        "[REDACTED]".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(feature = "bundle-http")]
+fn append_kimi_wire_trace(path: &Path, wire_id: u64, event: serde_json::Value) {
+    let _guard = KIMI_WIRE_TRACE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(%error, path = %path.display(), "failed to create Kimi wire trace directory");
+        return;
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "failed to open Kimi wire trace");
+            return;
+        }
+    };
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let record = serde_json::json!({
+        "timestamp_ms": timestamp_ms,
+        "wire_id": wire_id,
+        "event": event,
+    });
+    if let Err(error) = serde_json::to_writer(&mut file, &record)
+        .and_then(|()| writeln!(file).map_err(serde_json::Error::io))
+    {
+        tracing::warn!(%error, path = %path.display(), "failed to append Kimi wire trace");
+    }
+}
 
 fn shared_stdin() -> &'static tokio::sync::Mutex<tokio::io::BufReader<tokio::io::Stdin>> {
     STDIN_READER
@@ -3068,6 +3149,31 @@ impl io::IoNamespaceHttp for NativeSysOps {
         use crate::registry::{REGISTRY, SseBuffer};
 
         SysOpOutput::async_op(async move {
+            let wire_trace = kimi_wire_trace_path(&request.url).map(|path| {
+                let wire_id = KIMI_WIRE_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let headers: serde_json::Map<String, serde_json::Value> = request
+                    .headers
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            serde_json::Value::String(kimi_wire_header_value(key, value)),
+                        )
+                    })
+                    .collect();
+                append_kimi_wire_trace(
+                    &path,
+                    wire_id,
+                    serde_json::json!({
+                        "kind": "request",
+                        "method": request.method,
+                        "url": request.url,
+                        "headers": headers,
+                        "body": request.body,
+                    }),
+                );
+                (path, wire_id)
+            });
             let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|e| {
                 VmBamlError::InvalidArgument {
                     message: format!("Invalid HTTP method '{}': {e}", request.method),
@@ -3086,10 +3192,51 @@ impl io::IoNamespaceHttp for NativeSysOps {
                 builder = builder.body(request.body.clone());
             }
 
-            let response = apply_http_timeout(builder, &timeout_nanos)
-                .send()
-                .await
-                .map_err(|e| http_transport_error("SSE connection failed", &e))?;
+            let response = match apply_http_timeout(builder, &timeout_nanos).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some((path, wire_id)) = &wire_trace {
+                        append_kimi_wire_trace(
+                            path,
+                            *wire_id,
+                            serde_json::json!({
+                                "kind": "connection_error",
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
+                    return Err(VmRustFnError::from(http_transport_error(
+                        "SSE connection failed",
+                        &error,
+                    )));
+                }
+            };
+
+            if let Some((path, wire_id)) = &wire_trace {
+                let headers: serde_json::Map<String, serde_json::Value> = response
+                    .headers()
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.to_string(),
+                            serde_json::Value::String(kimi_wire_header_value(
+                                key.as_str(),
+                                value.to_str().unwrap_or("<non-utf8>"),
+                            )),
+                        )
+                    })
+                    .collect();
+                append_kimi_wire_trace(
+                    path,
+                    *wire_id,
+                    serde_json::json!({
+                        "kind": "response_opened",
+                        "status": response.status().as_u16(),
+                        "url": response.url().to_string(),
+                        "headers": headers,
+                    }),
+                );
+            }
 
             if !response.status().is_success() {
                 let status = response.status().as_u16();
@@ -3103,6 +3250,17 @@ impl io::IoNamespaceHttp for NativeSysOps {
                     }
                     Err(_) => "<could not read body>".to_string(),
                 };
+                if let Some((path, wire_id)) = &wire_trace {
+                    append_kimi_wire_trace(
+                        path,
+                        *wire_id,
+                        serde_json::json!({
+                            "kind": "error_response_body",
+                            "status": status,
+                            "body": body,
+                        }),
+                    );
+                }
                 return Err(VmRustFnError::from(VmBamlError::Io {
                     message: format!("SSE request failed with status {status}: {body}"),
                 }));
@@ -3188,6 +3346,16 @@ impl io::IoNamespaceHttp for NativeSysOps {
                         match outcome {
                             Ok(chunk) => chunk,
                             Err(()) => {
+                                if let Some((path, wire_id)) = &wire_trace {
+                                    append_kimi_wire_trace(
+                                        path,
+                                        *wire_id,
+                                        serde_json::json!({
+                                            "kind": "first_event_timeout",
+                                            "timeout_ms": duration.as_millis(),
+                                        }),
+                                    );
+                                }
                                 let mut buf = buf_clone.lock().await;
                                 buf.error = Some(VmBamlError::Timeout {
                                     message: format!(
@@ -3211,6 +3379,29 @@ impl io::IoNamespaceHttp for NativeSysOps {
                     match chunk_result {
                         Ok(bytes) => {
                             let events = parser.feed(&bytes);
+                            if let Some((path, wire_id)) = &wire_trace {
+                                let parsed_events: Vec<serde_json::Value> = events
+                                    .iter()
+                                    .map(|event| {
+                                        serde_json::json!({
+                                            "event": event.event,
+                                            "data": event.data,
+                                            "id": event.id,
+                                        })
+                                    })
+                                    .collect();
+                                append_kimi_wire_trace(
+                                    path,
+                                    *wire_id,
+                                    serde_json::json!({
+                                        "kind": "response_chunk",
+                                        "byte_length": bytes.len(),
+                                        "utf8_valid": std::str::from_utf8(&bytes).is_ok(),
+                                        "raw": String::from_utf8_lossy(&bytes),
+                                        "parsed_events": parsed_events,
+                                    }),
+                                );
+                            }
                             if !events.is_empty() {
                                 // The budget runs to the first PARSED event.
                                 // `timeout_at` polls the stream before the
@@ -3242,6 +3433,16 @@ impl io::IoNamespaceHttp for NativeSysOps {
                             }
                         }
                         Err(e) => {
+                            if let Some((path, wire_id)) = &wire_trace {
+                                append_kimi_wire_trace(
+                                    path,
+                                    *wire_id,
+                                    serde_json::json!({
+                                        "kind": "stream_error",
+                                        "error": e.to_string(),
+                                    }),
+                                );
+                            }
                             let mut buf = buf_clone.lock().await;
                             buf.error = Some(http_transport_error("SSE stream failed", &e));
                             buf.done = true;
@@ -3274,6 +3475,26 @@ impl io::IoNamespaceHttp for NativeSysOps {
                     notify_clone.notify_waiters();
                     guard.completed = true;
                     return;
+                }
+                if let Some((path, wire_id)) = &wire_trace {
+                    let parsed_events: Vec<serde_json::Value> = final_events
+                        .iter()
+                        .map(|event| {
+                            serde_json::json!({
+                                "event": event.event,
+                                "data": event.data,
+                                "id": event.id,
+                            })
+                        })
+                        .collect();
+                    append_kimi_wire_trace(
+                        path,
+                        *wire_id,
+                        serde_json::json!({
+                            "kind": "stream_ended",
+                            "final_parsed_events": parsed_events,
+                        }),
+                    );
                 }
                 let mut buf = buf_clone.lock().await;
                 if !final_events.is_empty() {

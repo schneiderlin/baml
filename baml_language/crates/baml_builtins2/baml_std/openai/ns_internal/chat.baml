@@ -107,6 +107,10 @@ class ChatCompat {
     // Query parameters the endpoint itself requires (Azure `api-version`).
     // User query params are merged over these.
     compat_query: map<string, string>,
+    // Replay assistant reasoning as the OpenAI-compatible
+    // `reasoning_content` message field. Kimi's preserved-thinking tool loop
+    // requires this; ordinary OpenAI endpoints must not receive it.
+    replay_reasoning_content: bool,
 
     /// Every field defaults to the plain-OpenAI shape; a wrapper overrides the
     /// handful that differ.
@@ -124,6 +128,7 @@ class ChatCompat {
         default_max_tokens: int? = null,
         default_role: string = "user",
         compat_query: map<string, string>? = null,
+        replay_reasoning_content: bool = false,
     ) -> ChatCompat {
         let empty: map<string, string> = {};
         ChatCompat {
@@ -140,6 +145,7 @@ class ChatCompat {
             default_max_tokens: default_max_tokens,
             default_role: default_role,
             compat_query: compat_query ?? empty,
+            replay_reasoning_content: replay_reasoning_content,
         }
     }
 }
@@ -315,6 +321,7 @@ class ChatToolCall {
 class ChatMessage {
     role: string,
     content: ChatMessageContent?,
+    reasoning_content: string?,
     tool_calls: ChatToolCall[]?,
     tool_call_id: string?,
 }
@@ -739,6 +746,7 @@ function chat_lower_prompt(
             ChatMessage {
                 role: message.role,
                 content: _chat_content(message.parts, compat.collapse_text_content),
+                reasoning_content: null,
                 tool_calls: null,
                 tool_call_id: null,
             },
@@ -753,8 +761,9 @@ function chat_lower_prompt(
 /// `ai.Journal` -> chat-completions messages. Assistant turns carry their text
 /// in `content` and their calls in `tool_calls`; each result comes back as its
 /// own `role: "tool"` message keyed by `tool_call_id`. Journal-only events
-/// (`RunStarted`, `ToolRequested`, `Usage`, `FinalProduced`) and reasoning
-/// blocks lower to nothing.
+/// (`RunStarted`, `ToolRequested`, `Usage`, `FinalProduced`) lower to nothing.
+/// Reasoning is replayed only for provider compat profiles that explicitly
+/// support the `reasoning_content` assistant-message field.
 ///
 /// Callers pass the journal through `ai.wire.sanitize_for_client` first, so
 /// foreign reasoning, empty turns and unanswered tool calls are already handled.
@@ -778,6 +787,7 @@ function chat_lower_journal(
                     ChatMessage {
                         role: "user",
                         content: _chat_content(parts, true),
+                        reasoning_content: null,
                         tool_calls: null,
                         tool_call_id: null,
                     },
@@ -786,6 +796,7 @@ function chat_lower_journal(
             },
             let assistant: ai.events.AssistantMessage => {
                 let parts: ChatContentPart[] = [];
+                let reasoning = "";
                 let calls: ChatToolCall[] = [];
                 for (let block in assistant.content) {
                     match (block) {
@@ -806,8 +817,10 @@ function chat_lower_journal(
                             );
                             null
                         },
-                        // Reasoning has no replayable wire form here.
-                        let r: ai.content.Reasoning => null,
+                        let r: ai.content.Reasoning => {
+                            reasoning = `${reasoning}${r.summary}`;
+                            null
+                        },
                     };
                 }
                 let content: ChatMessageContent? = if (parts.length() == 0) {
@@ -825,6 +838,11 @@ function chat_lower_journal(
                         ChatMessage {
                             role: "assistant",
                             content: content,
+                            reasoning_content: if (compat.replay_reasoning_content) {
+                                reasoning
+                            } else {
+                                null
+                            },
                             tool_calls: tool_calls,
                             tool_call_id: null,
                         },
@@ -839,6 +857,7 @@ function chat_lower_journal(
                     ChatMessage {
                         role: "tool",
                         content: _chat_content(_chat_lower_blocks(completed.content, compat, preview = preview), true),
+                        reasoning_content: null,
                         tool_calls: null,
                         tool_call_id: completed.id,
                     },
@@ -851,6 +870,7 @@ function chat_lower_journal(
                     ChatMessage {
                         role: "tool",
                         content: baml.json.stringify(baml.json.to_json(err)),
+                        reasoning_content: null,
                         tool_calls: null,
                         tool_call_id: failed.id,
                     },
@@ -1596,9 +1616,23 @@ class ChatStreamDecoder {
                                 position += 1;
                             }
                             if let reason: string = choice.finish_reason {
-                                let stop_reason = chat_stop_reason(reason);
-                                if (stop_reason == ai.content.StopReason.ToolUse && !self.calls_emitted) {
-                                    for (let tool_use in self.tool_uses()) {
+                                // Kimi can terminate a complete tool-call stream with a
+                                // nonstandard reason such as `unexpected_state`. Its official
+                                // client ignores finish_reason and trusts the assembled deltas.
+                                // Do the same for every OpenAI-compatible endpoint: wire content
+                                // is authoritative, while finish_reason is advisory metadata.
+                                let tool_uses = self.tool_uses();
+                                let has_complete_tool_uses = tool_uses.length() > 0
+                                    && tool_uses.every((tool_use) -> {
+                                        tool_use.id.trim().length() > 0 && tool_use.name.trim().length() > 0
+                                    });
+                                let stop_reason = if (has_complete_tool_uses) {
+                                    ai.content.StopReason.ToolUse
+                                } else {
+                                    chat_stop_reason(reason)
+                                };
+                                if (has_complete_tool_uses && !self.calls_emitted) {
+                                    for (let tool_use in tool_uses) {
                                         out.push(ai.stream.ToolUseDone { tool_use: tool_use });
                                     }
                                     self.calls_emitted = true;
