@@ -887,9 +887,9 @@ test "oai_stream_status_error" {
     assert.equal(oai_stream_status_error(), "invalid_request:http 401")
 }
 
-// The decoder buffers streamed function-call arguments across batches (the
-// stream event types cannot carry a tool call yet — PLAN §6), and a
-// `output_text.done` for an item that never streamed a delta emits it once.
+// The decoder buffers streamed function-call arguments across batches while
+// also exposing each fragment as ToolUseDelta, and a `output_text.done` for an
+// item that never streamed a delta emits it once.
 function oai_stream_decoder_buffers() -> string {
     let state = openai.internal.OaStreamState.new();
     let first: map<string, unknown> = {
@@ -922,7 +922,7 @@ function oai_stream_decoder_buffers() -> string {
 }
 
 test "oai_stream_decoder_buffers" {
-    assert.equal(oai_stream_decoder_buffers(), "{\"city\":\"paris\"}|0|1|hello|unset")
+    assert.equal(oai_stream_decoder_buffers(), "{\"city\":\"paris\"}|2|1|hello|unset")
 }
 
 // The dedup key is the CONTENT PART, not the item: a message with two text

@@ -1022,11 +1022,17 @@ class OaStreamState {
     model: string?,
     text_started: map<string, bool>,
     call_arguments: map<string, string>,
+    reasoning_started: bool,
 
     function new() -> OaStreamState {
         let started: map<string, bool> = {};
         let buffered: map<string, string> = {};
-        OaStreamState { model: null, text_started: started, call_arguments: buffered }
+        OaStreamState {
+            model: null,
+            text_started: started,
+            call_arguments: buffered,
+            reasoning_started: false,
+        }
     }
 }
 
@@ -1106,13 +1112,40 @@ function _openai_stream_events(
             };
             null
         },
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            if let delta: string = event.delta {
+                state.reasoning_started = true;
+                out.push(ai.stream.ReasoningDelta { summary: delta });
+            };
+            null
+        },
+        "response.output_item.added" => {
+            if let item: OaOutputItem = event.item {
+                if (item.type == "function_call") {
+                    out.push(
+                        ai.stream.ToolUseDelta {
+                            index: event.output_index ?? 0,
+                            id: item.call_id,
+                            name: item.name,
+                            arguments: null,
+                        },
+                    );
+                }
+            }
+            null
+        },
         "response.function_call_arguments.delta" => {
-            // ai.stream.StreamEvent cannot carry tool calls (PLAN §6), so the
-            // arguments accumulate here and the completed call is read from the
-            // terminal event's response object.
             if let delta: string = event.delta {
                 let key = _openai_event_key(event);
                 let _ = state.call_arguments.set(key, (state.call_arguments.get(key) ?? "") + delta);
+                out.push(
+                    ai.stream.ToolUseDelta {
+                        index: event.output_index ?? 0,
+                        id: event.item_id,
+                        name: null,
+                        arguments: delta,
+                    },
+                );
             };
             null
         },
@@ -1126,11 +1159,28 @@ function _openai_stream_events(
         "response.completed" | "response.incomplete" => {
             if let final_response: OaResponse = event.response {
                 let turn = openai_parse(final_response);
+                for (let block in turn.content) {
+                    match (block) {
+                        let reasoning: ai.content.Reasoning => {
+                            if (!state.reasoning_started && reasoning.summary != "") {
+                                out.push(ai.stream.ReasoningDelta { summary: reasoning.summary });
+                            }
+                            null
+                        },
+                        let tool_use: ai.content.ToolUse => {
+                            out.push(ai.stream.ToolUseDone { tool_use: tool_use });
+                            null
+                        },
+                        _ => null,
+                    };
+                }
                 out.push(
                     ai.stream.TurnMeta {
                         stop_reason: turn.stop_reason,
                         input_tokens: turn.usage?.input_tokens,
                         output_tokens: turn.usage?.output_tokens,
+                        cached_input_tokens: turn.usage?.cached_input_tokens,
+                        reasoning_tokens: turn.usage?.reasoning_tokens,
                     },
                 );
             };
