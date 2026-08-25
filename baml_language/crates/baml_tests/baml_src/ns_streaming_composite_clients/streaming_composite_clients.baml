@@ -17,6 +17,7 @@ class ScriptedStreamClient {
     fail_open_attempts: int,
     fail_pull_attempts: int,
     fail_after_delta: bool,
+    reasoning_before_failure: bool,
     cancel_before_delta: bool,
     unsafe_before_delta: bool,
     attempts: int,
@@ -80,6 +81,24 @@ class ScriptedStreamClient {
             if (self.unsafe_before_delta) {
                 return ai.stream.TurnStream.from_event_source(() -> {
                     throw ai.errors.StepBudgetExceeded { steps: 1 }
+                });
+            }
+            if (self.reasoning_before_failure) {
+                let cursor = 0;
+                let probe = self.probe;
+                let client_id = self.client_id;
+                return ai.stream.TurnStream.from_event_source(() -> {
+                    if (cursor == 0) {
+                        cursor += 1;
+                        ai.stream.ReasoningDelta { summary: "visible thought" }
+                    } else {
+                        probe.events.push(`reasoning-fail:${client_id}:${attempt}`);
+                        throw ai.errors.NetworkFailure {
+                            provider: client_id,
+                            detail: "failed after reasoning",
+                            raw_body: null,
+                        }
+                    }
                 });
             }
             if (self.fail_after_delta) {
@@ -178,6 +197,7 @@ function scripted_client(
     fail_open_attempts: int = 0,
     fail_pull_attempts: int = 0,
     fail_after_delta: bool = false,
+    reasoning_before_failure: bool = false,
     cancel_before_delta: bool = false,
     unsafe_before_delta: bool = false,
 ) -> ScriptedStreamClient {
@@ -187,6 +207,7 @@ function scripted_client(
         fail_open_attempts: fail_open_attempts,
         fail_pull_attempts: fail_pull_attempts,
         fail_after_delta: fail_after_delta,
+        reasoning_before_failure: reasoning_before_failure,
         cancel_before_delta: cancel_before_delta,
         unsafe_before_delta: unsafe_before_delta,
         attempts: 0,
@@ -294,6 +315,37 @@ test "retry_stream_does_not_retry_after_delta" {
     assert.equal(
         retry_stream_does_not_retry_after_delta_case(),
         "prefix|NetworkFailure:failed after first delta|open:partial:1,partial-fail:partial:1",
+    )
+}
+
+function retry_stream_does_not_retry_after_reasoning_case() -> string {
+    let probe = StreamProbe { events: [] };
+    let inner = scripted_client(
+        "reasoning-partial",
+        [],
+        probe,
+        reasoning_before_failure = true,
+    );
+    let retry = ai.clients.Retry.new(
+        inner,
+        max_attempts = 3,
+        backoff = ai.clients.Backoff.new(initial_ms = 0, max_ms = 0),
+    );
+    let stream = retry.invoke_stream(composite_input());
+    let first = match (stream.next_event()) {
+        let reasoning: ai.stream.ReasoningDelta => reasoning.summary,
+        _ => "unexpected",
+    };
+    let second = stream.next_event() catch_all (e) {
+        _ => failure_name(e),
+    };
+    `${first}|${second.to_string()}|${probe.events.join(",")}`
+}
+
+test "retry_stream_does_not_retry_after_reasoning" {
+    assert.equal(
+        retry_stream_does_not_retry_after_reasoning_case(),
+        "visible thought|NetworkFailure:failed after reasoning|open:reasoning-partial:1,reasoning-fail:reasoning-partial:1",
     )
 }
 

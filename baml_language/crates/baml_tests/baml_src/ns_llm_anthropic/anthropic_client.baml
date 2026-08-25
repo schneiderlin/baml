@@ -840,6 +840,18 @@ function anthropic_decode_tool_stream() -> string {
                 seen.push(`text:${d.text}`);
                 null
             },
+            let d: ai.stream.ReasoningDelta => {
+                seen.push(`reasoning:${d.summary}`);
+                null
+            },
+            let d: ai.stream.ToolUseDelta => {
+                seen.push(`tool-delta:${d.index}:${d.id ?? "-"}:${d.name ?? "-"}:${d.arguments ?? "-"}`);
+                null
+            },
+            let d: ai.stream.ToolUseDone => {
+                seen.push(`tool-done:${d.tool_use.id}`);
+                null
+            },
             let m: ai.stream.TurnMeta => {
                 seen.push(`meta:${m.stop_reason ?? "-"}/${m.input_tokens ?? -1}/${m.output_tokens ?? -1}`);
                 null
@@ -869,7 +881,10 @@ function anthropic_decode_tool_stream() -> string {
 
 test "anthropic_decode_tool_stream" {
     let got = anthropic_decode_tool_stream();
-    assert.contains(got, "events=meta:-/11/-1,text:Hel,text:lo,meta:ToolUse/-1/42,done|");
+    assert.contains(
+        got,
+        "events=meta:-/11/-1,text:Hel,text:lo,tool-delta:1:toolu_1:anth_weather:-,tool-delta:1:-:-:{\"city\":,tool-delta:1:-:-:\"SF\"},reasoning:hmm,meta:ToolUse/-1/42,tool-done:toolu_1,done|",
+    );
     // thinking never becomes answer text
     assert.contains(got, "thinking=hmm|");
     assert.contains(got, "signature=sig1|");

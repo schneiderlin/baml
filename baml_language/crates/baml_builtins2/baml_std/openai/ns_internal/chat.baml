@@ -1450,18 +1450,16 @@ class ChatToolCallBuffer {
 
 /// The stateful SSE decoder for one streamed turn.
 ///
-/// `ai.stream.StreamEvent` is `TextDelta | TurnMeta | TurnDone` and
-/// `TurnStream.final_turn()` only ever produces a single `Text` block, so
-/// streamed tool calls cannot reach the runner today (PLAN §6 — extending
-/// StreamEvent is its own stdlib change). They are still fully assembled here:
-/// `tool_uses()` returns them once the stream ends, which is what a future
-/// StreamEvent variant will emit and what the tests assert on.
+/// Reasoning and tool argument fragments are emitted as typed stream events.
+/// Tool arguments are also assembled here so a validated canonical ToolUseDone
+/// can be emitted before the turn terminates.
 class ChatStreamDecoder {
     provider: string,
     calls: ChatToolCallBuffer[],
+    calls_emitted: bool,
 
     function new(provider: string) -> ChatStreamDecoder {
-        ChatStreamDecoder { provider: provider, calls: [] }
+        ChatStreamDecoder { provider: provider, calls: [], calls_emitted: false }
     }
 
     // Extend (or open) the buffer for one tool-call delta.
@@ -1516,6 +1514,11 @@ class ChatStreamDecoder {
                                     out.push(ai.stream.TextDelta { text: text });
                                 }
                             }
+                            if let reasoning: string = choice.delta?.reasoning_content {
+                                if (reasoning != "") {
+                                    out.push(ai.stream.ReasoningDelta { summary: reasoning });
+                                }
+                            }
                             if let refusal: string = choice.delta?.refusal {
                                 if (refusal != "") {
                                     out.push(ai.stream.TextDelta { text: refusal });
@@ -1525,14 +1528,31 @@ class ChatStreamDecoder {
                             let position = 0;
                             for (let call in deltas) {
                                 self._absorb_call(call, position);
+                                out.push(
+                                    ai.stream.ToolUseDelta {
+                                        index: call.index ?? position,
+                                        id: call.id,
+                                        name: call.fn?.name,
+                                        arguments: call.fn?.arguments,
+                                    },
+                                );
                                 position += 1;
                             }
                             if let reason: string = choice.finish_reason {
+                                let stop_reason = chat_stop_reason(reason);
+                                if (stop_reason == ai.content.StopReason.ToolUse && !self.calls_emitted) {
+                                    for (let tool_use in self.tool_uses()) {
+                                        out.push(ai.stream.ToolUseDone { tool_use: tool_use });
+                                    }
+                                    self.calls_emitted = true;
+                                }
                                 out.push(
                                     ai.stream.TurnMeta {
-                                        stop_reason: chat_stop_reason(reason),
+                                        stop_reason: stop_reason,
                                         input_tokens: null,
                                         output_tokens: null,
+                                        cached_input_tokens: null,
+                                        reasoning_tokens: null,
                                     },
                                 );
                             }
@@ -1543,6 +1563,8 @@ class ChatStreamDecoder {
                                     stop_reason: null,
                                     input_tokens: usage.prompt_tokens,
                                     output_tokens: usage.completion_tokens,
+                                    cached_input_tokens: usage.prompt_tokens_details?.cached_tokens,
+                                    reasoning_tokens: usage.completion_tokens_details?.reasoning_tokens,
                                 },
                             );
                         }
