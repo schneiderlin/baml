@@ -9446,6 +9446,8 @@ fn baml.sys._strip_carriage_return(line: uint8array) -> uint8array {
     }
 }
 
+fn baml.sys.Process.pid = builtin(io)
+
 fn baml.sys.Process.wait = builtin(io)
 
 fn baml.sys.Process.kill = builtin(io)
@@ -9516,6 +9518,8 @@ fn baml.sys.exit(code: int) -> never {
 fn baml.sys.argv = builtin(vm)
 
 fn baml.sys.pid = builtin(io)
+
+fn baml.sys.kill = builtin(io)
 
 fn baml.time.Duration.abs(self: baml.time.Duration) -> baml.time.Duration {
     // Locals:
