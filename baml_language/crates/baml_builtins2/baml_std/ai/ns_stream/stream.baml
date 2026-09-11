@@ -652,7 +652,7 @@ class TurnStream {
                 }
             }
         }
-        let content: root.content.Block[] = [];
+        let content: root.content.ModelBlock[] = [];
         if (self._reasoning != "") {
             content.push(root.content.Reasoning { summary: self._reasoning });
         }

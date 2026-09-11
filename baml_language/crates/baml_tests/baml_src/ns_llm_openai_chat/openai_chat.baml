@@ -83,6 +83,33 @@ function _chat_input_with_history() -> ai.ModelTurnInput {
     }
 }
 
+// Kimi keeps model reasoning across tool turns. Exercise the current content-
+// block constructors so this fork-owned replay contract tracks ai.events API
+// changes instead of silently falling back to the legacy string constructors.
+function _kimi_input_with_history() -> ai.ModelTurnInput {
+    let spec = ChatEcho@spec("and tomorrow?");
+    let args: map<string, unknown> = { "city": "SF" };
+    let journal = ai.Journal {
+        log: [
+            ai.events.UserMessage.of(["weather in SF?"]),
+            ai.events.AssistantMessage {
+                content: [
+                    ai.content.Reasoning { summary: "check the forecast" },
+                    ai.content.ToolUse { id: "call_1", name: "chat_get_weather", args: args },
+                ],
+                client_id: "openai-chat/kimi-for-coding",
+            },
+            ai.events.ToolCompleted.of("call_1", ["sunny in SF"]),
+        ],
+    };
+    ai.ModelTurnInput {
+        prompt: spec.prompt_template,
+        journal: journal,
+        toolbox: ai.tools.Toolbox.new([ai.tools.tool(chat_get_weather)]),
+        output_type: spec.output_type(),
+    }
+}
+
 function _chat_vision_input(photo: image) -> ai.ModelTurnInput {
     let spec = ChatVision@spec(photo);
     ai.ModelTurnInput {
@@ -159,6 +186,28 @@ test "chat_openai_request_shape" {
     assert.equal(
         chat_openai_request_shape(),
         "POST|/chat/completions|Bearer test-key|application/json|gpt-4o-mini|system|text|user|model,messages|pong|Complete|9/2/4/1",
+    )
+}
+
+function kimi_request_preserves_thinking_and_reasoning() -> string {
+    let cl = openai.KimiClient.new();
+    let request = cl.render(_kimi_input_with_history());
+    let body = baml.json.parse(request.body);
+    [
+        cl.id(),
+        request.url,
+        baml.json.path<string>(body, ".model"),
+        baml.json.path<string>(body, ".thinking.type"),
+        baml.json.path<string>(body, ".thinking.keep"),
+        baml.json.path<string>(body, ".messages[3].reasoning_content"),
+        baml.json.path<string>(body, ".messages[4].content"),
+    ].join("|")
+}
+
+test "kimi_request_preserves_thinking_and_reasoning" {
+    assert.equal(
+        kimi_request_preserves_thinking_and_reasoning(),
+        "openai-chat/kimi-for-coding|https://api.kimi.com/coding/v1/chat/completions|kimi-for-coding|enabled|all|check the forecast|sunny in SF",
     )
 }
 

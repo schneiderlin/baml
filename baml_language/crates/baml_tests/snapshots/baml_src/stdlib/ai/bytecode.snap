@@ -1799,18 +1799,17 @@ function ai.clients.<(ai.clients.Fallback as ai.stream.StreamingClient)>.invoke_
     make_closure .<lambda(Fallback.invoke_stream, 1)>, 2
     load_const null
     load_const false
-    load_type string
-    alloc_array 0
-    load_const 0
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     alloc_array 0
     load_const 0
     load_const false
     load_type ai.events.LLMCall
     alloc_array 0
-    init_instance ai.clients.StreamRelay .open, .retry, .current, .emitted, .pending_text, .pending_cursor, .terminal, .terminal_cursor, .finished, .calls
+    init_instance ai.clients.StreamRelay .open, .retry, .current, .emitted, .terminal, .terminal_cursor, .finished, .calls
     store_var_load_var relay
     make_bound_method ai.clients.StreamRelay.next_event
+    load_var relay
+    make_bound_method ai.clients.StreamRelay.close_current
     call ai.stream.TurnStream.from_event_source
     store_var stream
     load_var2 5 4
@@ -1912,18 +1911,17 @@ function ai.clients.<(ai.clients.Retry as ai.stream.StreamingClient)>.invoke_str
     make_closure .<lambda(Retry.invoke_stream, 1)>, 2
     load_const null
     load_const false
-    load_type string
-    alloc_array 0
-    load_const 0
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     alloc_array 0
     load_const 0
     load_const false
     load_type ai.events.LLMCall
     alloc_array 0
-    init_instance ai.clients.StreamRelay .open, .retry, .current, .emitted, .pending_text, .pending_cursor, .terminal, .terminal_cursor, .finished, .calls
+    init_instance ai.clients.StreamRelay .open, .retry, .current, .emitted, .terminal, .terminal_cursor, .finished, .calls
     store_var_load_var relay
     make_bound_method ai.clients.StreamRelay.next_event
+    load_var relay
+    make_bound_method ai.clients.StreamRelay.close_current
     call ai.stream.TurnStream.from_event_source
     store_var stream
     load_var2 5 4
@@ -2476,7 +2474,7 @@ function ai.clients.StreamRelay.close_current(self: ai.clients.StreamRelay) -> v
 
   L0:
     load_var _3
-    call ai.stream.TurnStream._finish
+    call ai.stream.TurnStream.close
     pop 1
     load_const null
 
@@ -2484,30 +2482,20 @@ function ai.clients.StreamRelay.close_current(self: ai.clients.StreamRelay) -> v
     return
 }
 
-function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone | ai.stream.Done {
+function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone | ai.stream.Done {
     load_var self
-    load_field .pending_cursor
+    load_field .terminal_cursor
     store_var _3
     load_var self
-    load_field .pending_text
+    load_field .terminal
     container_len
     store_var _4
     load_var2 2 3
     cmp_int_op <
-    pop_jump_if_true L22
-    load_var self
-    load_field .terminal_cursor
-    store_var _14
-    load_var self
-    load_field .terminal
-    container_len
-    store_var _15
-    load_var2 5 6
-    cmp_int_op <
-    pop_jump_if_true L20
+    pop_jump_if_true L30
     load_var self
     load_field .finished
-    pop_jump_if_true L19
+    pop_jump_if_true L29
     load_var self
     load_field .current
     load_const null
@@ -2526,34 +2514,34 @@ function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.s
 
   L0:
     load_var opened
-    store_var _30
-    load_var _30
-    narrow_bind ai.clients.StreamRelayError, slot=9
-    pop_jump_if_true L18
+    store_var _19
+    load_var _19
+    narrow_bind ai.clients.StreamRelayError, slot=6
+    pop_jump_if_true L28
     load_var opened
-    store_var _34
-    load_var _34
-    narrow_bind ai.stream.TurnStream, slot=10
+    store_var _23
+    load_var _23
+    narrow_bind ai.stream.TurnStream, slot=7
     pop_jump_if_false L1
-    load_var2 1 10
+    load_var2 1 7
     store_field .current
 
   L1:
     load_var self
     load_field .current
-    store_var _37
-    load_var _37
-    narrow_bind ai.stream.TurnStream, slot=11
+    store_var _26
+    load_var _26
+    narrow_bind ai.stream.TurnStream, slot=8
     pop_jump_if_true L2
     load_const "StreamRelay has no current stream"
     call baml.sys.panic
-    jump L26
+    jump L32
 
   L2:
-    load_var _37
+    load_var _26
     store_var stream
     load_var stream
-    call ai.stream.TurnStream.next
+    call ai.stream.TurnStream.next_event
     store_var next
     jump L3
     load_var e
@@ -2564,25 +2552,50 @@ function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.s
 
   L3:
     load_var next
-    store_var _42
-    load_var _42
-    narrow_bind string[], slot=15
-    pop_jump_if_true L14
+    store_var _31
+    load_var _31
+    narrow_bind ai.stream.TextDelta, slot=12
+    pop_jump_if_true L27
     load_var next
-    store_var _48
-    load_var _48
-    narrow_bind ai.stream.Done, slot=18
+    store_var _33
+    load_var _33
+    narrow_bind ai.stream.ReasoningDelta, slot=13
+    pop_jump_if_true L26
+    load_var next
+    store_var _35
+    load_var _35
+    narrow_bind ai.stream.ToolUseDelta, slot=14
+    pop_jump_if_true L25
+    load_var next
+    store_var _37
+    load_var _37
+    narrow_bind ai.stream.ToolUseDone, slot=15
+    pop_jump_if_true L24
+    load_var next
+    store_var _39
+    load_var _39
+    narrow_bind ai.stream.TurnMeta, slot=16
+    pop_jump_if_true L23
+    load_var next
+    store_var _41
+    load_var _41
+    narrow_bind ai.stream.TurnDone, slot=17
+    pop_jump_if_true L18
+    load_var next
+    store_var _62
+    load_var _62
+    narrow_bind ai.stream.Done, slot=25
     pop_jump_if_true L4
-    load_var2 1 13
+    load_var2 1 10
     load_field .error
     call ai.clients.StreamRelay.recover
     pop 1
     load_var self
     call ai.clients.StreamRelay.next_event
-    jump L26
+    jump L32
 
   L4:
-    load_var _48
+    load_var _62
     store_var done
     load_var stream
     call ai.stream.TurnStream.final_turn
@@ -2596,20 +2609,20 @@ function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.s
 
   L5:
     load_var final
-    store_var _53
-    load_var _53
-    narrow_bind ai.clients.StreamRelayError, slot=22
-    pop_jump_if_true L13
+    store_var _67
+    load_var _67
+    narrow_bind ai.clients.StreamRelayError, slot=29
+    pop_jump_if_true L17
     load_var final
-    store_var _57
-    load_var _57
-    narrow_bind ai.ModelTurn, slot=23
+    store_var _71
+    load_var _71
+    narrow_bind ai.ModelTurn, slot=30
     pop_jump_if_true L6
     load_var done
-    jump L26
+    jump L32
 
   L6:
-    load_var _57
+    load_var _71
     store_var turn
     load_var self
     load_const true
@@ -2619,21 +2632,21 @@ function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.s
     load_type baml.iter.Iterable<Error = never, Item = ai.events.LLMCall>
     load_const "iter"
     virtual_call nargs=1 ntypeargs=0
-    store_var _60
+    store_var _74
 
   L7:
-    load_var _60
+    load_var _74
     load_type baml.iter.Iterator<Error = never, Item = ai.events.LLMCall>
     load_const "next"
     virtual_call nargs=1 ntypeargs=0
-    store_var _61
-    load_var _61
+    store_var _75
+    load_var _75
     is_type baml.iter.Done
     pop_jump_if_true L8
     load_type ai.events.LLMCall
     load_var self
     load_field .calls
-    load_var _61
+    load_var _75
     call baml.Array.push
     pop 1
     jump L7
@@ -2641,7 +2654,7 @@ function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.s
   L8:
     load_var turn
     load_field .stop_reason
-    store_var _70
+    store_var _84
     load_var turn
     load_field .usage
     load_const null
@@ -2650,12 +2663,12 @@ function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.s
     load_var turn
     load_field .usage
     load_field .0
-    store_var _71
+    store_var _85
     jump L10
 
   L9:
     load_const null
-    store_var _71
+    store_var _85
 
   L10:
     load_var turn
@@ -2666,132 +2679,196 @@ function ai.clients.StreamRelay.next_event(self: ai.clients.StreamRelay) -> ai.s
     load_var turn
     load_field .usage
     load_field .1
-    store_var _75
+    store_var _89
     jump L12
 
   L11:
     load_const null
-    store_var _75
+    store_var _89
 
   L12:
-    load_var2 1 27
-    load_var2 28 29
-    init_instance ai.stream.TurnMeta .stop_reason, .input_tokens, .output_tokens
+    load_var turn
+    load_field .usage
+    load_const null
+    cmp_op ==
+    pop_jump_if_true L13
+    load_var turn
+    load_field .usage
+    load_field .2
+    store_var _93
+    jump L14
+
+  L13:
+    load_const null
+    store_var _93
+
+  L14:
+    load_var turn
+    load_field .usage
+    load_const null
+    cmp_op ==
+    pop_jump_if_true L15
+    load_var turn
+    load_field .usage
+    load_field .3
+    store_var _97
+    jump L16
+
+  L15:
+    load_const null
+    store_var _97
+
+  L16:
+    load_var2 1 34
+    load_var2 35 36
+    load_var2 37 38
+    init_instance ai.stream.TurnMeta .stop_reason, .input_tokens, .output_tokens, .cached_input_tokens, .reasoning_tokens
     alloc_instance ai.stream.TurnDone
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     alloc_array 2
     store_field .terminal
     load_var self
     call ai.clients.StreamRelay.next_event
-    jump L26
+    jump L32
 
-  L13:
-    load_var2 1 22
+  L17:
+    load_var2 1 29
     load_field .error
     call ai.clients.StreamRelay.recover
     pop 1
     load_var self
     call ai.clients.StreamRelay.next_event
-    jump L26
+    jump L32
 
-  L14:
-    load_var _42
-    store_var batch
+  L18:
+    load_var _41
+    store_var event
+    load_var stream
+    call ai.stream.TurnStream.final_turn
+    store_var final
+    jump L19
+    load_var e
+    throw_if_panic
+    load_var e
+    init_instance ai.clients.StreamRelayError .error
+    store_var final
+
+  L19:
+    load_var final
+    store_var _46
+    load_var _46
+    narrow_bind ai.clients.StreamRelayError, slot=21
+    pop_jump_if_true L22
+    load_var final
+    store_var _50
+    load_var _50
+    narrow_bind ai.ModelTurn, slot=22
+    pop_jump_if_false L21
+    load_var self
+    load_const true
+    store_field .finished
+    load_var _50
+    load_field .calls
+    load_type baml.iter.Iterable<Error = never, Item = ai.events.LLMCall>
+    load_const "iter"
+    virtual_call nargs=1 ntypeargs=0
+    store_var _53
+
+  L20:
+    load_var _53
+    load_type baml.iter.Iterator<Error = never, Item = ai.events.LLMCall>
+    load_const "next"
+    virtual_call nargs=1 ntypeargs=0
+    store_var _54
+    load_var _54
+    is_type baml.iter.Done
+    pop_jump_if_true L21
+    load_type ai.events.LLMCall
+    load_var self
+    load_field .calls
+    load_var _54
+    call baml.Array.push
+    pop 1
+    jump L20
+
+  L21:
+    load_var event
+    jump L32
+
+  L22:
+    load_var2 1 21
+    load_field .error
+    call ai.clients.StreamRelay.recover
+    pop 1
+    load_var self
+    call ai.clients.StreamRelay.next_event
+    jump L32
+
+  L23:
+    load_var _39
+    jump L32
+
+  L24:
     load_var self
     load_const true
     store_field .emitted
-    load_var2 1 16
-    store_field .pending_text
+    load_var _37
+    jump L32
+
+  L25:
     load_var self
-    load_const 1
-    store_field .pending_cursor
-    load_type string
-    load_var batch
-    load_const 0
-    call baml.Array.at
-    jump_if_not_null_or_pop L15
-    jump L16
+    load_const true
+    store_field .emitted
+    load_var _35
+    jump L32
 
-  L15:
-    store_var _45
-    jump L17
+  L26:
+    load_var self
+    load_const true
+    store_field .emitted
+    load_var _33
+    jump L32
 
-  L16:
-    load_const "StreamRelay received an empty batch"
-    call baml.sys.panic
-    store_var _45
+  L27:
+    load_var self
+    load_const true
+    store_field .emitted
+    load_var _31
+    jump L32
 
-  L17:
-    load_var _45
-    init_instance ai.stream.TextDelta .text
-    jump L26
-
-  L18:
-    load_var2 1 9
+  L28:
+    load_var2 1 6
     load_field .error
     call ai.clients.StreamRelay.recover
     pop 1
     load_var self
     call ai.clients.StreamRelay.next_event
-    jump L26
+    jump L32
 
-  L19:
+  L29:
     alloc_instance ai.stream.Done
-    jump L26
+    jump L32
 
-  L20:
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+  L30:
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     load_var self
     load_field .terminal
     load_var self
     load_field .terminal_cursor
     call baml.Array.at
-    jump_if_not_null_or_pop L21
+    jump_if_not_null_or_pop L31
     load_const "StreamRelay lost a terminal event"
     call baml.sys.panic
 
-  L21:
+  L31:
     load_var self
     copy 0
     load_field .terminal_cursor
     load_const 1
     bin_op +
     store_field .terminal_cursor
-    jump L26
 
-  L22:
-    load_type string
-    load_var self
-    load_field .pending_text
-    load_var self
-    load_field .pending_cursor
-    call baml.Array.at
-    jump_if_not_null_or_pop L23
-    jump L24
-
-  L23:
-    store_var _7
-    jump L25
-
-  L24:
-    load_const "StreamRelay lost a pending delta"
-    call baml.sys.panic
-    store_var _7
-
-  L25:
-    load_var self
-    copy 0
-    load_field .pending_cursor
-    load_const 1
-    bin_op +
-    store_field .pending_cursor
-    load_var self
-    load_const true
-    store_field .emitted
-    load_var _7
-    init_instance ai.stream.TextDelta .text
-
-  L26:
+  L32:
     return
 }
 
@@ -6377,24 +6454,38 @@ function ai.stream.TurnStream._check_terminal(self: ai.stream.TurnStream) -> voi
 
 function ai.stream.TurnStream._finish(self: ai.stream.TurnStream) -> void {
     load_var self
+    load_field ._done
+    pop_jump_if_true L2
+    load_var self
     load_const true
     store_field ._done
     load_var self
     load_field ._sse
-    store_var _3
-    load_var _3
+    store_var _4
+    load_var _4
     narrow_bind baml.http.SseStream, slot=2
-    pop_jump_if_true L0
-    load_const null
-    jump L1
+    pop_jump_if_false L0
+    load_var _4
+    sys_op baml.http.SseStream.close
+    pop 1
 
   L0:
-    load_var _3
-    sys_op baml.http.SseStream.close
+    load_var self
+    load_field ._close_source
+    store_var _8
+    load_var _8
+    narrow_bind () -> void throws never, slot=3
+    pop_jump_if_true L1
+    load_const null
+    jump L2
+
+  L1:
+    load_var _8
+    call_indirect
     pop 1
     load_const null
 
-  L1:
+  L2:
     return
 }
 
@@ -6449,10 +6540,16 @@ function ai.stream.TurnStream._stamp_first_delta(self: ai.stream.TurnStream) -> 
     return
 }
 
+function ai.stream.TurnStream.close(self: ai.stream.TurnStream) -> void {
+    load_var self
+    call ai.stream.TurnStream._finish
+    return
+}
+
 function ai.stream.TurnStream.final_turn(self: ai.stream.TurnStream) -> ai.ModelTurn {
   L0:
     load_var self
-    call ai.stream.TurnStream.next
+    call ai.stream.TurnStream.next_event
     store_var _3
     load_var _3
     narrow_bind ai.stream.Done, slot=2
@@ -6472,6 +6569,18 @@ function ai.stream.TurnStream.final_turn(self: ai.stream.TurnStream) -> ai.Model
     call baml.ops.equals_equals
     unary_op !
     pop_jump_if_true L1
+    load_var self
+    load_field ._cached_input_tokens
+    load_const null
+    call baml.ops.equals_equals
+    unary_op !
+    pop_jump_if_true L1
+    load_var self
+    load_field ._reasoning_tokens
+    load_const null
+    call baml.ops.equals_equals
+    unary_op !
+    pop_jump_if_true L1
     load_const null
     store_var usage
     jump L6
@@ -6483,35 +6592,37 @@ function ai.stream.TurnStream.final_turn(self: ai.stream.TurnStream) -> ai.Model
     load_const 0
 
   L2:
-    store_var _12
+    store_var _18
     load_var self
     load_field ._output_tokens
     jump_if_not_null_or_pop L3
     jump L4
 
   L3:
-    store_var _16
+    store_var _22
     jump L5
 
   L4:
     load_const 0
-    store_var _16
+    store_var _22
 
   L5:
     load_var2 4 5
-    load_const null
-    load_const null
+    load_var self
+    load_field ._cached_input_tokens
+    load_var self
+    load_field ._reasoning_tokens
     init_instance ai.events.Usage .input_tokens, .output_tokens, .cached_input_tokens, .reasoning_tokens
     store_var usage
 
   L6:
     load_var self
     load_field ._wire_call
-    store_var _19
-    load_var _19
+    store_var _27
+    load_var _27
     narrow_bind ai.events.LLMCall, slot=6
     pop_jump_if_false L7
-    load_var _19
+    load_var _27
     store_var_load_var call
     load_field .timing
     load_field .duration_ms
@@ -6520,42 +6631,82 @@ function ai.stream.TurnStream.final_turn(self: ai.stream.TurnStream) -> ai.Model
     pop_jump_if_false L7
     load_var self
     load_field ._call_started
-    store_var _24
-    load_var _24
+    store_var _32
+    load_var _32
     narrow_bind baml.time.Instant, slot=8
     pop_jump_if_false L7
-    load_var _24
+    load_var _32
     call baml.time.Instant.elapsed
     call baml.time.Duration.to_milliseconds
-    store_var _27
+    store_var _35
     load_var call
     load_field .timing
-    load_var _27
+    load_var _35
     store_field .duration_ms
 
   L7:
+    load_type ai.content.Text | ai.content.Media | ai.content.Reasoning | ai.content.ToolUse
+    alloc_array 0
+    store_var content
     load_var self
-    load_field ._stop_reason
-    jump_if_not_null_or_pop L8
-    jump L9
+    load_field ._reasoning
+    load_const ""
+    cmp_op !=
+    pop_jump_if_false L8
+    load_type ai.content.Text | ai.content.Media | ai.content.Reasoning | ai.content.ToolUse
+    load_var2 10 1
+    load_field ._reasoning
+    init_instance ai.content.Reasoning .summary
+    call baml.Array.push
+    pop 1
 
   L8:
-    store_var _32
-    jump L10
+    load_type ai.content.Text | ai.content.Media | ai.content.Reasoning | ai.content.ToolUse
+    load_var2 10 1
+    load_field ._text
+    init_instance ai.content.Text .text
+    call baml.Array.push
+    pop 1
+    load_var self
+    load_field ._tool_uses
+    load_type baml.iter.Iterable<Error = never, Item = ai.content.ToolUse>
+    load_const "iter"
+    virtual_call nargs=1 ntypeargs=0
+    store_var _48
 
   L9:
-    load_const ai.content.StopReason.Complete
-    alloc_variant ai.content.StopReason
-    store_var _32
+    load_var _48
+    load_type baml.iter.Iterator<Error = never, Item = ai.content.ToolUse>
+    load_const "next"
+    virtual_call nargs=1 ntypeargs=0
+    store_var _49
+    load_var _49
+    is_type baml.iter.Done
+    pop_jump_if_true L10
+    load_type ai.content.Text | ai.content.Media | ai.content.Reasoning | ai.content.ToolUse
+    load_var2 10 12
+    call baml.Array.push
+    pop 1
+    jump L9
 
   L10:
     load_var self
-    load_field ._text
-    init_instance ai.content.Text .text
-    load_type ai.content.Text | ai.content.Media | ai.content.Reasoning | ai.content.ToolUse
-    alloc_array 1
-    load_var2 10 3
-    load_var self
+    load_field ._stop_reason
+    jump_if_not_null_or_pop L11
+    jump L12
+
+  L11:
+    store_var _58
+    jump L13
+
+  L12:
+    load_const ai.content.StopReason.Complete
+    alloc_variant ai.content.StopReason
+    store_var _58
+
+  L13:
+    load_var2 10 13
+    load_var2 3 1
     load_field ._calls
     init_instance ai.ModelTurn .content, .stop_reason, .usage, .calls
     return
@@ -6565,12 +6716,18 @@ function ai.stream.TurnStream.from_chunks(chunks: string[]) -> ai.stream.TurnStr
     load_const null
     load_const null
     load_const null
+    load_const null
     load_var chunks
     load_const 0
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     alloc_array 0
     load_const 0
     load_const ""
+    load_const ""
+    load_type ai.content.ToolUse
+    alloc_array 0
+    load_const null
+    load_const null
     load_const null
     load_const null
     load_const null
@@ -6583,21 +6740,34 @@ function ai.stream.TurnStream.from_chunks(chunks: string[]) -> ai.stream.TurnStr
     load_const null
     load_const null
     load_const false
-    init_instance ai.stream.TurnStream ._event_source, ._sse, ._decode, ._chunks, ._cursor, ._pending, ._pcursor, ._text, ._stop_reason, ._input_tokens, ._output_tokens, ._done, ._require_terminal, ._saw_terminal, ._calls, ._wire_call, ._call_started, ._ttft_from, ._capture_sse
+    init_instance ai.stream.TurnStream ._event_source, ._close_source, ._sse, ._decode, ._chunks, ._cursor, ._pending, ._pcursor, ._text, ._reasoning, ._tool_uses, ._stop_reason, ._input_tokens, ._output_tokens, ._cached_input_tokens, ._reasoning_tokens, ._done, ._require_terminal, ._saw_terminal, ._calls, ._wire_call, ._call_started, ._ttft_from, ._capture_sse
     return
 }
 
-function ai.stream.TurnStream.from_event_source(next_event: () -> ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone | ai.stream.Done throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError) -> ai.stream.TurnStream {
-    load_var next_event
+function ai.stream.TurnStream.from_event_source(next_event: () -> ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone | ai.stream.Done throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, close: (() -> void throws never) | null) -> ai.stream.TurnStream {
+    load_var close
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L0
+    load_const null
+    store_var close
+
+  L0:
+    load_var2 1 2
     load_const null
     load_const null
     load_type string
     alloc_array 0
     load_const 0
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     alloc_array 0
     load_const 0
     load_const ""
+    load_const ""
+    load_type ai.content.ToolUse
+    alloc_array 0
+    load_const null
+    load_const null
     load_const null
     load_const null
     load_const null
@@ -6610,11 +6780,11 @@ function ai.stream.TurnStream.from_event_source(next_event: () -> ai.stream.Text
     load_const null
     load_const null
     load_const false
-    init_instance ai.stream.TurnStream ._event_source, ._sse, ._decode, ._chunks, ._cursor, ._pending, ._pcursor, ._text, ._stop_reason, ._input_tokens, ._output_tokens, ._done, ._require_terminal, ._saw_terminal, ._calls, ._wire_call, ._call_started, ._ttft_from, ._capture_sse
+    init_instance ai.stream.TurnStream ._event_source, ._close_source, ._sse, ._decode, ._chunks, ._cursor, ._pending, ._pcursor, ._text, ._reasoning, ._tool_uses, ._stop_reason, ._input_tokens, ._output_tokens, ._cached_input_tokens, ._reasoning_tokens, ._done, ._require_terminal, ._saw_terminal, ._calls, ._wire_call, ._call_started, ._ttft_from, ._capture_sse
     return
 }
 
-function ai.stream.TurnStream.from_sse(sse: baml.http.SseStream, decode: (string) -> (ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone)[] throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, require_terminal: string | null) -> ai.stream.TurnStream {
+function ai.stream.TurnStream.from_sse(sse: baml.http.SseStream, decode: (string) -> (ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone)[] throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, require_terminal: string | null) -> ai.stream.TurnStream {
     load_var require_terminal
     load_const <omitted>
     cmp_op ==
@@ -6624,14 +6794,20 @@ function ai.stream.TurnStream.from_sse(sse: baml.http.SseStream, decode: (string
 
   L0:
     load_const null
+    load_const null
     load_var2 1 2
     load_type string
     alloc_array 0
     load_const 0
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     alloc_array 0
     load_const 0
     load_const ""
+    load_const ""
+    load_type ai.content.ToolUse
+    alloc_array 0
+    load_const null
+    load_const null
     load_const null
     load_const null
     load_const null
@@ -6644,7 +6820,7 @@ function ai.stream.TurnStream.from_sse(sse: baml.http.SseStream, decode: (string
     load_const null
     load_const null
     load_const false
-    init_instance ai.stream.TurnStream ._event_source, ._sse, ._decode, ._chunks, ._cursor, ._pending, ._pcursor, ._text, ._stop_reason, ._input_tokens, ._output_tokens, ._done, ._require_terminal, ._saw_terminal, ._calls, ._wire_call, ._call_started, ._ttft_from, ._capture_sse
+    init_instance ai.stream.TurnStream ._event_source, ._close_source, ._sse, ._decode, ._chunks, ._cursor, ._pending, ._pcursor, ._text, ._reasoning, ._tool_uses, ._stop_reason, ._input_tokens, ._output_tokens, ._cached_input_tokens, ._reasoning_tokens, ._done, ._require_terminal, ._saw_terminal, ._calls, ._wire_call, ._call_started, ._ttft_from, ._capture_sse
     return
 }
 
@@ -6656,7 +6832,7 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string[] | ai.
   L0:
     load_var self
     load_field ._done
-    pop_jump_if_true L15
+    pop_jump_if_true L19
 
   L1:
     load_var self
@@ -6671,22 +6847,22 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string[] | ai.
     pop_jump_if_true L9
     load_var ready
     container_len
-    store_var _40
-    load_var _40
+    store_var _61
+    load_var _61
     load_const 0
     cmp_int_op >
     pop_jump_if_true L8
     load_var self
     load_field ._event_source
-    store_var _42
-    load_var _42
-    narrow_bind () -> ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone | ai.stream.Done throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, slot=18
+    store_var _63
+    load_var _63
+    narrow_bind () -> ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone | ai.stream.Done throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, slot=26
     pop_jump_if_true L6
     load_var self
     load_field ._sse
-    store_var _55
-    load_var _55
-    narrow_bind baml.http.SseStream, slot=21
+    store_var _76
+    load_var _76
+    narrow_bind baml.http.SseStream, slot=29
     pop_jump_if_true L3
     load_type string
     load_var self
@@ -6694,18 +6870,18 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string[] | ai.
     load_var self
     load_field ._cursor
     call baml.Array.at
-    store_var _83
-    load_var _83
-    narrow_bind string, slot=27
+    store_var _104
+    load_var _104
+    narrow_bind string, slot=35
     pop_jump_if_true L2
     load_var self
     call ai.stream.TurnStream._finish
     pop 1
     alloc_instance ai.stream.Done
-    jump L16
+    jump L20
 
   L2:
-    load_var _83
+    load_var _104
     store_var c
     load_var self
     call ai.stream.TurnStream._stamp_first_delta
@@ -6720,59 +6896,59 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string[] | ai.
     load_var self
     load_field ._text
     call baml.String.from
-    store_var _86
+    store_var _107
     load_type string
     load_var c
     call baml.String.from
-    store_var _89
-    load_var2 1 29
-    load_var _89
+    store_var _110
+    load_var2 1 37
+    load_var _110
     bin_op +
     store_field ._text
     load_var c
     load_type string
     alloc_array 1
-    jump L16
+    jump L20
 
   L3:
-    load_var _55
+    load_var _76
     sys_op baml.http.SseStream.next
-    store_var _57
-    load_var _57
+    store_var _78
+    load_var _78
     load_const null
     cmp_op ==
     pop_jump_if_true L5
-    load_var _57
+    load_var _78
     store_var batch
-    load_var2 1 23
+    load_var2 1 31
     call ai.stream.TurnStream._capture_batch
     pop 1
     load_var self
     load_field ._decode
-    store_var _65
-    load_var _65
-    narrow_bind (string) -> (ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone)[] throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, slot=24
+    store_var _86
+    load_var _86
+    narrow_bind (string) -> (ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone)[] throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, slot=32
     pop_jump_if_false L0
-    load_var2 23 24
+    load_var2 31 32
     call_indirect
-    load_type baml.iter.Iterable<Error = never, Item = ai.stream.TextDelta | ai.stream.TurnDone | ai.stream.TurnMeta>
+    load_type baml.iter.Iterable<Error = never, Item = ai.stream.ReasoningDelta | ai.stream.TextDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnDone | ai.stream.TurnMeta>
     load_const "iter"
     virtual_call nargs=1 ntypeargs=0
-    store_var _70
+    store_var _91
 
   L4:
-    load_var _70
-    load_type baml.iter.Iterator<Error = never, Item = ai.stream.TextDelta | ai.stream.TurnDone | ai.stream.TurnMeta>
+    load_var _91
+    load_type baml.iter.Iterator<Error = never, Item = ai.stream.ReasoningDelta | ai.stream.TextDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnDone | ai.stream.TurnMeta>
     load_const "next"
     virtual_call nargs=1 ntypeargs=0
-    store_var _71
-    load_var _71
+    store_var _92
+    load_var _92
     is_type baml.iter.Done
     pop_jump_if_true L0
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     load_var self
     load_field ._pending
-    load_var _71
+    load_var _92
     call baml.Array.push
     pop 1
     jump L4
@@ -6785,44 +6961,53 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string[] | ai.
     call ai.stream.TurnStream._check_terminal
     pop 1
     alloc_instance ai.stream.Done
-    jump L16
+    jump L20
 
   L6:
-    load_var _42
+    load_var _63
     call_indirect
-    store_var _44
-    load_var _44
-    store_var _46
-    load_var _46
-    narrow_bind ai.stream.TextDelta, slot=20
+    store_var _65
+    load_var _65
+    store_var _67
+    load_var _67
+    narrow_bind ai.stream.TextDelta, slot=28
     pop_jump_if_true L7
-    load_var _46
-    narrow_bind ai.stream.TurnMeta, slot=20
+    load_var _67
+    narrow_bind ai.stream.ReasoningDelta, slot=28
     pop_jump_if_true L7
-    load_var _46
-    narrow_bind ai.stream.TurnDone, slot=20
+    load_var _67
+    narrow_bind ai.stream.ToolUseDelta, slot=28
+    pop_jump_if_true L7
+    load_var _67
+    narrow_bind ai.stream.ToolUseDone, slot=28
+    pop_jump_if_true L7
+    load_var _67
+    narrow_bind ai.stream.TurnMeta, slot=28
+    pop_jump_if_true L7
+    load_var _67
+    narrow_bind ai.stream.TurnDone, slot=28
     pop_jump_if_true L7
     load_var self
     call ai.stream.TurnStream._finish
     pop 1
-    load_var _44
-    jump L16
+    load_var _65
+    jump L20
 
   L7:
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     load_var self
     load_field ._pending
-    load_var _46
+    load_var _67
     call baml.Array.push
     pop 1
     jump L0
 
   L8:
     load_var ready
-    jump L16
+    jump L20
 
   L9:
-    load_type ai.stream.TextDelta | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
     load_var self
     load_field ._pending
     load_var self
@@ -6839,16 +7024,31 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string[] | ai.
     store_var _12
     load_var _12
     narrow_bind ai.stream.TextDelta, slot=6
-    pop_jump_if_true L14
+    pop_jump_if_true L18
     load_var e
     store_var _24
     load_var _24
-    narrow_bind ai.stream.TurnMeta, slot=10
+    narrow_bind ai.stream.ReasoningDelta, slot=10
+    pop_jump_if_true L17
+    load_var e
+    store_var _32
+    load_var _32
+    narrow_bind ai.stream.ToolUseDelta, slot=14
+    pop_jump_if_true L1
+    load_var e
+    store_var _33
+    load_var _33
+    narrow_bind ai.stream.ToolUseDone, slot=15
+    pop_jump_if_true L16
+    load_var e
+    store_var _39
+    load_var _39
+    narrow_bind ai.stream.TurnMeta, slot=16
     pop_jump_if_true L11
     load_var e
-    store_var _35
-    load_var _35
-    narrow_bind ai.stream.TurnDone, slot=15
+    store_var _56
+    load_var _56
+    narrow_bind ai.stream.TurnDone, slot=23
     pop_jump_if_false L1
     load_var self
     load_const true
@@ -6858,51 +7058,100 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string[] | ai.
     pop 1
     load_var ready
     container_len
-    store_var _38
-    load_var _38
+    store_var _59
+    load_var _59
     load_const 0
     cmp_int_op >
     pop_jump_if_true L10
     alloc_instance ai.stream.Done
-    jump L16
+    jump L20
 
   L10:
     load_var ready
-    jump L16
+    jump L20
 
   L11:
-    load_var _24
+    load_var _39
     store_var_load_var m
     load_field .stop_reason
-    store_var _27
-    load_var _27
-    narrow_bind ai.content.StopReason, slot=12
+    store_var _42
+    load_var _42
+    narrow_bind ai.content.StopReason, slot=18
     pop_jump_if_false L12
-    load_var2 1 12
+    load_var2 1 18
     store_field ._stop_reason
 
   L12:
     load_var m
     load_field .input_tokens
-    store_var _30
-    load_var _30
-    narrow_bind int, slot=13
+    store_var _45
+    load_var _45
+    narrow_bind int, slot=19
     pop_jump_if_false L13
-    load_var2 1 13
+    load_var2 1 19
     store_field ._input_tokens
 
   L13:
     load_var m
     load_field .output_tokens
-    store_var _33
-    load_var _33
-    narrow_bind int, slot=14
-    pop_jump_if_false L1
-    load_var2 1 14
+    store_var _48
+    load_var _48
+    narrow_bind int, slot=20
+    pop_jump_if_false L14
+    load_var2 1 20
     store_field ._output_tokens
-    jump L1
 
   L14:
+    load_var m
+    load_field .cached_input_tokens
+    store_var _51
+    load_var _51
+    narrow_bind int, slot=21
+    pop_jump_if_false L15
+    load_var2 1 21
+    store_field ._cached_input_tokens
+
+  L15:
+    load_var m
+    load_field .reasoning_tokens
+    store_var _54
+    load_var _54
+    narrow_bind int, slot=22
+    pop_jump_if_false L1
+    load_var2 1 22
+    store_field ._reasoning_tokens
+    jump L1
+
+  L16:
+    load_type ai.content.ToolUse
+    load_var self
+    load_field ._tool_uses
+    load_var _33
+    load_field .tool_use
+    call baml.Array.push
+    pop 1
+    jump L1
+
+  L17:
+    load_var _24
+    store_var d
+    load_type string
+    load_var self
+    load_field ._reasoning
+    call baml.String.from
+    store_var _26
+    load_type string
+    load_var d
+    load_field .summary
+    call baml.String.from
+    store_var _29
+    load_var2 1 12
+    load_var _29
+    bin_op +
+    store_field ._reasoning
+    jump L1
+
+  L18:
     load_var _12
     store_var d
     load_var self
@@ -6929,10 +7178,353 @@ function ai.stream.TurnStream.next(self: ai.stream.TurnStream) -> string[] | ai.
     pop 1
     jump L1
 
-  L15:
+  L19:
     alloc_instance ai.stream.Done
 
+  L20:
+    return
+}
+
+function ai.stream.TurnStream.next_event(self: ai.stream.TurnStream) -> ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone | ai.stream.Done {
+  L0:
+    load_var self
+    load_field ._done
+    pop_jump_if_true L19
+
+  L1:
+    load_var self
+    load_field ._pcursor
+    store_var _4
+    load_var self
+    load_field ._pending
+    container_len
+    store_var _5
+    load_var2 2 3
+    cmp_int_op <
+    pop_jump_if_true L8
+    load_var self
+    load_field ._event_source
+    store_var _57
+    load_var _57
+    narrow_bind () -> ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone | ai.stream.Done throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, slot=25
+    pop_jump_if_true L6
+    load_var self
+    load_field ._sse
+    store_var _70
+    load_var _70
+    narrow_bind baml.http.SseStream, slot=28
+    pop_jump_if_true L3
+    load_type string
+    load_var self
+    load_field ._chunks
+    load_var self
+    load_field ._cursor
+    call baml.Array.at
+    store_var _98
+    load_var _98
+    narrow_bind string, slot=34
+    pop_jump_if_true L2
+    load_var self
+    call ai.stream.TurnStream._finish
+    pop 1
+    alloc_instance ai.stream.Done
+    jump L20
+
+  L2:
+    load_var _98
+    store_var c
+    load_var self
+    call ai.stream.TurnStream._stamp_first_delta
+    pop 1
+    load_var self
+    copy 0
+    load_field ._cursor
+    load_const 1
+    bin_op +
+    store_field ._cursor
+    load_type string
+    load_var self
+    load_field ._text
+    call baml.String.from
+    store_var _101
+    load_type string
+    load_var c
+    call baml.String.from
+    store_var _104
+    load_var2 1 36
+    load_var _104
+    bin_op +
+    store_field ._text
+    load_var c
+    init_instance ai.stream.TextDelta .text
+    jump L20
+
+  L3:
+    load_var _70
+    sys_op baml.http.SseStream.next
+    store_var _72
+    load_var _72
+    load_const null
+    cmp_op ==
+    pop_jump_if_true L5
+    load_var _72
+    store_var batch
+    load_var2 1 30
+    call ai.stream.TurnStream._capture_batch
+    pop 1
+    load_var self
+    load_field ._decode
+    store_var _80
+    load_var _80
+    narrow_bind (string) -> (ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone)[] throws ai.errors.Failure | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError, slot=31
+    pop_jump_if_false L0
+    load_var2 30 31
+    call_indirect
+    load_type baml.iter.Iterable<Error = never, Item = ai.stream.ReasoningDelta | ai.stream.TextDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnDone | ai.stream.TurnMeta>
+    load_const "iter"
+    virtual_call nargs=1 ntypeargs=0
+    store_var _85
+
+  L4:
+    load_var _85
+    load_type baml.iter.Iterator<Error = never, Item = ai.stream.ReasoningDelta | ai.stream.TextDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnDone | ai.stream.TurnMeta>
+    load_const "next"
+    virtual_call nargs=1 ntypeargs=0
+    store_var _86
+    load_var _86
+    is_type baml.iter.Done
+    pop_jump_if_true L0
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_var self
+    load_field ._pending
+    load_var _86
+    call baml.Array.push
+    pop 1
+    jump L4
+
+  L5:
+    load_var self
+    call ai.stream.TurnStream._finish
+    pop 1
+    load_var self
+    call ai.stream.TurnStream._check_terminal
+    pop 1
+    alloc_instance ai.stream.Done
+    jump L20
+
+  L6:
+    load_var _57
+    call_indirect
+    store_var _59
+    load_var _59
+    store_var _61
+    load_var _61
+    narrow_bind ai.stream.TextDelta, slot=27
+    pop_jump_if_true L7
+    load_var _61
+    narrow_bind ai.stream.ReasoningDelta, slot=27
+    pop_jump_if_true L7
+    load_var _61
+    narrow_bind ai.stream.ToolUseDelta, slot=27
+    pop_jump_if_true L7
+    load_var _61
+    narrow_bind ai.stream.ToolUseDone, slot=27
+    pop_jump_if_true L7
+    load_var _61
+    narrow_bind ai.stream.TurnMeta, slot=27
+    pop_jump_if_true L7
+    load_var _61
+    narrow_bind ai.stream.TurnDone, slot=27
+    pop_jump_if_true L7
+    load_var self
+    call ai.stream.TurnStream._finish
+    pop 1
+    load_var _59
+    jump L20
+
+  L7:
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_var self
+    load_field ._pending
+    load_var _61
+    call baml.Array.push
+    pop 1
+    jump L0
+
+  L8:
+    load_type ai.stream.TextDelta | ai.stream.ReasoningDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnMeta | ai.stream.TurnDone
+    load_var self
+    load_field ._pending
+    load_var self
+    load_field ._pcursor
+    call baml.Array.at
+    store_var e
+    load_var self
+    copy 0
+    load_field ._pcursor
+    load_const 1
+    bin_op +
+    store_field ._pcursor
+    load_var e
+    store_var _11
+    load_var _11
+    narrow_bind ai.stream.TextDelta, slot=5
+    pop_jump_if_true L18
+    load_var e
+    store_var _20
+    load_var _20
+    narrow_bind ai.stream.ReasoningDelta, slot=9
+    pop_jump_if_true L17
+    load_var e
+    store_var _28
+    load_var _28
+    narrow_bind ai.stream.ToolUseDelta, slot=13
+    pop_jump_if_true L16
+    load_var e
+    store_var _30
+    load_var _30
+    narrow_bind ai.stream.ToolUseDone, slot=14
+    pop_jump_if_true L15
+    load_var e
+    store_var _36
+    load_var _36
+    narrow_bind ai.stream.TurnMeta, slot=16
+    pop_jump_if_true L9
+    load_var e
+    store_var _53
+    load_var _53
+    narrow_bind ai.stream.TurnDone, slot=23
+    pop_jump_if_false L1
+    load_var _53
+    store_var d
+    load_var self
+    load_const true
+    store_field ._saw_terminal
+    load_var self
+    call ai.stream.TurnStream._finish
+    pop 1
+    load_var d
+    jump L20
+
+  L9:
+    load_var _36
+    store_var_load_var m
+    load_field .stop_reason
+    store_var _39
+    load_var _39
+    narrow_bind ai.content.StopReason, slot=18
+    pop_jump_if_false L10
+    load_var2 1 18
+    store_field ._stop_reason
+
+  L10:
+    load_var m
+    load_field .input_tokens
+    store_var _42
+    load_var _42
+    narrow_bind int, slot=19
+    pop_jump_if_false L11
+    load_var2 1 19
+    store_field ._input_tokens
+
+  L11:
+    load_var m
+    load_field .output_tokens
+    store_var _45
+    load_var _45
+    narrow_bind int, slot=20
+    pop_jump_if_false L12
+    load_var2 1 20
+    store_field ._output_tokens
+
+  L12:
+    load_var m
+    load_field .cached_input_tokens
+    store_var _48
+    load_var _48
+    narrow_bind int, slot=21
+    pop_jump_if_false L13
+    load_var2 1 21
+    store_field ._cached_input_tokens
+
+  L13:
+    load_var m
+    load_field .reasoning_tokens
+    store_var _51
+    load_var _51
+    narrow_bind int, slot=22
+    pop_jump_if_false L14
+    load_var2 1 22
+    store_field ._reasoning_tokens
+
+  L14:
+    load_var m
+    jump L20
+
+  L15:
+    load_var _30
+    store_var d
+    load_type ai.content.ToolUse
+    load_var self
+    load_field ._tool_uses
+    load_var d
+    load_field .tool_use
+    call baml.Array.push
+    pop 1
+    load_var d
+    jump L20
+
   L16:
+    load_var _28
+    jump L20
+
+  L17:
+    load_var _20
+    store_var d
+    load_type string
+    load_var self
+    load_field ._reasoning
+    call baml.String.from
+    store_var _22
+    load_type string
+    load_var d
+    load_field .summary
+    call baml.String.from
+    store_var _25
+    load_var2 1 11
+    load_var _25
+    bin_op +
+    store_field ._reasoning
+    load_var d
+    jump L20
+
+  L18:
+    load_var _11
+    store_var d
+    load_var self
+    call ai.stream.TurnStream._stamp_first_delta
+    pop 1
+    load_type string
+    load_var self
+    load_field ._text
+    call baml.String.from
+    store_var _14
+    load_type string
+    load_var d
+    load_field .text
+    call baml.String.from
+    store_var _17
+    load_var2 1 7
+    load_var _17
+    bin_op +
+    store_field ._text
+    load_var d
+    jump L20
+
+  L19:
+    alloc_instance ai.stream.Done
+
+  L20:
     return
 }
 
