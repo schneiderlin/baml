@@ -55,7 +55,7 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
         Ty::Bool { .. } => TranslatedType::bare("boolean"),
         Ty::Null { .. } => TranslatedType::bare("null"),
         Ty::Uint8Array { .. } => TranslatedType::bare("Uint8Array"),
-        Ty::BuiltinUnknown { .. } | Ty::Interface(..) => TranslatedType::bare("unknown"),
+        Ty::Unknown { .. } | Ty::Interface(..) => TranslatedType::bare("unknown"),
         Ty::Void { .. } => TranslatedType::bare("null"),
         Ty::Never { .. } => TranslatedType::bare("never"),
         // `_BamlHandle` is the runtime opaque-handle type; Phase 4 emits the
@@ -135,7 +135,7 @@ pub(crate) fn translate_ty(ty: &Ty, ctx: &TranslateCtx) -> TranslatedType {
 
         Ty::Class(name, args, _) => {
             // Host token positions intentionally erase the distinct reflected
-            // kind hierarchy (H-9). All `baml.reflect.<kind>.Type` values cross
+            // kind hierarchy (H-9). All `reflect.<kind>.Type` values cross
             // the bridge as the same opaque `BamlType` definition handle.
             if is_reflect_kind_type(name) {
                 return TranslatedType::bare("BamlType");
@@ -240,11 +240,10 @@ fn is_reflect_kind_type(name: &Name) -> bool {
         "primitive",
         "union",
     ];
-    name.package().as_str() == "baml"
+    name.package().as_str() == "reflect"
         && name.name() == "Type"
-        && name.namespace().len() == 2
-        && name.namespace()[0].as_str() == "reflect"
-        && KINDS.contains(&name.namespace()[1].as_str())
+        && name.namespace().len() == 1
+        && KINDS.contains(&name.namespace()[0].as_str())
 }
 
 fn media_ref(bare: &str, ctx: &TranslateCtx) -> TranslatedType {
@@ -332,7 +331,7 @@ mod tests {
         )
     }
     fn class_ty(name: Name, args: Vec<Ty>) -> Ty {
-        Ty::Class(name, args, baml_base::TyAttr::EMPTY)
+        Ty::Class(name, args.into(), baml_base::TyAttr::EMPTY)
     }
     fn enum_ty(name: Name) -> Ty {
         Ty::Enum(name, baml_base::TyAttr::EMPTY)
@@ -353,7 +352,7 @@ mod tests {
         Ty::List(inner, baml_base::TyAttr::EMPTY)
     }
     fn union(members: Vec<Ty>) -> Ty {
-        Ty::Union(members, baml_base::TyAttr::EMPTY)
+        Ty::Union(members.into(), baml_base::TyAttr::EMPTY)
     }
     fn media(kind: MediaKind) -> Ty {
         Ty::Media(kind, baml_base::TyAttr::EMPTY)
@@ -370,7 +369,7 @@ mod tests {
     }
     fn callable(params: Vec<baml_codegen_types::CallableParam>, ret: Box<Ty>) -> Ty {
         Ty::Function {
-            params,
+            params: params.into(),
             ret,
             throws: Box::new(Ty::Never {
                 attr: baml_base::TyAttr::EMPTY,
@@ -414,7 +413,7 @@ mod tests {
             | Ty::List(..)
             | Ty::Map { .. }
             | Ty::Union(..)
-            | Ty::BuiltinUnknown { .. }
+            | Ty::Unknown { .. }
             | Ty::Function { .. }
             | Ty::Future(..)
             | Ty::Void { .. }
@@ -521,8 +520,8 @@ mod tests {
                 expected_imports: &[],
             },
             Case {
-                label: "builtin_unknown",
-                ty: Ty::BuiltinUnknown {
+                label: "unknown",
+                ty: Ty::Unknown {
                     attr: baml_base::TyAttr::EMPTY,
                 },
                 ctx: ctx(&[]),

@@ -906,7 +906,7 @@ async fn collect_tests_user_exact_file_full_lifecycle() {
             client: GPT4o
             prompt: `
                 Classify the sentiment of the following text.
-                ${ctx.output_format}
+                ${ctx.output_format()}
                 Text: ${text}
             `
         }
@@ -917,7 +917,7 @@ async fn collect_tests_user_exact_file_full_lifecycle() {
                 testset sentiments {
                     let req = baml.http.fetch("http://localhost:8000/" + sentiments);
                     let data = req.text();
-                    let tests = GenerateTests$parse(data);
+                    let tests = GenerateTests@spec(0, "").parse(data);
                     for (let ex in tests) {
                         test ex {
                             let result = ClassifySentiment("hi");

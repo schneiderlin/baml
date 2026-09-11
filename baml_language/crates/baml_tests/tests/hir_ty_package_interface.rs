@@ -1,14 +1,14 @@
 //! BEP-066 package-interface schema and source-less resolution checkpoints.
 
 use baml_base::Name;
-use baml_compiler2_hir::package::PackageId;
 use baml_compiler2_hir_ty::{
     callable::{ExternalCallTarget, ExternalLinkability},
     package_interface::{
-        ExportedType, ResolvedValue, package_interface, package_resolution_context,
+        ExportedType, ResolvedValue, export_interface, package_resolution_context,
     },
 };
-use baml_project::{ProjectDatabase, collect_diagnostics, testing::assert_no_diagnostic_errors};
+use baml_db::{ProjectDatabase, collect_diagnostics, testing::assert_no_diagnostic_errors};
+use baml_tests::engine::TestDbExt;
 
 const LIBRARY: &str = r#"
 interface Parent {
@@ -83,29 +83,67 @@ function inspect(
 
 fn library_db() -> ProjectDatabase {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new("/hir-ty-package-interface-library"));
-    db.add_compiler2_virtual_file("<builtin>/app/lib.baml", LIBRARY);
+    db.workspace(std::path::Path::new("/hir-ty-package-interface-library"));
+    db.dependency("app");
+    db.file("<builtin>/app/lib.baml", LIBRARY);
     db
 }
 
 fn library_blob() -> Vec<u8> {
+    library_blob_with_format(baml_artifact::FORMAT_VERSION)
+}
+
+fn library_blob_with_format(artifact_format: u32) -> Vec<u8> {
     let db = library_db();
     assert_no_diagnostic_errors(&db);
-    borsh::to_vec(package_interface(
-        &db,
-        PackageId::new(&db, Name::new("app")),
-    ))
+    baml_artifact::encode_with_format_for_test(
+        artifact_format,
+        baml_artifact::ArtifactKind::PackageInterface,
+        &export_interface(
+            &db,
+            baml_compiler2_hir::package::spelling(&db)
+                .root(&Name::new("app"))
+                .unwrap(),
+        ),
+    )
     .expect("package interface serializes")
+}
+
+#[test]
+fn mounted_interface_skew_is_rejected_before_installation() {
+    let blob = library_blob_with_format(baml_artifact::FORMAT_VERSION + 1);
+
+    let mut db = ProjectDatabase::new();
+    db.workspace(std::path::Path::new("/hir-ty-package-interface-skew"));
+    let error = match db.try_mount("app", blob) {
+        Err(baml_db::SourceRootError::InvalidInterface { message }) => message,
+        other => panic!("a skewed interface must be refused as invalid, got {other:?}"),
+    };
+    assert_eq!(
+        error,
+        format!(
+            "package interface: toolchain {} / format {}; this runtime: {} / format {} — recompile the package and runtime with the same BAML toolchain",
+            baml_artifact::BUILD_FINGERPRINT,
+            baml_artifact::FORMAT_VERSION + 1,
+            baml_artifact::BUILD_FINGERPRINT,
+            baml_artifact::FORMAT_VERSION,
+        )
+    );
 }
 
 #[test]
 fn enriched_interface_is_symbolic_loc_free_and_borsh_stable() {
     let db = library_db();
     assert_no_diagnostic_errors(&db);
-    let interface = package_interface(&db, PackageId::new(&db, Name::new("app")));
-    let bytes = borsh::to_vec(interface).expect("serialize");
+    let interface = export_interface(
+        &db,
+        baml_compiler2_hir::package::spelling(&db)
+            .root(&Name::new("app"))
+            .unwrap(),
+    );
+    let bytes = borsh::to_vec(&interface).expect("serialize");
     let decoded = borsh::from_slice(&bytes).expect("deserialize");
-    assert_eq!(interface, &decoded);
+    assert_eq!(interface, decoded);
 
     let ExportedType::Interface {
         generic_params,
@@ -163,33 +201,39 @@ fn enriched_interface_is_symbolic_loc_free_and_borsh_stable() {
 #[test]
 fn mounted_lookup_returns_owned_exported_results_without_source_locs() {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new("/hir-ty-package-interface-consumer"));
-    db.set_mounted_packages([("app".to_owned(), library_blob())].into());
-    db.add_file("main.baml", "function main() -> int throws never { 0 }");
-    let context = package_resolution_context(&db, PackageId::new(&db, Name::new("user")));
+    db.workspace(std::path::Path::new("/hir-ty-package-interface-consumer"));
+    db.mount("app", library_blob());
+    db.file("main.baml", "function main() -> int throws never { 0 }");
+    let context = package_resolution_context(&db, db.workspace_root().unwrap());
 
     let (_, ty) = context
         .resolve_type(&db, &[Name::new("app"), Name::new("View")], &[])
         .expect("mounted interface type resolves");
-    assert!(matches!(ty, baml_type::Ty::Interface(ref qtn, ..) if qtn.package().as_str() == "app"));
+    assert!(matches!(
+        ty,
+        baml_type::Ty::Interface(ref qtn, ..)
+            if baml_compiler2_hir::package::spelling(&db).of(qtn.root()).as_str() == "app"
+    ));
     let baml_type::Ty::Interface(qtn, args, pins, _) = ty else {
         unreachable!()
     };
-    let root = baml_type::interned::InterfaceRef::new(
+    let root = baml_type::Interface::new(
         qtn,
         if args.is_empty() {
-            vec![baml_type::interned::Ty::int()].into_boxed_slice()
+            Box::new([baml_type::Ty::Int {
+                attr: baml_type::TyAttr::default(),
+            }])
         } else {
-            args.iter()
-                .map(baml_type::interned::Ty::from_plain)
-                .collect()
+            args.clone()
         },
-        pins.iter()
-            .map(|(name, ty)| (name.clone(), baml_type::interned::Ty::from_plain(ty)))
-            .collect(),
+        pins.clone(),
     );
-    let inherited =
-        baml_compiler2_hir_ty::impls::direct_requires_closure(&db, &root, &root.existential(), 64);
+    let inherited = baml_compiler2_hir_ty::impls::direct_requires_closure_plain(
+        &db,
+        &root,
+        &root.to_ty(),
+        baml_compiler2_hir_ty::impls::REQUIRES_CLOSURE_FUEL,
+    );
     assert!(
         inherited
             .iter()
@@ -201,14 +245,15 @@ fn mounted_lookup_returns_owned_exported_results_without_source_locs() {
         param.clone(),
         vec![baml_type::Interface {
             name: root.name.clone(),
-            generics: root.generics.iter().map(|ty| ty.to_plain()).collect(),
-            associated_types: Vec::new(),
+            generics: root.generics.clone(),
+            associated_types: Box::new([]),
         }],
     )]
     .into_iter()
     .collect();
     let projection = baml_compiler2_hir_ty::interfaces::lower_projection(
         &db,
+        db.workspace_root().expect("workspace root"),
         &bounds,
         baml_type::Ty::TypeVar(param, baml_type::TyAttr::default()),
         None,
@@ -220,7 +265,9 @@ fn mounted_lookup_returns_owned_exported_results_without_source_locs() {
         projection
             .diagnostics
             .iter()
-            .map(ToString::to_string)
+            .map(|diagnostic| {
+                diagnostic.render(&baml_compiler2_hir_ty::render::Viewpoint::canonical(&db))
+            })
             .collect::<Vec<_>>()
     );
 
@@ -237,10 +284,10 @@ fn mounted_lookup_returns_owned_exported_results_without_source_locs() {
 
 fn error_messages(source: &str) -> Vec<String> {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new("/hir-ty-package-interface-errors"));
-    db.set_mounted_packages([("app".to_owned(), library_blob())].into());
-    db.add_file("ns_reflect/local.baml", "class Type<T> { value T }");
-    db.add_file("main.baml", source);
+    db.workspace(std::path::Path::new("/hir-ty-package-interface-errors"));
+    db.mount("app", library_blob());
+    db.file("ns_reflect/local.baml", "class Type<T> { value T }");
+    db.file("main.baml", source);
     collect_diagnostics(&db)
         .iter()
         .filter(|diagnostic| diagnostic.severity == baml_compiler_diagnostics::Severity::Error)
@@ -259,31 +306,49 @@ fn error_messages(source: &str) -> Vec<String> {
 }
 
 #[test]
-fn mounted_type_validation_and_shorthand_shadowing_are_fail_closed() {
+fn bare_type_is_not_a_value_type_annotation() {
+    let errors = error_messages("function removed(value: type) -> type { value }");
     assert!(
-        error_messages(
-            r#"
+        errors
+            .iter()
+            .filter(|message| {
+                message.contains("`type` no longer names a runtime type value")
+                    && message.contains("write `reflect.Type` instead")
+            })
+            .count()
+            >= 2,
+        "bare `type` annotations must be rejected, and must name their replacement: {errors:#?}"
+    );
+}
+
+#[test]
+fn mounted_type_validation_and_package_shadowing_are_fail_closed() {
+    let valid_errors = error_messages(
+        r#"
 function ok(
-    local: reflect.Type<int>,
+    local: root.reflect.Type<int>,
     view: app.View<int>,
     status: app.Status,
     score: app.Score,
 ) -> int throws never { 0 }
 
-function type_shorthand() -> type throws never {
-    type.of<int>()
-}
-
-function reflect_shorthand() -> type throws never {
-    reflect.literal.new(1).as_type()
-}
-
 function json_shorthand() -> string throws never {
     json.stringify(null)
 }
 "#,
-        )
-        .is_empty()
+    );
+    assert!(
+        valid_errors.is_empty(),
+        "the user reflect namespace and json shorthand should remain valid: {valid_errors:#?}"
+    );
+
+    let shadow_errors =
+        error_messages("function shadowed() -> unknown throws never { reflect.Type.of<int>() }");
+    assert!(
+        shadow_errors
+            .iter()
+            .any(|message| message.contains("unresolved name: `of`")),
+        "an ordinary package name should follow normal user-namespace shadowing: {shadow_errors:#?}"
     );
 
     let errors = error_messages(
@@ -312,19 +377,34 @@ function bad(
 }
 
 #[test]
-fn reflect_type_shorthand_requires_baml_package_access() {
+fn reflect_resolves_as_an_ordinary_builtin_package() {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new(
+    db.workspace(std::path::Path::new(
         "/hir-ty-reflect-shorthand-package-access",
     ));
-    let boundary_file = db.add_compiler2_virtual_file(
-        "<builtin>/boundary/reflect_probe.baml",
-        "type ForbiddenReflect = reflect.Signature\n",
+    // `assert` is a stdlib package whose manifest declares `reflect`: a file
+    // joining its `Stdlib` root reaches `reflect` through that edge.
+    let assert_file = db.file(
+        "<builtin>/assert/reflect_probe.baml",
+        "type DeclaredReflect = reflect.Signature\n",
     );
-    let user_file = db.add_file(
+    // `boundary` declares no such edge: a package reaches only what its
+    // manifest lists, and no leak across undeclared packages exists.
+    let boundary_file = db.file(
+        "<builtin>/boundary/reflect_probe.baml",
+        "type UndeclaredReflect = reflect.Signature\n",
+    );
+    let user_file = db.file(
         "allowed_reflect.baml",
         "type AllowedReflect = reflect.Signature\n",
     );
+
+    let assert_alias = *baml_compiler2_ppir::item_data::file_type_aliases(&db, assert_file)
+        .first()
+        .expect("assert alias");
+    let assert_errors =
+        baml_compiler2_hir_ty::lower::type_alias_lowering_diagnostics(&db, assert_alias);
+    assert!(assert_errors.is_empty(), "{assert_errors:?}");
 
     let boundary_alias = *baml_compiler2_ppir::item_data::file_type_aliases(&db, boundary_file)
         .first()
@@ -332,8 +412,10 @@ fn reflect_type_shorthand_requires_baml_package_access() {
     let boundary_errors =
         baml_compiler2_hir_ty::lower::type_alias_lowering_diagnostics(&db, boundary_alias);
     assert!(
-        !boundary_errors.is_empty(),
-        "boundary has no baml dependency, so reflect.Signature must be unresolved"
+        boundary_errors
+            .iter()
+            .any(|(_, error)| format!("{error:?}").contains("reflect.Signature")),
+        "an undeclared package must not resolve: {boundary_errors:?}"
     );
 
     let user_alias = *baml_compiler2_ppir::item_data::file_type_aliases(&db, user_file)
@@ -344,65 +426,69 @@ fn reflect_type_shorthand_requires_baml_package_access() {
     assert!(user_errors.is_empty(), "{user_errors:?}");
     assert_eq!(
         baml_compiler2_hir_ty::lower::type_alias_value(&db, user_alias)
-            .to_plain()
-            .render_canonical(),
-        "baml.reflect.Signature"
+            .render_with(&baml_compiler2_hir_ty::render::Viewpoint::canonical(&db)),
+        "reflect.Signature"
     );
 }
 
 #[test]
-fn keyword_shorthands_follow_the_exported_baml_surface() {
+fn reflect_package_resolution_uses_ordinary_builtin_items() {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new(
-        "/hir-ty-reflect-shorthand-export-surface",
+    db.workspace(std::path::Path::new(
+        "/hir-ty-reflect-package-export-surface",
     ));
-    db.add_compiler2_virtual_file(
-        "<builtin>/baml/ns_reflect/raw_only.baml",
+    // Joins the stdlib `reflect` root: reflect is its own root package.
+    db.file(
+        "<builtin>/reflect/raw_only.baml",
         "interface RawOnly {}\nclient raw_only = openai.ResponsesClient.new(model = \"gpt-4\");\n",
     );
-    db.add_file(
+    db.file(
         "main.baml",
         r#"
 type ExportedShorthandType = reflect.RawOnly
 
-function exported_shorthand_value() -> type throws never {
+function exported_shorthand_value() -> reflect.Type throws never {
     reflect.literal.new(1).as_type()
 }
 
-function raw_only_value_must_stay_hidden() -> string throws never {
+function raw_only_value_is_available() -> string throws never {
     reflect.raw_only
 }
 "#,
     );
 
-    let user_pkg = PackageId::new(&db, Name::new("user"));
+    let user_pkg = db.workspace_root().unwrap();
     let context = package_resolution_context(&db, user_pkg);
-    let baml_items =
-        baml_compiler2_ppir::package_items(&db, PackageId::new(&db, Name::new("baml")));
+    let reflect_items = baml_compiler2_ppir::package_items(
+        &db,
+        baml_compiler2_hir::package::spelling(&db)
+            .root(&Name::new("reflect"))
+            .unwrap(),
+    );
     assert!(
-        baml_items
-            .lookup_type(&[Name::new("reflect")], &Name::new("RawOnly"))
+        reflect_items
+            .lookup_type(&[], &Name::new("RawOnly"))
             .is_some()
     );
     assert!(
-        baml_items
-            .lookup_value(&[Name::new("reflect")], &Name::new("raw_only"))
+        reflect_items
+            .lookup_value(&[], &Name::new("raw_only"))
             .is_some()
     );
-    let exported_baml = context
+    let exported_reflect = context
         .dep_interfaces
         .iter()
-        .find(|(name, _)| name.as_str() == "baml")
-        .map(|(_, interface)| interface)
-        .expect("user package can access baml");
+        .find(|(name, _, _)| name.as_str() == "reflect")
+        .map(|(_, _, interface)| interface)
+        .expect("user package can access reflect");
     assert!(
-        exported_baml
-            .lookup_type(&[Name::new("reflect")], &Name::new("RawOnly"))
+        exported_reflect
+            .lookup_type(&[], &Name::new("RawOnly"))
             .is_some()
     );
     assert!(
-        exported_baml
-            .lookup_function(&[Name::new("reflect")], &Name::new("raw_only"))
+        exported_reflect
+            .lookup_function(&[], &Name::new("raw_only"))
             .is_none()
     );
 
@@ -411,14 +497,13 @@ function raw_only_value_must_stay_hidden() -> string throws never {
         .filter(|diagnostic| diagnostic.severity == baml_compiler_diagnostics::Severity::Error)
         .map(|diagnostic| diagnostic.message)
         .collect();
-    let shorthand_errors: Vec<_> = errors
+    let package_errors: Vec<_> = errors
         .iter()
         .filter(|message| message.contains("reflect.raw_only"))
         .collect();
-    assert_eq!(
-        shorthand_errors.len(),
-        1,
-        "the raw-only value must not leak through shorthand: {errors:#?}"
+    assert!(
+        package_errors.is_empty(),
+        "an in-tree builtin package resolves through its ordinary package items: {errors:#?}"
     );
 }
 
@@ -428,18 +513,18 @@ fn mounted_witnesses_members_defaults_and_symbolic_calls_type_check_source_less(
     assert!(errors.is_empty(), "{errors:#?}");
 
     let mut mounted = ProjectDatabase::new();
-    mounted.set_project_root(std::path::Path::new(
+    mounted.workspace(std::path::Path::new(
         "/hir-ty-package-interface-parity-mounted",
     ));
-    mounted.set_mounted_packages([("app".to_owned(), library_blob())].into());
-    mounted.add_file("main.baml", WITNESS_CONSUMER);
+    mounted.mount("app", library_blob());
+    mounted.file("main.baml", WITNESS_CONSUMER);
     let mut local = library_db();
-    local.add_file("main.baml", WITNESS_CONSUMER);
+    local.file("main.baml", WITNESS_CONSUMER);
     assert_no_diagnostic_errors(&mounted);
     assert_no_diagnostic_errors(&local);
 
     let inspect = |db: &ProjectDatabase| {
-        let items = baml_compiler2_ppir::package_items(db, PackageId::new(db, Name::new("user")));
+        let items = baml_compiler2_ppir::package_items(db, (db).workspace_root().unwrap());
         let Some(baml_compiler2_hir::contributions::Definition::Function(function)) =
             items.lookup_value(&[], &Name::new("inspect"))
         else {
@@ -454,7 +539,7 @@ fn mounted_witnesses_members_defaults_and_symbolic_calls_type_check_source_less(
             panic!("inspect has an expression body")
         };
         let root = body.root_expr.expect("inspect root expression");
-        let root_ty = inference.type_of_expr[&root].to_plain();
+        let root_ty = inference.type_of_expr[&root].clone();
         let targets = inference
             .member_resolutions
             .values()
@@ -473,12 +558,12 @@ fn mounted_witnesses_members_defaults_and_symbolic_calls_type_check_source_less(
     assert!(local_targets.is_empty());
     assert!(mounted_targets.iter().any(|target| matches!(
         target,
-        ExternalCallTarget::Free { name, .. } if name.as_str() == "choose"
+        ExternalCallTarget::Free { function } if function.name().as_str() == "choose"
     )));
     assert!(mounted_targets.iter().any(|target| matches!(
         target,
-        ExternalCallTarget::Method { class, name, .. }
-            if class.as_str() == "Box" && name.as_str() == "get_value"
+        ExternalCallTarget::Method { class, name }
+            if class.name().as_str() == "Box" && name.as_str() == "get_value"
     )));
     assert!(mounted_targets.iter().any(|target| matches!(
         target,
@@ -490,8 +575,9 @@ fn mounted_witnesses_members_defaults_and_symbolic_calls_type_check_source_less(
 #[test]
 fn mounted_reserved_builtin_reports_normal_and_optional_calls() {
     let mut library = ProjectDatabase::new();
-    library.set_project_root(std::path::Path::new("/hir-ty-package-interface-native"));
-    library.add_compiler2_virtual_file(
+    library.workspace(std::path::Path::new("/hir-ty-package-interface-native"));
+    library.dependency("native");
+    library.file(
         "<builtin>/native/native.baml",
         r#"
 function value() -> int throws never {
@@ -500,18 +586,23 @@ function value() -> int throws never {
 "#,
     );
     assert_no_diagnostic_errors(&library);
-    let blob = borsh::to_vec(package_interface(
-        &library,
-        PackageId::new(&library, Name::new("native")),
-    ))
+    let blob = baml_artifact::encode(
+        baml_artifact::ArtifactKind::PackageInterface,
+        &export_interface(
+            &library,
+            baml_compiler2_hir::package::spelling(&library)
+                .root(&Name::new("native"))
+                .unwrap(),
+        ),
+    )
     .expect("native package interface serializes");
 
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new(
+    db.workspace(std::path::Path::new(
         "/hir-ty-package-interface-native-consumer",
     ));
-    db.set_mounted_packages([("native".to_owned(), blob)].into());
-    db.add_file(
+    db.mount("native", blob);
+    db.file(
         "main.baml",
         r#"
 function direct() -> int throws never {

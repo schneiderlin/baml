@@ -16,17 +16,17 @@
 // ---------------------------------------------------------------------------
 // Wire classes.
 
-// POST /v1/images/generations. `prompt` and `model` always ride; everything
-// else is optional and omitted when the client left it unset.
-//
-//   * `response_format` (`url` | `b64_json`) is a dall-e-only parameter — the
-//     GPT image models always return base64 and reject the field, so the
-//     client omits it for them and defaults it to `b64_json` elsewhere (we need
-//     bytes, and the dall-e default is `url`).
-//   * `output_format` / `output_compression` / `background` / `moderation` are
-//     GPT-image-only; `style` is dall-e-3-only. The client sends what it was
-//     given and lets the API reject impossible combinations, rather than
-//     encoding a model table that goes stale.
+/// POST /v1/images/generations. `prompt` and `model` always ride; everything
+/// else is optional and omitted when the client left it unset.
+///
+///   * `response_format` (`url` | `b64_json`) is a dall-e-only parameter — the
+///     GPT image models always return base64 and reject the field, so the
+///     client omits it for them and defaults it to `b64_json` elsewhere (we need
+///     bytes, and the dall-e default is `url`).
+///   * `output_format` / `output_compression` / `background` / `moderation` are
+///     GPT-image-only; `style` is dall-e-3-only. The client sends what it was
+///     given and lets the API reject impossible combinations, rather than
+///     encoding a model table that goes stale.
 class OaImagesRequest {
     model: string,
     prompt: string,
@@ -42,11 +42,11 @@ class OaImagesRequest {
     response_format: string?,
 }
 
-// One element of `data[]`. `b64_json` is what the GPT image models always
-// return; `url` appears only when a dall-e request asked for it (the link
-// expires after 60 minutes, so `_oai_images_fetch_inline` pulls the bytes
-// before the value leaves the client); `revised_prompt` is dall-e-3's
-// rewritten prompt.
+/// One element of `data[]`. `b64_json` is what the GPT image models always
+/// return; `url` appears only when a dall-e request asked for it (the link
+/// expires after 60 minutes, so `_oai_images_fetch_inline` pulls the bytes
+/// before the value leaves the client); `revised_prompt` is dall-e-3's
+/// rewritten prompt.
 class OaImageDatum {
     b64_json: string?,
     url: string?,
@@ -58,8 +58,8 @@ class OaImagesInputTokensDetails {
     image_tokens: int?,
 }
 
-// `ImageGenUsage` — GPT image models only, absent for dall-e. Every field is
-// optional here: an envelope that omits one must not fail the whole decode.
+/// `ImageGenUsage` — GPT image models only, absent for dall-e. Every field is
+/// optional here: an envelope that omits one must not fail the whole decode.
 class OaImagesUsage {
     input_tokens: int?,
     output_tokens: int?,
@@ -67,9 +67,9 @@ class OaImagesUsage {
     input_tokens_details: OaImagesInputTokensDetails?,
 }
 
-// `ImagesResponse`. The GPT image models echo the settings they actually used
-// (`output_format`, `size`, `quality`, `background`), which is where the
-// returned images' MIME type comes from.
+/// `ImagesResponse`. The GPT image models echo the settings they actually used
+/// (`output_format`, `size`, `quality`, `background`), which is where the
+/// returned images' MIME type comes from.
 class OaImagesResponse {
     created: int?,
     data: OaImageDatum[]?,
@@ -83,16 +83,16 @@ class OaImagesResponse {
 // ---------------------------------------------------------------------------
 // Request construction.
 
-// The client's canonical id, shared by `ai.Client.id` and the error paths.
+/// (internal) The client's canonical id, shared by `ai.Client.id` and the error paths.
 function _oai_images_client_id(c: root.ImageClient) -> string {
     let id = `openai-images/${c.model}`;
     id
 }
 
-// Drop every null-valued key, recursively. A typed request class serializes
-// its unset options as explicit nulls; the Images API wants them absent (and
-// `merge_request_body`'s null-deletes-a-key contract only makes sense against a
-// null-free base).
+/// (internal) Drop every null-valued key, recursively. A typed request class serializes
+/// its unset options as explicit nulls; the Images API wants them absent (and
+/// `merge_request_body`'s null-deletes-a-key contract only makes sense against a
+/// null-free base).
 function _oai_images_drop_nulls(value: baml.json.json) -> baml.json.json {
     match (value) {
         let object: map<string, baml.json.json> => {
@@ -120,9 +120,9 @@ function _oai_images_drop_nulls(value: baml.json.json) -> baml.json.json {
     }
 }
 
-// Media in a prompt is a hard error: /v1/images/generations takes text only
-// (image-to-image lives behind /v1/images/edits, which is a multipart endpoint
-// and a separate client).
+/// (internal) Media in a prompt is a hard error: /v1/images/generations takes text only
+/// (image-to-image lives behind /v1/images/edits, which is a multipart endpoint
+/// and a separate client).
 function _oai_images_media_rejected(kind: string) -> ai.errors.InvalidRequest {
     let detail = `Images API only supports text prompts; found ${kind} input`;
     ai.errors.InvalidRequest {
@@ -133,44 +133,39 @@ function _oai_images_media_rejected(kind: string) -> ai.errors.InvalidRequest {
     }
 }
 
-// The rendered prompt as one text block: every text part trimmed, blanks
-// dropped, joined with a blank line. Roles carry no meaning for an image
-// endpoint, so they are discarded (sys_llm's gateway builder does the same).
-// Journal user messages follow the prompt so a re-ask still reaches the model;
-// assistant turns and tool traffic have no representation here.
+/// (internal) Collect a turn's text into `parts`: every text block trimmed, blanks
+/// dropped. Any media block is a hard error: /v1/images/generations takes
+/// text only, at every position.
+function _oai_images_collect(blocks: ai.content.Block[], parts: string[]) -> void {
+    for (let block in blocks) {
+        match (block) {
+            let text: ai.content.Text => {
+                let trimmed = text.text.trim();
+                if (trimmed != "") {
+                    parts.push(trimmed);
+                }
+                null
+            },
+            let media: ai.content.Media => {
+                throw _oai_images_media_rejected(media.kind())
+            },
+        };
+    }
+}
+
+/// (internal) The rendered prompt as one text block, joined with a blank line. Roles
+/// carry no meaning for an image endpoint, so they are discarded (sys_llm's
+/// gateway builder does the same). Journal user turns follow the prompt so a
+/// re-ask still reaches the model; assistant turns and tool traffic have no
+/// representation here.
 function _oai_images_prompt_text(prompt: ai.Prompt, journal: ai.Journal) -> string {
     let parts: string[] = [];
     for (let message in prompt.messages()) {
-        for (let part in message.parts) {
-            match (part) {
-                let text: string => {
-                    let trimmed = text.trim();
-                    if (trimmed != "") {
-                        parts.push(trimmed);
-                    }
-                    null
-                },
-                let image: baml.media.Image => {
-                    throw _oai_images_media_rejected("image")
-                },
-                let audio: baml.media.Audio => {
-                    throw _oai_images_media_rejected("audio")
-                },
-                let video: baml.media.Video => {
-                    throw _oai_images_media_rejected("video")
-                },
-                let pdf: baml.media.Pdf => {
-                    throw _oai_images_media_rejected("pdf")
-                },
-            };
-        }
+        _oai_images_collect(ai.wire.prompt_blocks(message), parts);
     }
     for (let event in journal.entries()) {
         if let user: ai.events.UserMessage = event {
-            let trimmed = user.content.trim();
-            if (trimmed != "") {
-                parts.push(trimmed);
-            }
+            _oai_images_collect(user.content, parts);
         }
     }
     let joined = parts.join("\n\n");
@@ -185,10 +180,10 @@ function _oai_images_prompt_text(prompt: ai.Prompt, journal: ai.Journal) -> stri
     joined
 }
 
-// `response_format` is dall-e-only. An explicit setting always wins; otherwise
-// the GPT image models get the field omitted (they reject it and always answer
-// base64) and everything else gets `b64_json`, because a `url` answer — the
-// dall-e default — is not what a media output type wants.
+/// (internal) `response_format` is dall-e-only. An explicit setting always wins; otherwise
+/// the GPT image models get the field omitted (they reject it and always answer
+/// base64) and everything else gets `b64_json`, because a `url` answer — the
+/// dall-e default — is not what a media output type wants.
 function _oai_images_response_format(model: string, explicit: string?) -> string? {
     if let chosen: string = explicit {
         return chosen;
@@ -206,12 +201,11 @@ function _oai_images_trim_slash(url: string) -> string {
     url
 }
 
-// Percent-escape the characters that would otherwise change a URL's structure.
-// `baml.http` has no query-string builder; this covers what a header/query
-// passthrough realistically carries.
+/// (internal) Percent-escape the characters that would otherwise change a URL's structure.
+/// `baml.http` has no query-string builder; this covers what a header/query
+/// passthrough realistically carries.
 function _oai_images_escape_query(raw: string) -> string {
-    let escaped = raw
-        .replace_all("%", "%25")
+    let escaped = raw.replace_all("%", "%25")
         .replace_all(" ", "%20")
         .replace_all("&", "%26")
         .replace_all("=", "%3D")
@@ -240,13 +234,10 @@ function _oai_images_with_query(url: string, params: map<string, string>?) -> st
     `${url}${separator}${pairs.join("&")}`
 }
 
-// Provider defaults, then the user's `headers` (lowercased, as the HTTP layer
-// stores them), then auth for a live request. A preview leaves user-supplied
-// auth intact without resolving or exposing the configured credential.
-function _oai_images_headers(
-    c: root.ImageClient,
-    preview: bool = false,
-) -> map<string, string> {
+/// (internal) Provider defaults, then the user's `headers` (lowercased, as the HTTP layer
+/// stores them), then auth for a live request. A preview leaves user-supplied
+/// auth intact without resolving or exposing the configured credential.
+function _oai_images_headers(c: root.ImageClient, preview: bool = false) -> map<string, string> {
     let headers: map<string, string> = { "content-type": "application/json" };
     if let extra: map<string, string> = c.headers {
         for (let name in extra.keys()) {
@@ -259,7 +250,7 @@ function _oai_images_headers(
     headers
 }
 
-// ai.ModelTurnInput -> one Images API request.
+/// ai.ModelTurnInput -> one Images API request.
 function images_render(
     c: root.ImageClient,
     input: ai.ModelTurnInput,
@@ -277,7 +268,7 @@ function images_render(
     // The schema block an ordinary client injects is noise for an image
     // endpoint (`Return an image output.` is the only shape it can produce),
     // so the rendered prompt carries the authored text alone.
-    let text = _oai_images_prompt_text(input.prompt(""), journal);
+    let text = _oai_images_prompt_text(input.prompt(ai.internal.build_output_format(input.output_type)), journal);
     let request = OaImagesRequest {
         model: c.model,
         prompt: text,
@@ -309,9 +300,9 @@ function images_render(
 // ---------------------------------------------------------------------------
 // Response parsing.
 
-// `output_format` names the encoding of the bytes in `b64_json`. The response
-// echoes it for the GPT image models; otherwise the client's own setting is the
-// best available answer, and png is the API default.
+/// (internal) `output_format` names the encoding of the bytes in `b64_json`. The response
+/// echoes it for the GPT image models; otherwise the client's own setting is the
+/// best available answer, and png is the API default.
 function _oai_images_mime(format: string?) -> string {
     let normalized = (format ?? "png").to_lower_case();
     match (normalized) {
@@ -322,16 +313,16 @@ function _oai_images_mime(format: string?) -> string {
     }
 }
 
-// A `url`-mode datum, fetched and inlined. dall-e's `response_format: "url"`
-// answers with a link that OpenAI expires after 60 minutes, and a `-> image`
-// value whose `base64()` is empty is useless to user code — so the bytes are
-// pulled here, once, and the value handed on carries real content. The MIME
-// type comes from the fetch's own `content-type` when it sent one.
+/// (internal) A `url`-mode datum, fetched and inlined. dall-e's `response_format: "url"`
+/// answers with a link that OpenAI expires after 60 minutes, and a `-> image`
+/// value whose `base64()` is empty is useless to user code — so the bytes are
+/// pulled here, once, and the value handed on carries real content. The MIME
+/// type comes from the fetch's own `content-type` when it sent one.
 function _oai_images_fetch_inline(location: string, fallback_mime: string) -> image {
     let response = baml.http.fetch(location) catch_all (e) {
         let timeout: baml.errors.Timeout => throw timeout,
         _ => {
-            throw ai.errors.NetworkFailure {
+            throw ai.errors.NetworkFailure { status_code: null,
                 provider: "openai-images",
                 detail: `fetching the generated image at ${location} failed: ${e.to_string()}`,
                 raw_body: null,
@@ -339,7 +330,7 @@ function _oai_images_fetch_inline(location: string, fallback_mime: string) -> im
         },
     };
     if (!response.ok()) {
-        throw ai.errors.NetworkFailure {
+        throw ai.errors.NetworkFailure { status_code: null,
             provider: "openai-images",
             detail: `fetching the generated image at ${location} returned HTTP ${response.status_code}`,
             raw_body: null,
@@ -354,8 +345,8 @@ function _oai_images_fetch_inline(location: string, fallback_mime: string) -> im
     baml.media.Image.from_base64(response.bytes().to_base64(), mime)
 }
 
-// One `data[]` element as a canonical media block, or null when it carried
-// neither base64 nor a URL.
+/// (internal) One `data[]` element as a canonical media block, or null when it carried
+/// neither base64 nor a URL.
 function _oai_images_block(datum: OaImageDatum, mime: string) -> ai.content.Media? {
     if let encoded: string = datum.b64_json {
         return ai.content.Media.new(
@@ -372,13 +363,13 @@ function _oai_images_block(datum: OaImageDatum, mime: string) -> ai.content.Medi
     null
 }
 
-// One decoded response -> one model turn of media blocks. An image endpoint
-// produces no text and never stops early, so the stop reason is always
-// Complete; `usage` is present for the GPT image models only.
+/// One decoded response -> one model turn of media blocks. An image endpoint
+/// produces no text and never stops early, so the stop reason is always
+/// Complete; `usage` is present for the GPT image models only.
 function images_parse(c: root.ImageClient, resp: OaImagesResponse) -> ai.ModelTurn {
     let mime = _oai_images_mime(resp.output_format ?? c.output_format);
     let data: OaImageDatum[] = resp.data ?? [];
-    let content: ai.content.Block[] = [];
+    let content: ai.content.ModelBlock[] = [];
     for (let datum in data) {
         if let block: ai.content.Media = _oai_images_block(datum, mime) {
             content.push(block);
@@ -401,19 +392,26 @@ function images_parse(c: root.ImageClient, resp: OaImagesResponse) -> ai.ModelTu
         null
     };
     ai.ModelTurn {
+        calls: [],
         content: content,
         stop_reason: ai.content.StopReason.Complete,
         usage: usage,
     }
 }
 
-// The one internal entry point: render, send, normalize — one model turn.
-// There is no streaming counterpart: the Images API's `stream`/`partial_images`
-// mode emits partially-rendered previews, which `ai.stream.StreamEvent` (text
-// deltas) cannot carry, so `root.ImageClient` deliberately does not implement
-// ai.stream.StreamingClient.
+/// The one internal entry point: render, send, normalize — one model turn.
+/// There is no streaming counterpart: the Images API's `stream`/`partial_images`
+/// mode emits partially-rendered previews, which `ai.stream.Event` (text
+/// deltas) cannot carry, so `openai.ImageClient` deliberately does not implement
+/// ai.stream.StreamingClient.
 function images_invoke(c: root.ImageClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
     let req = images_render(c, input);
-    let resp = ai.wire.send_as<OaImagesResponse>(req, "openai-images");
-    images_parse(c, resp)
+    let sent = ai.wire.send_as_with_wire<OaImagesResponse>(
+        req,
+        "openai-images",
+        c.id(),
+        capture_wire = c.capture_wire,
+    );
+    let turn = images_parse(c, sent.value);
+    ai.ModelTurn { ...turn, calls: [sent.call] }
 }

@@ -1,5 +1,16 @@
 # BEP-066 `hir_ty` port contracts
 
+> **Superseded (2026-09):** the runtime-slot model this checklist records —
+> inline `unreflect(...)` type arguments, deferred runtime checks
+> (`deferred_checks` / `RuntimeCheck`), the `unreflect` pattern, and the
+> streaming/`from_json` slot rules (rows T-01, B-01, B-05 through B-08, B-13,
+> B-18, B-19, B-21, B-22) — was replaced by the rigid statement model:
+> `type T = unreflect(e)` is the only spelling, `T` is a rigid frame parameter,
+> nothing is deferred to a runtime gate, and nothing typed by `T` leaves its
+> block (E0172). See `baml_language/TYPE_SYSTEM.md`, "Scoped runtime type
+> bindings". Rows marked done below describe the superseded behavior as it
+> was verified at the time, and so do the two sections named below.
+
 This document freezes the compiler-core contracts for the BEP-066 port after
 the TIR-to-`hir_ty` cutover. `TYPE_SYSTEM.md` and the current `hir_ty` behavior
 remain authoritative. The names below may be shortened during implementation,
@@ -19,19 +30,19 @@ that code exists.
 | [x] | L-01 | 3 | Type lookup distinguishes source-backed definitions from source-less exported types without reaching into absent dependency source. |
 | [x] | L-02 | 3 | Foreign classes, interfaces, enums, aliases, and variants receive the same kind and arity validation as local definitions. |
 | [x] | L-03 | 3, 6 | Foreign interface pins validate names and duplicates, realize defaults with symbolic `Self`, and diagnose missing required bindings. |
-| [x] | L-04 | 3 | `reflect.X` type shorthand is tried only after ordinary local, user, and package resolution fails. |
+| [x] | L-04 | 3 | Type lookup has no `reflect` shorthand: `reflect.X` resolves through ordinary package resolution, so a local or user name of the same shape still wins. |
 | [x] | L-05 | 4 | Only the exact extraction contract permits an outer function type without `throws`; ordinary function types retain current diagnostics and recovery. |
-| [x] | R-01 | 3 | Value roots `reflect`, `type`, and `json` fall back to package `baml` only after ordinary resolution fails, preserving the full path. |
+| [x] | R-01 | 3 | `json` is the only value root that falls back to package `baml`, and only after ordinary resolution fails, preserving the full path; `reflect` resolves as an ordinary package and `type` is no longer a value root. |
 | [x] | T-01 | 2, 5 | Runtime type operands and type-binding values are ordinary hidden expression edges for throw-fact traversal. |
 | [x] | B-01 | 2, 4 | Runtime slots and loc-free callables are isolated per body/default run and survive only in durable result tables. |
 | [x] | B-02 | 5 | Inference-time type lowering sees declared generics plus the active scoped overlay. |
 | [x] | B-03 | 4 | Only the special `Session.eval` result slot defaults an uninferable generic to `unknown`; ordinary slots keep current errors. |
 | [x] | B-04 | 3, 4 | Mounted owner/function generics and bounds instantiate normally, synthetic effect parameters do not affect user arity, and bound receivers seed owner substitutions. |
 | [x] | B-05 | 2, 4 | Written type arguments retain ordered static/runtime provenance; runtime operands use a bound-or-`unknown` occurrence type and never become solver variables. |
-| [x] | B-06 | 4 | A bare value in a generic slot reports the targeted “requires `unreflect`” diagnostic. |
+| [x] | B-06 | 4 | A bare value in a generic slot reports the targeted diagnostic. (Superseded wording: it now names the binding — “`x` is a value, not a type; bind its runtime type first with `type T = unreflect(x);`”.) |
 | [x] | B-07 | 4 | Every runtime operand is inferred and checked below primitive `type`, with normal error/pending cascade suppression. |
 | [x] | B-08 | 4 | Only checks that depend on a runtime slot are deferred; operands are still inferred and unrelated static bounds remain enforced. |
-| [x] | B-09 | 4, 7 | Exact `baml.reflect.Package.get_function<F>` extraction uses its special type position and MIR consumes the solved plan without re-lowering syntax. |
+| [x] | B-09 | 4, 7 | Exact `reflect.Package.get_function<F>` extraction uses its special type position and MIR consumes the solved plan without re-lowering syntax. |
 | [x] | B-10 | 4 | Argument binding enriches one call plan without erasing type slots; optional and ordinary calls use the same write path. |
 | [x] | B-11 | 4 | Uncontracted render/build helpers seed schema `T` from a named, non-generic LLM function return type. |
 | [x] | B-12 | 2, 5 | Default and forward-reference traversal visits hidden operands exactly once and default inference cannot leak per-body external-call state. |
@@ -42,7 +53,7 @@ that code exists.
 | [x] | B-17 | 3, 6 | Mounted builtins without a loc-free link contract are reserved and fail with the targeted unsupported-call diagnostic, including optional calls. |
 | [x] | B-18 | 4 | Streaming calls reject runtime type-argument slots. |
 | [x] | B-19 | 4 | `from_json` reconstruction runs only for an all-static type-argument plan. |
-| [x] | B-20 | 3 | Expression inference uses the same shadow-preserving `baml.reflect/type/json` fallback as type lowering. |
+| [x] | B-20 | 3 | Expression inference uses the same ordinary package resolution for `reflect` and the same shadow-preserving `json` fallback as type lowering. |
 | [x] | B-21 | 5 | An `unreflect` pattern checks its operand as `type`, preserves the scrutinee type, has unique possible-but-non-covering usefulness identity, and binds nothing. |
 | [x] | B-22 | 2, 5 | Inference and throw analysis share canonical hidden-child traversal for runtime operands and type-binding values. |
 | [x] | N-01 | 1 | Static Mint identity hashes canonical plain `NormalTy` with fixed FNV-1a-64 and architecture-stable numeric encoding, never an intern handle. |
@@ -50,6 +61,15 @@ that code exists.
 | [x] | N-03 | 1 | Exactly the sealed builtin reflection-kind classes subtype primitive `type`; user classes cannot opt in. |
 
 ## Runtime type-slot contract
+
+> **Superseded (2026-09).** Every type named in this section is gone:
+> `BodyTypeArgRef` (a written type argument is now just a `BodyTypeRefId`),
+> `CallTypeArgPlan::Runtime` and its `occurrence_ty` (the plan is a struct of
+> `ty` + `emission_ty`), `CallPlan::deferred_checks`, and `RuntimeCheck`. There
+> are no runtime gates or call flags: a runtime type reaches a type position
+> only as a `type T = unreflect(e);` binding's rigid frame parameter, and every
+> use of `T` is checked statically. See `baml_language/TYPE_SYSTEM.md`,
+> "Scoped runtime type bindings".
 
 The canonical syntax bridge is an ordered slot enum in
 `baml_compiler2_hir::body_type_refs`:
@@ -147,6 +167,15 @@ package-interface bytes. Compatibility is per compiler build; it is not an
 external persistence or wire-format promise.
 
 ## Scoped generic-overlay contract
+
+> **Superseded (2026-09)** in three ways, and the last is a reversal:
+> `ScopedTypeBinding` carries a `source: ScopedTypeSource` (`Runtime(ExprId)`
+> or `Static(Ty)`) rather than an `operand` plus an `occurrence_ty`; the
+> parameter's identity is its binding statement's index in the body, with no
+> owner component; and a binding is NOT erased at block exit. Nothing typed by
+> `T` may be observable outside the block at all - the block's value leaves
+> only through a ground type that does not mention `T`, and anything else is
+> E0172. See `baml_language/TYPE_SYSTEM.md`, "Scoped runtime type bindings".
 
 `LowerCtx` continues to own the immutable declaration frame. Dynamic runtime
 type bindings are owned by the body-local `InferenceContext` as an ordered

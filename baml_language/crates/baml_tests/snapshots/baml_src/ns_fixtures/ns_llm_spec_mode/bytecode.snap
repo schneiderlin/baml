@@ -1,7 +1,7 @@
 ---
 source: crates/baml_tests/src/corpus.rs
 ---
-function fixtures.llm_spec_mode.NamedTools(q: string, client: ai.Client | null) -> fixtures.llm_spec_mode.Answer {
+function fixtures.llm_spec_mode.NamedTools(q: string, client: ai.Client | null, on_event: ((ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced) -> void throws unknown) | null) -> fixtures.llm_spec_mode.Answer {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -10,28 +10,35 @@ function fixtures.llm_spec_mode.NamedTools(q: string, client: ai.Client | null) 
     store_var client
 
   L0:
-    load_type fixtures.llm_spec_mode.Answer
+    load_var on_event
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L1
+    load_const null
+    store_var on_event
+
+  L1:
+    load_type unknown
     load_const <omitted>
     load_const <omitted>
     load_var client
     load_const <omitted>
-    load_const <omitted>
+    load_var on_event
     call ai.Agent.new
-    store_var _5
-    load_var q
-    call user.fixtures.llm_spec_mode.NamedTools$spec
     store_var _7
+    load_var q
+    call user.fixtures.llm_spec_mode.NamedTools@spec
+    store_var _9
+    load_type fixtures.llm_spec_mode.Answer
     load_var2 4 5
-    load_type ai.Runner<fixtures.llm_spec_mode.Answer, Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | baml.panics.Cancelled | baml.reflect.errors.CompilationError | ai.errors.Failure, Output = ai.RunResult<fixtures.llm_spec_mode.Answer>>
+    load_type ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure>
     load_const "run"
-    virtual_call nargs=2 ntypeargs=0
-    store_var _4
-    load_var _4
+    virtual_call nargs=2 ntypeargs=1
     load_field .value
     return
 }
 
-function fixtures.llm_spec_mode.NamedTools$build_request(q: string, client: ai.Client | null) -> baml.http.Request {
+function fixtures.llm_spec_mode.NamedTools@build_request(q: string, client: ai.Client | null) -> baml.http.Request {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -41,7 +48,7 @@ function fixtures.llm_spec_mode.NamedTools$build_request(q: string, client: ai.C
 
   L0:
     load_var q
-    call user.fixtures.llm_spec_mode.NamedTools$spec
+    call user.fixtures.llm_spec_mode.NamedTools@spec
     store_var _4
     load_type fixtures.llm_spec_mode.Answer
     load_var2 3 2
@@ -49,33 +56,30 @@ function fixtures.llm_spec_mode.NamedTools$build_request(q: string, client: ai.C
     return
 }
 
-function fixtures.llm_spec_mode.NamedTools$parse(json: string) -> fixtures.llm_spec_mode.Answer {
+function fixtures.llm_spec_mode.NamedTools@parse(json: string) -> fixtures.llm_spec_mode.Answer {
     load_type fixtures.llm_spec_mode.Answer
     load_var json
     call baml.sap.parse
     return
 }
 
-function fixtures.llm_spec_mode.NamedTools$render_prompt(q: string) -> ai.Prompt {
+function fixtures.llm_spec_mode.NamedTools@render_prompt(q: string) -> ai.Prompt {
     load_var q
-    call user.fixtures.llm_spec_mode.NamedTools$spec
+    call user.fixtures.llm_spec_mode.NamedTools@spec
     store_var _2
     load_type fixtures.llm_spec_mode.Answer
-    call ai.wire.render_output_format
-    store_var _3
-    load_type fixtures.llm_spec_mode.Answer
-    load_var2 2 3
+    load_var _2
     call ai.FunctionSpec.prompt
     return
 }
 
-function fixtures.llm_spec_mode.NamedTools$spec(q: string) -> ai.FunctionSpec<fixtures.llm_spec_mode.Answer> {
+function fixtures.llm_spec_mode.NamedTools@spec(q: string) -> ai.FunctionSpec<fixtures.llm_spec_mode.Answer> {
     load_var ?1
     make_cell
     store_var ?1
     call user.fixtures.llm_spec_mode.more_tools
     call ai.tools.Toolbox.new
-    store_var _4
+    store_var _5
     load_const "claude-haiku-4-5"
     load_const <omitted>
     load_const <omitted>
@@ -91,8 +95,9 @@ function fixtures.llm_spec_mode.NamedTools$spec(q: string) -> ai.FunctionSpec<fi
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
-    call anthropic.AnthropicClient.new
-    store_var _6
+    load_const <omitted>
+    call anthropic.Client.new
+    store_var _7
     load_const "NamedTools"
     load_deref ?1
     load_const "q"
@@ -100,14 +105,14 @@ function fixtures.llm_spec_mode.NamedTools$spec(q: string) -> ai.FunctionSpec<fi
     load_type unknown
     alloc_map 1
     load_var q
-    make_closure .<lambda(NamedTools$spec, 0)>, 1
+    make_closure .<lambda(NamedTools@spec, 0)>, 1
     load_var2 2 3
     load_type fixtures.llm_spec_mode.Answer
     init_instance<1> ai.FunctionSpec .spec_name, .args, .prompt_template, .toolbox, .default_client
     return
 }
 
-function fixtures.llm_spec_mode.PlainChat(q: string, client: ai.Client | null) -> string {
+function fixtures.llm_spec_mode.PlainChat(q: string, client: ai.Client | null, on_event: ((ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced) -> void throws unknown) | null) -> string {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -116,28 +121,35 @@ function fixtures.llm_spec_mode.PlainChat(q: string, client: ai.Client | null) -
     store_var client
 
   L0:
-    load_type string
+    load_var on_event
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L1
+    load_const null
+    store_var on_event
+
+  L1:
+    load_type unknown
     load_const <omitted>
     load_const <omitted>
     load_var client
     load_const <omitted>
-    load_const <omitted>
+    load_var on_event
     call ai.Agent.new
-    store_var _5
-    load_var q
-    call user.fixtures.llm_spec_mode.PlainChat$spec
     store_var _7
+    load_var q
+    call user.fixtures.llm_spec_mode.PlainChat@spec
+    store_var _9
+    load_type string
     load_var2 4 5
-    load_type ai.Runner<string, Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | baml.panics.Cancelled | baml.reflect.errors.CompilationError | ai.errors.Failure, Output = ai.RunResult<string>>
+    load_type ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure>
     load_const "run"
-    virtual_call nargs=2 ntypeargs=0
-    store_var _4
-    load_var _4
+    virtual_call nargs=2 ntypeargs=1
     load_field .value
     return
 }
 
-function fixtures.llm_spec_mode.PlainChat$build_request(q: string, client: ai.Client | null) -> baml.http.Request {
+function fixtures.llm_spec_mode.PlainChat@build_request(q: string, client: ai.Client | null) -> baml.http.Request {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -147,7 +159,7 @@ function fixtures.llm_spec_mode.PlainChat$build_request(q: string, client: ai.Cl
 
   L0:
     load_var q
-    call user.fixtures.llm_spec_mode.PlainChat$spec
+    call user.fixtures.llm_spec_mode.PlainChat@spec
     store_var _4
     load_type string
     load_var2 3 2
@@ -155,34 +167,31 @@ function fixtures.llm_spec_mode.PlainChat$build_request(q: string, client: ai.Cl
     return
 }
 
-function fixtures.llm_spec_mode.PlainChat$parse(json: string) -> string {
+function fixtures.llm_spec_mode.PlainChat@parse(json: string) -> string {
     load_type string
     load_var json
     call baml.sap.parse
     return
 }
 
-function fixtures.llm_spec_mode.PlainChat$render_prompt(q: string) -> ai.Prompt {
+function fixtures.llm_spec_mode.PlainChat@render_prompt(q: string) -> ai.Prompt {
     load_var q
-    call user.fixtures.llm_spec_mode.PlainChat$spec
+    call user.fixtures.llm_spec_mode.PlainChat@spec
     store_var _2
     load_type string
-    call ai.wire.render_output_format
-    store_var _3
-    load_type string
-    load_var2 2 3
+    load_var _2
     call ai.FunctionSpec.prompt
     return
 }
 
-function fixtures.llm_spec_mode.PlainChat$spec(q: string) -> ai.FunctionSpec<string> {
+function fixtures.llm_spec_mode.PlainChat@spec(q: string) -> ai.FunctionSpec<string> {
     load_var ?1
     make_cell
     store_var ?1
     load_type ai.tools.Tool
     alloc_array 0
     call ai.tools.Toolbox.new
-    store_var _4
+    store_var _5
     load_const "gpt-4o-mini"
     load_const <omitted>
     load_const <omitted>
@@ -199,8 +208,9 @@ function fixtures.llm_spec_mode.PlainChat$spec(q: string) -> ai.FunctionSpec<str
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call openai.ResponsesClient.new
-    store_var _6
+    store_var _7
     load_const "PlainChat"
     load_deref ?1
     load_const "q"
@@ -208,14 +218,14 @@ function fixtures.llm_spec_mode.PlainChat$spec(q: string) -> ai.FunctionSpec<str
     load_type unknown
     alloc_map 1
     load_var q
-    make_closure .<lambda(PlainChat$spec, 0)>, 1
+    make_closure .<lambda(PlainChat@spec, 0)>, 1
     load_var2 2 3
     load_type string
     init_instance<1> ai.FunctionSpec .spec_name, .args, .prompt_template, .toolbox, .default_client
     return
 }
 
-function fixtures.llm_spec_mode.PlainChat$stream(q: string, client: ai.stream.StreamingClient | null) -> ai.stream.Stream<string | null, string> {
+function fixtures.llm_spec_mode.PlainChat@stream(q: string, client: ai.stream.StreamingClient | null, on_event: ((ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced) -> void throws unknown) | null) -> ai.stream.Stream<string | null, string> {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -224,17 +234,26 @@ function fixtures.llm_spec_mode.PlainChat$stream(q: string, client: ai.stream.St
     store_var client
 
   L0:
+    load_var on_event
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L1
+    load_const null
+    store_var on_event
+
+  L1:
     load_var q
-    call user.fixtures.llm_spec_mode.PlainChat$spec
-    store_var _4
+    call user.fixtures.llm_spec_mode.PlainChat@spec
+    store_var _6
     load_type string | null
     load_type string
-    load_var2 3 2
+    load_var2 4 2
+    load_var on_event
     call ai.stream.from_spec
     return
 }
 
-function fixtures.llm_spec_mode.SpecAgent(q: string, client: ai.Client | null) -> fixtures.llm_spec_mode.Answer {
+function fixtures.llm_spec_mode.SpecAgent(q: string, client: ai.Client | null, on_event: ((ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced) -> void throws unknown) | null) -> fixtures.llm_spec_mode.Answer {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -243,28 +262,35 @@ function fixtures.llm_spec_mode.SpecAgent(q: string, client: ai.Client | null) -
     store_var client
 
   L0:
-    load_type fixtures.llm_spec_mode.Answer
+    load_var on_event
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L1
+    load_const null
+    store_var on_event
+
+  L1:
+    load_type unknown
     load_const <omitted>
     load_const <omitted>
     load_var client
     load_const <omitted>
-    load_const <omitted>
+    load_var on_event
     call ai.Agent.new
-    store_var _5
-    load_var q
-    call user.fixtures.llm_spec_mode.SpecAgent$spec
     store_var _7
+    load_var q
+    call user.fixtures.llm_spec_mode.SpecAgent@spec
+    store_var _9
+    load_type fixtures.llm_spec_mode.Answer
     load_var2 4 5
-    load_type ai.Runner<fixtures.llm_spec_mode.Answer, Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | baml.panics.Cancelled | baml.reflect.errors.CompilationError | ai.errors.Failure, Output = ai.RunResult<fixtures.llm_spec_mode.Answer>>
+    load_type ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure>
     load_const "run"
-    virtual_call nargs=2 ntypeargs=0
-    store_var _4
-    load_var _4
+    virtual_call nargs=2 ntypeargs=1
     load_field .value
     return
 }
 
-function fixtures.llm_spec_mode.SpecAgent$build_request(q: string, client: ai.Client | null) -> baml.http.Request {
+function fixtures.llm_spec_mode.SpecAgent@build_request(q: string, client: ai.Client | null) -> baml.http.Request {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -274,7 +300,7 @@ function fixtures.llm_spec_mode.SpecAgent$build_request(q: string, client: ai.Cl
 
   L0:
     load_var q
-    call user.fixtures.llm_spec_mode.SpecAgent$spec
+    call user.fixtures.llm_spec_mode.SpecAgent@spec
     store_var _4
     load_type fixtures.llm_spec_mode.Answer
     load_var2 3 2
@@ -282,27 +308,24 @@ function fixtures.llm_spec_mode.SpecAgent$build_request(q: string, client: ai.Cl
     return
 }
 
-function fixtures.llm_spec_mode.SpecAgent$parse(json: string) -> fixtures.llm_spec_mode.Answer {
+function fixtures.llm_spec_mode.SpecAgent@parse(json: string) -> fixtures.llm_spec_mode.Answer {
     load_type fixtures.llm_spec_mode.Answer
     load_var json
     call baml.sap.parse
     return
 }
 
-function fixtures.llm_spec_mode.SpecAgent$render_prompt(q: string) -> ai.Prompt {
+function fixtures.llm_spec_mode.SpecAgent@render_prompt(q: string) -> ai.Prompt {
     load_var q
-    call user.fixtures.llm_spec_mode.SpecAgent$spec
+    call user.fixtures.llm_spec_mode.SpecAgent@spec
     store_var _2
     load_type fixtures.llm_spec_mode.Answer
-    call ai.wire.render_output_format
-    store_var _3
-    load_type fixtures.llm_spec_mode.Answer
-    load_var2 2 3
+    load_var _2
     call ai.FunctionSpec.prompt
     return
 }
 
-function fixtures.llm_spec_mode.SpecAgent$spec(q: string) -> ai.FunctionSpec<fixtures.llm_spec_mode.Answer> {
+function fixtures.llm_spec_mode.SpecAgent@spec(q: string) -> ai.FunctionSpec<fixtures.llm_spec_mode.Answer> {
     load_var ?1
     make_cell
     store_var ?1
@@ -314,7 +337,7 @@ function fixtures.llm_spec_mode.SpecAgent$spec(q: string) -> ai.FunctionSpec<fix
     load_type ai.tools.Tool
     alloc_array 1
     call ai.tools.Toolbox.new
-    store_var _4
+    store_var _5
     load_const "gpt-4o-mini"
     load_const <omitted>
     load_const <omitted>
@@ -331,8 +354,9 @@ function fixtures.llm_spec_mode.SpecAgent$spec(q: string) -> ai.FunctionSpec<fix
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call openai.ResponsesClient.new
-    store_var _7
+    store_var _8
     load_const "SpecAgent"
     load_deref ?1
     load_const "q"
@@ -340,7 +364,7 @@ function fixtures.llm_spec_mode.SpecAgent$spec(q: string) -> ai.FunctionSpec<fix
     load_type unknown
     alloc_map 1
     load_var q
-    make_closure .<lambda(SpecAgent$spec, 0)>, 1
+    make_closure .<lambda(SpecAgent@spec, 0)>, 1
     load_var2 2 3
     load_type fixtures.llm_spec_mode.Answer
     init_instance<1> ai.FunctionSpec .spec_name, .args, .prompt_template, .toolbox, .default_client
@@ -349,7 +373,7 @@ function fixtures.llm_spec_mode.SpecAgent$spec(q: string) -> ai.FunctionSpec<fix
 
 function fixtures.llm_spec_mode.build_spec(q: string) -> ai.FunctionSpec<fixtures.llm_spec_mode.Answer> {
     load_var q
-    call user.fixtures.llm_spec_mode.SpecAgent$spec
+    call user.fixtures.llm_spec_mode.SpecAgent@spec
     return
 }
 

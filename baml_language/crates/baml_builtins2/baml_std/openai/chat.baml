@@ -1,13 +1,12 @@
-// openai.ChatClient — one model turn against OpenAI's Chat Completions API
-// (`POST https://api.openai.com/v1/chat/completions`).
-//
-// The sibling of `openai.ResponsesClient`: same provider, older and far more
-// widely-cloned endpoint. Reach for this one when you want chat-completions
-// semantics from OpenAI itself; for any other OpenAI-compatible server use
-// `openai.GenericClient`, `openai.OllamaClient`, `openai.OpenRouterClient` or
-// `openai.AzureClient`, which are the same wire core with different compat
-// flags (`openai/ns_internal/chat.baml`).
-
+/// One model turn against OpenAI's Chat Completions API
+/// (`POST https://api.openai.com/v1/chat/completions`).
+///
+/// The sibling of `openai.ResponsesClient`: same provider, older and far more
+/// widely-cloned endpoint. Reach for this one when you want chat-completions
+/// semantics from OpenAI itself; for any other OpenAI-compatible server use
+/// `openai.GenericClient`, `openai.OllamaClient`, `openai.OpenRouterClient` or
+/// `openai.AzureClient`, which are the same wire core with different compat
+/// flags (`openai/ns_internal/chat.baml`).
 class ChatClient {
     model: string,
     // A literal string, `env.NAME` (a late-bound `baml.env.Ref` read at request
@@ -37,7 +36,14 @@ class ChatClient {
     top_p: float?,
     stop: string[]?,
     seed: int?,
+    // Record request/response bodies (and raw SSE events) on the LLMCall wire
+    // records delivered through on_event. Status, headers, and timing are
+    // always recorded; this flag only gates the bodies.
+    capture_wire: bool,
 
+    /// Creates a client. Construction reads no environment variable, so
+    /// declaring one is always safe; credentials and endpoints resolve when a
+    /// request is built.
     function new(
         model: string = "gpt-4o-mini",
         api_key: ai.Credential? = null,
@@ -53,6 +59,7 @@ class ChatClient {
         top_p: float? = null,
         stop: string[]? = null,
         seed: int? = null,
+        capture_wire: bool = true,
     ) -> ChatClient {
         ChatClient {
             model: model,
@@ -69,57 +76,62 @@ class ChatClient {
             top_p: top_p,
             stop: stop,
             seed: seed,
+            capture_wire: capture_wire,
         }
     }
 
-    // The request-time credential: the explicit value (a literal, or the value
-    // of the variable an `env.NAME` ref points at), else the provider's
-    // canonical variable. Null is reported as a configuration error when the
-    // request is built, naming OPENAI_API_KEY.
+    /// The request-time credential: the explicit value (a literal, or the value
+    /// of the variable an `env.NAME` ref points at), else the provider's
+    /// canonical variable. Null is reported as a configuration error when the
+    /// request is built, naming OPENAI_API_KEY.
     function resolved_api_key(self) -> string? {
         ai.wire.resolve_credential(self.api_key, "OPENAI_API_KEY")
     }
 
-    // The request-time base URL, or the provider default.
+    /// The request-time base URL, or the provider default.
     function resolved_base_url(self) -> string {
         ai.wire.resolve_credential(self.base_url, null) ?? "https://api.openai.com/v1"
     }
 
-    // The provider record: everything the shared core needs to know about this
-    // endpoint. Only `stream_options` distinguishes first-party OpenAI from a
-    // bare compatible server.
+    /// The provider record: everything the shared core needs to know about this
+    /// endpoint. Only `stream_options` distinguishes first-party OpenAI from a
+    /// bare compatible server.
+    /// The provider record: everything the shared chat core needs to know
+    /// about this endpoint.
     function compat(self) -> root.internal.ChatCompat {
-        root.internal
-            .ChatCompat
-            .new(
-                provider = "openai-chat",
-                base_url = self.resolved_base_url(),
-                api_key_env = "OPENAI_API_KEY",
-                api_key_required = true,
-                send_stream_options = true,
-            )
+        root.internal.ChatCompat.new(
+            provider = "openai-chat",
+            base_url = self.resolved_base_url(),
+            api_key_env = "OPENAI_API_KEY",
+            api_key_required = true,
+            send_stream_options = true,
+        )
     }
 
+    /// The per-request parameters handed to the shared chat core.
+    ///
+    /// # Parameters
+    ///
+    /// - `preview`: omit the credential, for rendering a request without
+    ///   sending it.
     function params(self, preview: bool = false) -> root.internal.ChatParams {
-        root.internal
-            .ChatParams
-            .new(
-                model = self.model,
-                api_key = if (preview) {
-                    null
-                } else {
-                    self.resolved_api_key()
-                },
-                temperature = self.temperature,
-                max_tokens = self.max_tokens,
-                max_completion_tokens = self.max_completion_tokens,
-                top_p = self.top_p,
-                stop = self.stop,
-                seed = self.seed,
-                headers = self.headers,
-                query_params = self.query_params,
-                request_body = self.request_body,
-            )
+        root.internal.ChatParams.new(
+            model = self.model,
+            api_key = if (preview) {
+                null
+            } else {
+                self.resolved_api_key()
+            },
+            temperature = self.temperature,
+            max_tokens = self.max_tokens,
+            max_completion_tokens = self.max_completion_tokens,
+            top_p = self.top_p,
+            stop = self.stop,
+            seed = self.seed,
+            headers = self.headers,
+            query_params = self.query_params,
+            request_body = self.request_body,
+        )
     }
 
     implements ai.Client {
@@ -138,6 +150,7 @@ class ChatClient {
                 self.compat(),
                 self.params(),
                 input,
+                capture_wire = self.capture_wire,
                 request_timeout_ms = self.request_timeout_ms,
             ) catch_all (e) {
                 _ => throw ai.errors.normalize_invoke(e),
@@ -151,6 +164,7 @@ class ChatClient {
                 self.compat(),
                 self.params(),
                 input,
+                capture_wire = self.capture_wire,
                 request_timeout_ms = self.request_timeout_ms,
                 time_to_first_token_timeout_ms = self.time_to_first_token_timeout_ms,
             ) catch_all (e) {

@@ -64,7 +64,7 @@ function _chat_input_with_history() -> ai.ModelTurnInput {
     let args: map<string, unknown> = { "city": "SF" };
     let journal = ai.Journal {
         log: [
-            ai.events.UserMessage { content: "weather in SF?" },
+            ai.events.UserMessage.new("weather in SF?"),
             ai.events.AssistantMessage {
                 content: [
                     ai.content.Text { text: "checking" },
@@ -72,7 +72,34 @@ function _chat_input_with_history() -> ai.ModelTurnInput {
                 ],
                 client_id: "openai-chat/gpt-4o-mini",
             },
-            ai.events.ToolCompleted { id: "call_1", output: "sunny in SF" },
+            ai.events.ToolCompleted.new("call_1", "sunny in SF"),
+        ],
+    };
+    ai.ModelTurnInput {
+        prompt: spec.prompt_template,
+        journal: journal,
+        toolbox: ai.tools.Toolbox.new([ai.tools.tool(chat_get_weather)]),
+        output_type: spec.output_type(),
+    }
+}
+
+// Kimi keeps model reasoning across tool turns. Exercise the current content-
+// block constructors so this fork-owned replay contract tracks ai.events API
+// changes instead of silently falling back to the legacy string constructors.
+function _kimi_input_with_history() -> ai.ModelTurnInput {
+    let spec = ChatEcho@spec("and tomorrow?");
+    let args: map<string, unknown> = { "city": "SF" };
+    let journal = ai.Journal {
+        log: [
+            ai.events.UserMessage.of(["weather in SF?"]),
+            ai.events.AssistantMessage {
+                content: [
+                    ai.content.Reasoning { summary: "check the forecast" },
+                    ai.content.ToolUse { id: "call_1", name: "chat_get_weather", args: args },
+                ],
+                client_id: "openai-chat/kimi-for-coding",
+            },
+            ai.events.ToolCompleted.of("call_1", ["sunny in SF"]),
         ],
     };
     ai.ModelTurnInput {
@@ -159,6 +186,28 @@ test "chat_openai_request_shape" {
     assert.equal(
         chat_openai_request_shape(),
         "POST|/chat/completions|Bearer test-key|application/json|gpt-4o-mini|system|text|user|model,messages|pong|Complete|9/2/4/1",
+    )
+}
+
+function kimi_request_preserves_thinking_and_reasoning() -> string {
+    let cl = openai.KimiClient.new();
+    let request = cl.render(_kimi_input_with_history());
+    let body = baml.json.parse(request.body);
+    [
+        cl.id(),
+        request.url,
+        baml.json.path<string>(body, ".model"),
+        baml.json.path<string>(body, ".thinking.type"),
+        baml.json.path<string>(body, ".thinking.keep"),
+        baml.json.path<string>(body, ".messages[3].reasoning_content"),
+        baml.json.path<string>(body, ".messages[4].content"),
+    ].join("|")
+}
+
+test "kimi_request_preserves_thinking_and_reasoning" {
+    assert.equal(
+        kimi_request_preserves_thinking_and_reasoning(),
+        "openai-chat/kimi-for-coding|https://api.kimi.com/coding/v1/chat/completions|kimi-for-coding|enabled|all|check the forecast|sunny in SF",
     )
 }
 
@@ -438,6 +487,107 @@ test "chat_generic_collapses_text" {
     )
 }
 
+// Regression for #4589. Both provider paths receive the exact same answer;
+// each result retains the reported omitted/present/explicit-null comparison.
+class Issue4589Bbox {
+    x float
+    y float
+    w float
+    h float
+}
+
+class Issue4589Source {
+    doc_id string
+    page int
+    bbox Issue4589Bbox?
+}
+
+class Issue4589Envelope {
+    value string?
+    source Issue4589Source?
+    abstained bool
+    note string?
+}
+
+class Issue4589FourCases {
+    optional_omitted Issue4589Envelope?
+    required_omitted Issue4589Envelope
+    optional_present Issue4589Envelope?
+    optional_explicit_null Issue4589Envelope?
+}
+
+function Issue4589Probe(t: string) -> Issue4589FourCases {
+    client: "openai/gpt-4o-mini"
+    prompt: `${role("user")}${t}\n${ctx.output_format()}`
+}
+
+function _issue_4589_answer() -> string {
+    `{"optional_omitted":{"value":"optional-omitted","source":{"doc_id":"d","page":0},"abstained":false},"required_omitted":{"value":"required-omitted","source":{"doc_id":"d","page":0},"abstained":false},"optional_present":{"value":"optional-present","source":{"doc_id":"d","page":0,"bbox":{"x":0.1,"y":0.1,"w":0.1,"h":0.1}},"abstained":false},"optional_explicit_null":{"value":"optional-explicit-null","source":{"doc_id":"d","page":0,"bbox":null},"abstained":false}}`
+}
+
+function _issue_4589_chat_response() -> string {
+    let answer = baml.json.stringify(baml.json.to_json(_issue_4589_answer()));
+    `{"id":"chatcmpl-4589","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":${answer}},"finish_reason":"stop"}]}`
+}
+
+function _issue_4589_responses_response() -> string {
+    let answer = baml.json.stringify(baml.json.to_json(_issue_4589_answer()));
+    `{"id":"resp-4589","model":"m","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":${answer}}]}]}`
+}
+
+function _issue_4589_result_label(path: string, value: Issue4589FourCases) -> string {
+    [
+        path,
+        value.optional_omitted?.value ?? "NULLED",
+        value.required_omitted.value ?? "NULLED",
+        value.optional_present?.value ?? "NULLED",
+        value.optional_explicit_null?.value ?? "NULLED",
+    ].join("|")
+}
+
+function issue_4589_chat_preserves_omitted_nested_optional_class() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_issue_4589_chat_response())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.GenericClient.new(
+                model = "m",
+                base_url = mock.base_url() + "/v1",
+            );
+            let result = ai.Agent.new(client = cl).run(Issue4589Probe@spec("probe")).value;
+            _issue_4589_result_label(mock.last_request().path(), result)
+        },
+    )
+}
+
+test "issue_4589_chat_preserves_omitted_nested_optional_class" {
+    assert.equal(
+        issue_4589_chat_preserves_omitted_nested_optional_class(),
+        "/v1/chat/completions|optional-omitted|required-omitted|optional-present|optional-explicit-null",
+    )
+}
+
+function issue_4589_responses_preserves_omitted_nested_optional_class() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_issue_4589_responses_response())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ResponsesClient.new(
+                model = "m",
+                api_key = "test-key",
+                base_url = mock.base_url() + "/v1",
+            );
+            let result = ai.Agent.new(client = cl).run(Issue4589Probe@spec("probe")).value;
+            _issue_4589_result_label(mock.last_request().path(), result)
+        },
+    )
+}
+
+test "issue_4589_responses_preserves_omitted_nested_optional_class" {
+    assert.equal(
+        issue_4589_responses_preserves_omitted_nested_optional_class(),
+        "/v1/responses|optional-omitted|required-omitted|optional-present|optional-explicit-null",
+    )
+}
+
 function chat_generic_request_timeout_ms() -> string {
     root.llm_mock.mock_json_serve(
         [root.llm_mock.MockResponse.ok(_chat_ok_body())],
@@ -615,7 +765,7 @@ function chat_azure_config_error_survives_normalize() -> string {
 }
 
 function chat_anthropic_config_error_survives_normalize() -> string {
-    anthropic.AnthropicClient.new(
+    anthropic.Client.new(
         model = "claude-haiku-4-5",
         api_key = env.BAML_TEST_UNSET_ANTHROPIC_KEY,
     ).resolved_api_key() catch_all (e) { _ => _config_failure_class(e) }
@@ -880,8 +1030,10 @@ function chat_sse_decodes_text_and_usage() -> string {
                     let done: ai.stream.Done => {
                         break;
                     },
-                    let piece: string => {
-                        deltas.push(piece);
+                    let batch: string[] => {
+                        for (let piece in batch) {
+                            deltas.push(piece);
+                        }
                         null
                     },
                 };
@@ -926,7 +1078,7 @@ function chat_stream_total_timeout_after_delta() -> string {
             );
             let stream = cl.invoke_stream(_chat_input("hi"));
             let first = match (stream.next()) {
-                let text: string => text,
+                let batch: string[] => batch.join(""),
                 let done: ai.stream.Done => "Done",
             };
             let outcome = `${stream.final_turn().terminal_text() ?? ""}` catch_all (e) {
@@ -1021,17 +1173,18 @@ test "chat_generic_stream_time_to_first_token_timeout_ms" {
     assert.equal(chat_generic_stream_time_to_first_token_timeout_ms(), "20|Timeout")
 }
 
-// Streamed tool calls arrive as id/name once and argument fragments after.
-// `ai.stream.StreamEvent` cannot carry them to the runner yet (PLAN §6), so they
-// are buffered in the decoder and readable when the turn ends — this drives the
-// decoder over a real SSE connection and asserts the assembled call.
-function chat_sse_assembles_tool_calls() -> string {
+// Streamed tool calls arrive as id/name once and argument fragments after. They
+// are buffered in the decoder and emitted when the turn ends — this drives the
+// decoder over a real SSE connection and asserts the assembled call. The wire
+// content remains authoritative when a compatible provider supplies a
+// nonstandard finish reason.
+function chat_sse_assembles_tool_calls(finish_reason: string = "tool_calls") -> string {
     root.llm_mock.mock_sse_serve(
         [
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"chat_get_weather\",\"arguments\":\"\"}}]}}]}"),
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}"),
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]}}]}"),
-            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"${finish_reason}"}]}`),
             root.llm_mock.sse_data(`[DONE]`),
         ],
         (mock: root.llm_mock.MockSseServer) -> {
@@ -1044,6 +1197,7 @@ function chat_sse_assembles_tool_calls() -> string {
             };
             let sse = baml.http.fetch_sse(request);
             let stops: string[] = [];
+            let completed: string[] = [];
             while (true) {
                 match (sse.next()) {
                     null => {
@@ -1056,6 +1210,10 @@ function chat_sse_assembles_tool_calls() -> string {
                                     if let reason: ai.content.StopReason = meta.stop_reason {
                                         stops.push(`${reason}`);
                                     }
+                                    null
+                                },
+                                let done: ai.stream.ToolUseDone => {
+                                    completed.push(`${done.tool_use.id}/${done.tool_use.name}`);
                                     null
                                 },
                                 _ => null,
@@ -1073,6 +1231,7 @@ function chat_sse_assembles_tool_calls() -> string {
                 use?.id ?? "-",
                 use?.name ?? "-",
                 baml.json.stringify(baml.json.to_json(use?.args)),
+                completed.join(","),
                 stops.join(","),
             ].join("|")
         },
@@ -1082,8 +1241,89 @@ function chat_sse_assembles_tool_calls() -> string {
 test "chat_sse_assembles_tool_calls" {
     assert.equal(
         chat_sse_assembles_tool_calls(),
-        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|ToolUse",
+        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|call_7/chat_get_weather|ToolUse",
     )
+}
+
+test "chat_sse_trusts_complete_tool_call_over_nonstandard_finish_reason" {
+    assert.equal(
+        chat_sse_assembles_tool_calls(finish_reason = "unexpected_state"),
+        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|call_7/chat_get_weather|ToolUse",
+    )
+}
+
+// The public TurnStream contract carries reasoning and tool activity all the
+// way through the OpenAI-compatible client. final_turn reconstructs canonical
+// Reasoning/ToolUse blocks; legacy terminal text remains separate and empty.
+function chat_stream_preserves_reasoning_and_tools() -> string {
+    root.llm_mock.mock_sse_serve(
+        [
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{"reasoning_content":"plan "}}]}`),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{"reasoning_content":"first"}}]}`),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"chat_get_weather\",\"arguments\":\"\"}}]}}]}"),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}"),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]}}]}"),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`),
+            root.llm_mock.sse_data(`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":3}}}`),
+            root.llm_mock.sse_data(`[DONE]`),
+        ],
+        (mock: root.llm_mock.MockSseServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let stream = cl.invoke_stream(_chat_input("hi"));
+            let seen: string[] = [];
+            while (true) {
+                match (stream.next_event()) {
+                    let reasoning: ai.stream.ReasoningDelta => {
+                        seen.push(`r:${reasoning.summary}`);
+                        null
+                    },
+                    let delta: ai.stream.ToolUseDelta => {
+                        seen.push(`td:${delta.index}:${delta.id ?? "-"}:${delta.name ?? "-"}:${delta.arguments ?? "-"}`);
+                        null
+                    },
+                    let done: ai.stream.ToolUseDone => {
+                        seen.push(`tool:${done.tool_use.id}:${done.tool_use.name}`);
+                        null
+                    },
+                    let meta: ai.stream.TurnMeta => {
+                        if let stop: ai.content.StopReason = meta.stop_reason {
+                            seen.push(`stop:${stop}`);
+                        }
+                        null
+                    },
+                    let done: ai.stream.TurnDone => {
+                        seen.push("turn-done");
+                        null
+                    },
+                    let done: ai.stream.Done => {
+                        break;
+                    },
+                    _ => null,
+                };
+            }
+            let turn = stream.final_turn();
+            let reasoning = "";
+            for (let block in turn.content) {
+                if let thought: ai.content.Reasoning = block {
+                    reasoning = thought.summary;
+                }
+            }
+            let tool = turn.tool_uses().at(0);
+            [
+                `events=${seen.join(",")}`,
+                `reasoning=${reasoning}`,
+                `text=${turn.terminal_text() ?? "null"}`,
+                `tool=${tool?.id ?? "-"}/${tool?.name ?? "-"}/${baml.json.stringify(baml.json.to_json(tool?.args))}`,
+                `usage=${turn.usage?.input_tokens ?? -1}/${turn.usage?.output_tokens ?? -1}/${turn.usage?.cached_input_tokens ?? -1}/${turn.usage?.reasoning_tokens ?? -1}`,
+            ].join("|")
+        },
+    )
+}
+
+test "chat_stream_preserves_reasoning_and_tools" {
+    let got = chat_stream_preserves_reasoning_and_tools();
+    assert.contains(got, "events=r:plan ,r:first,td:0:call_7:chat_get_weather:,td:0:-:-:{\"city\":,td:0:-:-:\"Paris\"},tool:call_7:chat_get_weather,stop:ToolUse,turn-done|");
+    assert.contains(got, "reasoning=plan first|text=|tool=call_7/chat_get_weather/{\"city\":\"Paris\"}|usage=11/8/5/3")
 }
 
 // ─── through the runner ──────────────────────────────────────────────────────
@@ -1098,7 +1338,7 @@ function chat_runs_through_the_agent() -> string {
                 api_key = "test-key",
                 base_url = mock.base_url(),
             );
-            let result = ai.Agent<string>.new(client = cl).run(ChatEcho@spec("Say pong."));
+            let result = ai.Agent.new(client = cl).run(ChatEcho@spec("Say pong."));
             result.value
         },
     )
@@ -1632,7 +1872,7 @@ test "chat_parses_audio_output" {
 
 function live_openai_chat_answers() -> bool {
     let cl = openai.ChatClient.new(model = "gpt-4o-mini", max_tokens = 16);
-    let result = ai.Agent<string>.new(client = cl).run(ChatEcho@spec("Say pong."));
+    let result = ai.Agent.new(client = cl).run(ChatEcho@spec("Say pong."));
     result.value.trim().length() > 0
 }
 
@@ -1647,7 +1887,7 @@ function live_openai_chat_streams() -> bool {
 
 function live_openrouter_answers() -> bool {
     let cl = openai.OpenRouterClient.new(model = "openai/gpt-4o-mini", max_tokens = 16);
-    let result = ai.Agent<string>.new(client = cl).run(ChatEcho@spec("Say pong."));
+    let result = ai.Agent.new(client = cl).run(ChatEcho@spec("Say pong."));
     result.value.trim().length() > 0
 }
 
@@ -1676,4 +1916,113 @@ testset "live" with testing.Sequential() {
     } else {
         log.warn("live::openrouter not registered: OPENROUTER_API_KEY is unset")
     }
+}
+
+// ─── journal content blocks: media in tool results and user turns ─────────────
+//
+// Chat column of the lowering table (`_chat_lower_block` in chat.baml): a
+// `tool` message is text only, so every media kind in a result Degrades into
+// a trailing user turn; user turns Accept image, audio and pdf; video has no
+// part at all and is Rejected.
+
+function _chat_media_input(media: image | audio | video | pdf) -> ai.ModelTurnInput {
+    let spec = ChatEcho@spec("and tomorrow?");
+    ai.ModelTurnInput {
+        prompt: spec.prompt_template,
+        journal: root.llm_mock.media_journal("openai-chat/gpt-4o-mini", media),
+        toolbox: ai.tools.Toolbox.new([ai.tools.tool(chat_get_weather)]),
+        output_type: spec.output_type(),
+    }
+}
+
+// messages: [system, user, assistant(tool_calls), tool, tool, user(note +
+// image), user(text + image)]. Both tool messages keep plain-string content.
+function chat_journal_image_degrades() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_chat_ok_body())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let _ = cl.invoke(_chat_media_input(root.llm_mock.media_png()));
+            let body = mock.last_request().json();
+            [
+                baml.json.path<string>(body, ".messages[3].content"),
+                baml.json.path<string>(body, ".messages[4].tool_call_id"),
+                baml.json.path<string>(body, ".messages[4].content"),
+                baml.json.path<string>(body, ".messages[5].role"),
+                baml.json.path<string>(body, ".messages[5].content[0].text"),
+                baml.json.path<string>(body, ".messages[5].content[1].image_url.url"),
+                baml.json.path<string>(body, ".messages[6].role"),
+                baml.json.path<string>(body, ".messages[6].content[0].text"),
+                baml.json.path<string>(body, ".messages[6].content[1].type"),
+                baml.json.path_or<string>(body, ".messages[7].role", "absent"),
+            ].join("|")
+        },
+    )
+}
+
+test "chat_journal_image_degrades" {
+    assert.equal(
+        chat_journal_image_degrades(),
+        `sunny in SF|call_media|captured:|user|${root.llm_mock.degrade_note("capture")}|data:image/png;base64,SGVsbG8=|user|Screenshot after the tool ran:|image_url|absent`,
+    )
+}
+
+// messages: [system, user, assistant(tool_calls), tool(placeholder), tool,
+// user(note + audio)]: the two `tool` replies stay contiguous and the media
+// the first one could not carry follows the second.
+function chat_journal_parallel_results_stay_contiguous() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_chat_ok_body())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let spec = ChatEcho@spec("and tomorrow?");
+            let input = ai.ModelTurnInput {
+                prompt: spec.prompt_template,
+                journal: root.llm_mock.parallel_media_journal("openai-chat/gpt-4o-mini", root.llm_mock.media_mp3()),
+                toolbox: ai.tools.Toolbox.new([ai.tools.tool(chat_get_weather)]),
+                output_type: spec.output_type(),
+            };
+            let _ = cl.invoke(input);
+            let body = mock.last_request().json();
+            [
+                baml.json.path<string>(body, ".messages[3].role"),
+                baml.json.path<string>(body, ".messages[3].tool_call_id"),
+                baml.json.path<string>(body, ".messages[3].content"),
+                baml.json.path<string>(body, ".messages[4].role"),
+                baml.json.path<string>(body, ".messages[4].tool_call_id"),
+                baml.json.path<string>(body, ".messages[5].role"),
+                baml.json.path<string>(body, ".messages[5].content[0].text"),
+                baml.json.path<string>(body, ".messages[5].content[1].type"),
+                baml.json.path_or<string>(body, ".messages[6].role", "absent"),
+            ].join("|")
+        },
+    )
+}
+
+test "chat_journal_parallel_results_stay_contiguous" {
+    assert.equal(
+        chat_journal_parallel_results_stay_contiguous(),
+        `tool|call_media|[audio]|tool|call_text|user|${root.llm_mock.degrade_note("capture")}|input_audio|absent`,
+    )
+}
+
+function chat_journal_video_rejected() -> string {
+    root.llm_mock.mock_json_serve(
+        [root.llm_mock.MockResponse.ok(_chat_ok_body())],
+        (mock: root.llm_mock.MockJsonServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let clip = baml.media.Video.from_base64("QUJD", "video/mp4");
+            let detail = cl.invoke(_chat_media_input(clip)).stop_reason.to_string() catch_all (e) {
+                let invalid: ai.errors.InvalidRequest => invalid.detail,
+                _ => `unexpected error class: ${e.to_string()}`,
+            };
+            `${detail}|requests=${mock.request_count()}`
+        },
+    )
+}
+
+test "chat_journal_video_rejected" {
+    let got = chat_journal_video_rejected();
+    assert.contains(got, "OpenAI Chat Completions has no video input part");
+    assert.contains(got, "|requests=0")
 }

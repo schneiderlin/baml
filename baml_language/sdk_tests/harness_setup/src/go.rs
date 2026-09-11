@@ -7,10 +7,11 @@
 
 use std::{collections::HashMap, env, fs, path::PathBuf};
 
-use baml_base::Name as BaseName;
+use baml_base::{Literal, Name as BaseName};
 use baml_codegen_types::{
-    CallableParam, Class, ClassProperty, CodegenFunctionParamMode, Enum, EnumVariant, Function,
-    FunctionArgument, Name, NamingConvention, Origin, Symbol, SymbolPool, Ty, TypeAlias,
+    CallableParam, Class, ClassProperty, CodegenFunctionParamMode, DefaultLiteral, Enum,
+    EnumVariant, Function, FunctionArgument, FunctionArgumentDefault, Name, NamingConvention,
+    Origin, Symbol, SymbolPool, Ty, TypeAlias,
 };
 use baml_type::TyAttr;
 
@@ -59,7 +60,7 @@ fn ty_enum(name: Name) -> Ty {
 }
 
 fn ty_class(name: Name, arguments: Vec<Ty>) -> Ty {
-    Ty::Class(name, arguments, TyAttr::default())
+    Ty::Class(name, arguments.into(), TyAttr::default())
 }
 
 fn ty_alias(name: Name) -> Ty {
@@ -67,7 +68,7 @@ fn ty_alias(name: Name) -> Ty {
 }
 
 fn ty_union(members: Vec<Ty>) -> Ty {
-    Ty::Union(members, TyAttr::default())
+    Ty::Union(members.into(), TyAttr::default())
 }
 
 fn ty_callable(params: Vec<Ty>, ret: Ty) -> Ty {
@@ -214,6 +215,21 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
         vec![],
         BaseName::new("call_cross_package_union_callback"),
     );
+    let defaulted_extract = Name::new(
+        BaseName::new("user"),
+        vec![],
+        BaseName::new("defaulted_extract"),
+    );
+    let defaulted_extract_spec = Name::new(
+        BaseName::new("user"),
+        vec![],
+        BaseName::new("defaulted_extract@spec"),
+    );
+    let defaulted_extract_stream = Name::new(
+        BaseName::new("user"),
+        vec![],
+        BaseName::new("defaulted_extract@stream"),
+    );
     let static_factory = Name::new(
         BaseName::new("user"),
         vec![],
@@ -278,6 +294,7 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
                 generic_params: vec![],
                 docstring: None,
                 arguments: vec![FunctionArgument {
+                    injected: false,
                     name: BaseName::new("value"),
                     docstring: None,
                     ty: ty_class(context.clone(), vec![]),
@@ -300,12 +317,14 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
                 docstring: None,
                 arguments: vec![
                     FunctionArgument {
+                        injected: false,
                         name: BaseName::new("models"),
                         docstring: None,
                         ty: ty_string(),
                         default: None,
                     },
                     FunctionArgument {
+                        injected: false,
                         name: BaseName::new("value"),
                         docstring: None,
                         ty: ty_class(models.clone(), vec![]),
@@ -328,6 +347,7 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
                 generic_params: vec![],
                 docstring: None,
                 arguments: vec![FunctionArgument {
+                    injected: false,
                     name: BaseName::new("value"),
                     docstring: None,
                     ty: ty_class(envelope.clone(), vec![]),
@@ -349,6 +369,7 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
                 generic_params: vec![],
                 docstring: None,
                 arguments: vec![FunctionArgument {
+                    injected: false,
                     name: BaseName::new("value"),
                     docstring: None,
                     ty: ty_class(enum_holder.clone(), vec![]),
@@ -373,6 +394,7 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
                 docstring: None,
                 arguments: vec![
                     FunctionArgument {
+                        injected: false,
                         name: BaseName::new("callback"),
                         docstring: None,
                         ty: ty_callable(
@@ -385,6 +407,7 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
                         default: None,
                     },
                     FunctionArgument {
+                        injected: false,
                         name: BaseName::new("value"),
                         docstring: None,
                         ty: ty_union(vec![ty_string(), ty_class(models.clone(), vec![])]),
@@ -400,6 +423,29 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
                 },
             }),
         ),
+        synthetic_defaulted_extract(defaulted_extract, "defaulted_extract", ty_string(), false),
+        synthetic_defaulted_extract(
+            defaulted_extract_spec,
+            "defaulted_extract@spec",
+            ty_class(
+                Name::new(BaseName::new("ai"), vec![], BaseName::new("FunctionSpec")),
+                vec![ty_string()],
+            ),
+            false,
+        ),
+        synthetic_defaulted_extract(
+            defaulted_extract_stream,
+            "defaulted_extract@stream",
+            ty_class(
+                Name::new(
+                    BaseName::new("ai"),
+                    vec![BaseName::new("stream")],
+                    BaseName::new("Stream"),
+                ),
+                vec![ty_string(), ty_string()],
+            ),
+            true,
+        ),
         synthetic_class_with_methods(static_factory, vec![], static_methods),
     ]);
     let output = sdkgen_go::to_source_code_with_bytecode(
@@ -410,6 +456,65 @@ fn stage_package_edges(manifest_dir: &std::path::Path, diagnostics: &mut BuildDi
     );
     stage_output(manifest_dir, "package_edges", output, diagnostics);
     watch_dir(&manifest_dir.join("package_edges").join("customizable"));
+}
+
+fn synthetic_defaulted_extract(
+    name: Name,
+    function_name: &str,
+    return_type: Ty,
+    include_on_event: bool,
+) -> (Name, Symbol) {
+    let mut arguments = vec![
+        FunctionArgument {
+            injected: false,
+            name: BaseName::new("text"),
+            docstring: None,
+            ty: ty_string(),
+            default: None,
+        },
+        FunctionArgument {
+            injected: false,
+            name: BaseName::new("tone"),
+            docstring: None,
+            ty: ty_string(),
+            default: Some(FunctionArgumentDefault::Literal(DefaultLiteral::Scalar(
+                Literal::String("neutral".to_string()),
+            ))),
+        },
+    ];
+    if include_on_event {
+        arguments.push(FunctionArgument {
+            injected: true,
+            name: BaseName::new("on_event"),
+            docstring: None,
+            ty: ty_union(vec![
+                ty_callable(
+                    vec![ty_string()],
+                    Ty::Void {
+                        attr: TyAttr::default(),
+                    },
+                ),
+                Ty::Null {
+                    attr: TyAttr::default(),
+                },
+            ]),
+            default: Some(FunctionArgumentDefault::Null),
+        });
+    }
+    let function = Function {
+        name: BaseName::new(function_name),
+        generic_params: vec![],
+        docstring: None,
+        arguments,
+        return_type,
+        throws: None,
+        watchers: vec![],
+        origin: Origin {
+            source_file_path: "synthetic.baml".to_string(),
+            span_start: 0,
+        },
+    };
+    (name, Symbol::Function(function))
 }
 
 fn synthetic_class(name: Name, properties: Vec<(&str, Ty)>) -> (Name, Symbol) {
@@ -451,6 +556,7 @@ fn synthetic_method(name: &str, arguments: Vec<(&str, Ty, bool)>, return_type: T
         arguments: arguments
             .into_iter()
             .map(|(name, ty, defaulted)| FunctionArgument {
+                injected: false,
                 name: BaseName::new(name),
                 docstring: None,
                 ty,
@@ -508,6 +614,7 @@ fn round_trip_function(name: Name, ty: Ty) -> (Name, Symbol) {
         generic_params: vec![],
         docstring: None,
         arguments: vec![FunctionArgument {
+            injected: false,
             name: BaseName::new("value"),
             docstring: None,
             ty: ty.clone(),

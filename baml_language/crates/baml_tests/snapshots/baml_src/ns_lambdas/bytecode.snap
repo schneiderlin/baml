@@ -212,6 +212,102 @@ function lambdas.$init_test_ns_lambdas_lambdas(registry: testing.TestCollector) 
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "annotated_return_uses_closure_contract"
+    make_closure .<lambda($init_test_ns_lambdas_lambdas, 30)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "inferred_return_uses_closure_frame"
+    make_closure .<lambda($init_test_ns_lambdas_lambdas, 31)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "inferred_returns_join_with_tail"
+    make_closure .<lambda($init_test_ns_lambdas_lambdas, 32)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "contextual_returns_join_before_binding"
+    make_closure .<lambda($init_test_ns_lambdas_lambdas, 33)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "nested_returns_use_innermost_frame"
+    make_closure .<lambda($init_test_ns_lambdas_lambdas, 34)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "match_arm_return_uses_closure_frame"
+    make_closure .<lambda($init_test_ns_lambdas_lambdas, 35)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "return_inside_deferred_closure"
+    make_closure .<lambda($init_test_ns_lambdas_lambdas, 36)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_const null
+    return
+}
+
+function lambdas.$init_test_ns_lambdas_signature_holes(registry: testing.TestCollector) -> null {
+    load_var registry
+    load_const "root.lambdas"
+    load_const "lambda_return_hole_matches_omitted_and_explicit"
+    make_closure .<lambda($init_test_ns_lambdas_signature_holes, 0)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "lambda_nested_return_hole"
+    make_closure .<lambda($init_test_ns_lambdas_signature_holes, 4)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "lambda_parameter_and_return_from_context"
+    make_closure .<lambda($init_test_ns_lambdas_signature_holes, 6)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "lambda_throws_hole"
+    make_closure .<lambda($init_test_ns_lambdas_signature_holes, 8)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "lambda_hole_preserves_enclosing_generic_frame"
+    make_closure .<lambda($init_test_ns_lambdas_signature_holes, 10)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.lambdas"
+    load_const "lambda_explicit_unknown_is_not_an_unsolved_hole"
+    make_closure .<lambda($init_test_ns_lambdas_signature_holes, 11)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
     load_const null
     return
 }
@@ -226,30 +322,24 @@ function lambdas.lambda_contextual_call(cb: (int) -> int throws int | string) ->
 function lambdas.lambda_contextual_main() -> int {
     make_closure .<lambda(lambda_contextual_main, 0)>, 0
     call user.lambdas.lambda_contextual_call
-    jump L4
+    jump L2
     load_var e
     is_type string
-    pop_jump_if_false L0
-    jump L3
-
-  L0:
+    pop_jump_if_true L1
     load_var e
     is_type int
-    pop_jump_if_false L1
-    jump L2
-
-  L1:
+    pop_jump_if_true L0
     load_var e
     rethrow
 
-  L2:
+  L0:
     load_const 2
-    jump L4
+    jump L2
 
-  L3:
+  L1:
     load_const 1
 
-  L4:
+  L2:
     return
 }
 
@@ -281,20 +371,17 @@ function lambdas.lambda_effect_main() -> int {
     load_type string
     load_const user.lambdas.lambda_effect_fail
     call user.lambdas.lambda_effect_forward
-    jump L2
+    jump L1
     load_var e
     is_type string
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_var e
     rethrow
 
-  L1:
+  L0:
     load_const 1
 
-  L2:
+  L1:
     return
 }
 
@@ -302,6 +389,30 @@ function lambdas.lambdas_annotated_lambda_doubles() -> int {
     load_const 21
     make_closure .<lambda(lambdas_annotated_lambda_doubles, 0)>, 0
     call_indirect
+    return
+}
+
+function lambdas.lambdas_annotated_return_uses_closure_contract() -> int[] {
+    make_closure .<lambda(lambdas_annotated_return_uses_closure_contract, 0)>, 0
+    store_var choose
+    load_const true
+    load_var choose
+    call_indirect
+    load_const false
+    load_var choose
+    call_indirect
+    load_type int
+    alloc_array 2
+    return
+}
+
+function lambdas.lambdas_callback_return_name(callback: (bool) -> #0 throws unknown) -> string {
+    load_var callback
+    call reflect.signature
+    load_field .returns
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     return
 }
 
@@ -357,16 +468,13 @@ function lambdas.lambdas_captures_loop_variable_accumulation() -> int {
     store_var _6
     load_var _6
     is_type baml.iter.Done
-    pop_jump_if_false L1
-    jump L2
-
-  L1:
+    pop_jump_if_true L1
     load_var2 4 2
     call_indirect
     pop 1
     jump L0
 
-  L2:
+  L1:
     load_deref ?1
     return
 }
@@ -408,6 +516,14 @@ function lambdas.lambdas_closure_in_map_with_captured_offset() -> int[] {
     return
 }
 
+function lambdas.lambdas_contextual_returns_join_before_binding() -> string {
+    load_type int | string
+    load_type never
+    make_closure .<lambda(lambdas_contextual_returns_join_before_binding, 0)>, 0
+    call user.lambdas.lambdas_callback_return_name
+    return
+}
+
 function lambdas.lambdas_deep_nesting_three_levels() -> int {
     load_var ?1
     make_cell
@@ -425,22 +541,19 @@ function lambdas.lambdas_explicit_throwing_lambda_catches_error() -> int {
     load_const -1
     make_closure .<lambda(lambdas_explicit_throwing_lambda_catches_error, 0)>, 0
     call_indirect
-    jump L2
+    jump L1
     load_var e
     is_type "negative"
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_var e
     throw_if_panic
     load_const -2
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const -1
 
-  L2:
+  L1:
     return
 }
 
@@ -478,19 +591,45 @@ function lambdas.lambdas_inferred_return_type_lambda() -> int {
     return
 }
 
+function lambdas.lambdas_inferred_return_uses_closure_frame() -> int[] {
+    make_closure .<lambda(lambdas_inferred_return_uses_closure_frame, 0)>, 0
+    store_var choose
+    load_const true
+    load_var choose
+    call_indirect
+    load_const false
+    load_var choose
+    call_indirect
+    load_type int
+    alloc_array 2
+    return
+}
+
+function lambdas.lambdas_inferred_returns_join_with_tail() -> string {
+    make_closure .<lambda(lambdas_inferred_returns_join_with_tail, 0)>, 0
+    call reflect.signature
+    load_field .returns
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
+    return
+}
+
 function lambdas.lambdas_inferred_signature() -> string {
     make_closure .<lambda(lambdas_inferred_signature, 0)>, 0
-    call baml.reflect.signature
+    call reflect.signature
     store_var sig
     load_var sig
     load_field .returns
-    call baml.TypeValue.baml.ToString.to_string
-    store_var _5
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     load_var sig
     load_field .errors
-    call baml.TypeValue.baml.ToString.to_string
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     store_var _7
-    load_var _5
     load_const "/"
     bin_op +
     load_var _7
@@ -500,17 +639,19 @@ function lambdas.lambdas_inferred_signature() -> string {
 
 function lambdas.lambdas_inferred_throwing_signature() -> string {
     make_closure .<lambda(lambdas_inferred_throwing_signature, 0)>, 0
-    call baml.reflect.signature
+    call reflect.signature
     store_var sig
     load_var sig
     load_field .returns
-    call baml.TypeValue.baml.ToString.to_string
-    store_var _5
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     load_var sig
     load_field .errors
-    call baml.TypeValue.baml.ToString.to_string
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     store_var _7
-    load_var _5
     load_const "/"
     bin_op +
     load_var _7
@@ -704,6 +845,20 @@ function lambdas.lambdas_lambda_param_shadows_annotated_outer_local() -> int {
     return
 }
 
+function lambdas.lambdas_match_arm_return_uses_closure_frame() -> int[] {
+    make_closure .<lambda(lambdas_match_arm_return_uses_closure_frame, 0)>, 0
+    store_var choose
+    load_const 0
+    load_var choose
+    call_indirect
+    load_const 4
+    load_var choose
+    call_indirect
+    load_type int
+    alloc_array 2
+    return
+}
+
 function lambdas.lambdas_multi_param_lambda() -> int {
     load_const 20
     load_const 22
@@ -785,6 +940,33 @@ function lambdas.lambdas_nested_lambda_transitive_capture() -> int {
     return
 }
 
+function lambdas.lambdas_nested_returns_use_innermost_frame() -> int[] {
+    make_closure .<lambda(lambdas_nested_returns_use_innermost_frame, 0)>, 0
+    store_var outer
+    load_const true
+    load_var outer
+    call_indirect
+    load_const false
+    load_var outer
+    call_indirect
+    load_type int
+    alloc_array 2
+    return
+}
+
+function lambdas.lambdas_return_inside_deferred_closure() -> int {
+    make_closure .<lambda(lambdas_return_inside_deferred_closure, 0)>, 0
+    call_indirect
+    pop 1
+    load_const 25
+    return
+    make_closure .<lambda(lambdas_return_inside_deferred_closure, 1)>, 0
+    call_indirect
+    pop 1
+    load_var _1
+    rethrow
+}
+
 function lambdas.lambdas_shared_cell_mutation_counter() -> int {
     load_var ?1
     make_cell
@@ -806,5 +988,23 @@ function lambdas.lambdas_shared_cell_mutation_counter() -> int {
 function lambdas.lambdas_zero_param_lambda() -> int {
     make_closure .<lambda(lambdas_zero_param_lambda, 0)>, 0
     call_indirect
+    return
+}
+
+function lambdas.signature_holes_generic(value: #0) -> string {
+    load_type #0
+    make_closure .<lambda(signature_holes_generic, 0)>, captures=0, ntypeargs=1
+    store_var identity
+    load_var2 1 2
+    call_indirect
+    load_var value
+    call assert.equal
+    pop 1
+    load_var identity
+    call reflect.signature
+    load_field .returns
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     return
 }

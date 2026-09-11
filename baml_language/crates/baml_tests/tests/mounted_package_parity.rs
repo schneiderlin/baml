@@ -25,13 +25,12 @@
 
 use baml_base::Name;
 use baml_compiler2_emit::{
-    CompileOptions, MountedPackageLinkError, OptLevel, decompose_units, emit_units,
-    generate_project_bytecode_with_mounted_units, generate_project_bytecode_with_opt,
+    MountedPackageLinkError, OptLevel, emit_units, generate_project_bytecode_with_mounted_units,
+    generate_project_bytecode_with_opt,
 };
-use baml_compiler2_hir::package::PackageId;
-use baml_compiler2_hir_ty::package_interface::{ExportedType, PackageInterface, package_interface};
-use baml_project::{ProjectDatabase, collect_diagnostics, testing::assert_no_diagnostic_errors};
-use baml_tests::engine::run_compiled;
+use baml_compiler2_hir_ty::package_interface::{ExportedType, PackageInterface, export_interface};
+use baml_db::{ProjectDatabase, collect_diagnostics, testing::assert_no_diagnostic_errors};
+use baml_tests::engine::{TestDbExt, run_compiled};
 use bex_engine::BexExternalValue;
 use bex_vm_types::{CompilationUnit, Program};
 use indexmap::IndexMap;
@@ -146,37 +145,41 @@ function parse_positive(value: int) -> int throws ParseError {
 }
 "#;
 
-fn options() -> CompileOptions {
-    CompileOptions {
-        emit_test_cases: false,
-    }
-}
-
 fn library_db() -> ProjectDatabase {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new(ROOT));
-    db.add_compiler2_virtual_file("<builtin>/app/lib.baml", LIB);
+    db.workspace(std::path::Path::new(ROOT));
+    db.dependency("app");
+    db.file("<builtin>/app/lib.baml", LIB);
     db
 }
 
 struct LibraryArtifacts {
     blob: Vec<u8>,
-    interface: PackageInterface,
+    interface: PackageInterface<baml_type::TypeName>,
     units: Vec<CompilationUnit>,
 }
 
 fn library_artifacts() -> LibraryArtifacts {
     let db = library_db();
     assert_no_diagnostic_errors(&db);
-    let interface = package_interface(&db, PackageId::new(&db, Name::new("app"))).clone();
-    let blob = borsh::to_vec(&interface).expect("serialize app package interface");
-    let round_trip =
-        borsh::from_slice::<PackageInterface>(&blob).expect("deserialize app package interface");
+    let interface = export_interface(
+        &db,
+        baml_compiler2_hir::package::spelling(&db)
+            .root(&Name::new("app"))
+            .unwrap(),
+    );
+    let blob = baml_artifact::encode(baml_artifact::ArtifactKind::PackageInterface, &interface)
+        .expect("serialize app package interface");
+    let round_trip = baml_artifact::decode::<PackageInterface<baml_type::TypeName>>(
+        baml_artifact::ArtifactKind::PackageInterface,
+        &blob,
+    )
+    .expect("deserialize app package interface");
     assert_eq!(
         interface, round_trip,
         "interface blob must round-trip exactly"
     );
-    let units = emit_units(&db, &options(), OPT).expect("emit independent app units");
+    let units = emit_units(&db, package(&db), OPT).expect("emit independent app units");
     LibraryArtifacts {
         blob,
         interface,
@@ -184,30 +187,37 @@ fn library_artifacts() -> LibraryArtifacts {
     }
 }
 
+/// The workspace root the fixture builder added: the package whose program
+/// the test compiles.
+fn package(db: &ProjectDatabase) -> baml_db::SourceRoot {
+    db.workspace_root()
+        .unwrap_or_else(|| unreachable!("the fixture builder adds one workspace root"))
+}
+
 fn source_db(user: &str) -> ProjectDatabase {
     let mut db = library_db();
-    db.add_file("main.baml", user);
+    db.file("main.baml", user);
     db
 }
 
 fn blob_db(user: &str, blob: Vec<u8>) -> ProjectDatabase {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new(ROOT));
-    db.set_mounted_packages([("app".to_string(), blob)].into());
-    db.add_file("main.baml", user);
+    db.workspace(std::path::Path::new(ROOT));
+    db.mount("app", blob);
+    db.file("main.baml", user);
     db
 }
 
 fn compile_source(user: &str) -> Program {
     let db = source_db(user);
     assert_no_diagnostic_errors(&db);
-    generate_project_bytecode_with_opt(&db, &options(), OPT).expect("source-path compile")
+    generate_project_bytecode_with_opt(&db, package(&db), OPT).expect("source-path compile")
 }
 
 fn compile_blob(user: &str, artifacts: &LibraryArtifacts) -> Program {
     let db = blob_db(user, artifacts.blob.clone());
     assert_no_diagnostic_errors(&db);
-    generate_project_bytecode_with_mounted_units(&db, &options(), OPT, &artifacts.units)
+    generate_project_bytecode_with_mounted_units(&db, package(&db), OPT, &artifacts.units)
         .expect("blob-path compile and link")
 }
 
@@ -507,25 +517,29 @@ fn emitted_program_dependency_and_consumer_units_are_byte_identical() {
     let artifacts = library_artifacts();
     let source_db = source_db(ARTIFACT_USER);
     assert_no_diagnostic_errors(&source_db);
-    let source_program =
-        generate_project_bytecode_with_opt(&source_db, &options(), OPT).expect("source program");
-    let source_units = emit_units(&source_db, &options(), OPT).expect("source units");
+    let source_program = generate_project_bytecode_with_opt(&source_db, package(&source_db), OPT)
+        .expect("source program");
+    let source_units = emit_units(&source_db, package(&source_db), OPT).expect("source units");
 
     let blob_db = blob_db(ARTIFACT_USER, artifacts.blob.clone());
     assert_no_diagnostic_errors(&blob_db);
-    let blob_program =
-        generate_project_bytecode_with_mounted_units(&blob_db, &options(), OPT, &artifacts.units)
-            .expect("blob program");
+    // The blob side decomposes with ITS OWN db's coordinates (the
+    // same-frame artifacts API), never against the source db: decompose
+    // consumes the generating emit's declaration-keyed placements, and a
+    // foreign db has none for this program. (The pre-coordinates version
+    // of this oracle exploited the old Pass-1 replay to decompose a
+    // foreign program — that road no longer exists, on purpose.)
+    let (blob_program, blob_units) =
+        baml_compiler2_emit::generate_project_bytecode_with_mounted_units_artifacts(
+            &blob_db,
+            package(&blob_db),
+            OPT,
+            &artifacts.units,
+        )
+        .expect("blob program");
 
     let source_program_bytes = borsh::to_vec(&source_program).expect("serialize source program");
     let blob_program_bytes = borsh::to_vec(&blob_program).expect("serialize blob program");
-
-    // The blob database intentionally has no app source with which to attribute
-    // flat objects during decomposition. Use the source manifest only as the
-    // inverse-link attribution oracle; the bytes being decomposed are the blob
-    // path's independently linked program.
-    let blob_units = decompose_units(&source_db, &options(), &blob_program)
-        .expect("decompose blob image with source manifest");
     let source_user = unit(&source_units, "main.baml");
     let blob_user = unit(&blob_units, "main.baml");
     assert_ne!(
@@ -610,7 +624,7 @@ fn mounted_unit_api_preserves_dependency_link_errors() {
     duplicate_units.push(unit(&artifacts.units, "<builtin>/app/lib.baml").clone());
     let db = blob_db("function main() -> int { 0 }", artifacts.blob);
     let error =
-        generate_project_bytecode_with_mounted_units(&db, &options(), OPT, &duplicate_units)
+        generate_project_bytecode_with_mounted_units(&db, package(&db), OPT, &duplicate_units)
             .expect_err("duplicate dependency export must fail before consumer emit");
     assert!(matches!(
         error,

@@ -104,14 +104,51 @@ function optional_chain_type_args.$init_test_ns_optional_chain_type_args_optiona
     return
 }
 
+function optional_chain_type_args.<(user.optional_chain_type_args.Cat as user.optional_chain_type_args.Speaker)>.speak(self: optional_chain_type_args.Cat) -> string {
+    load_const "cat:"
+    load_type #0
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
+    bin_op +
+    return
+}
+
+function optional_chain_type_args.<(user.optional_chain_type_args.Dog as user.optional_chain_type_args.Speaker)>.speak(self: optional_chain_type_args.Dog) -> string {
+    load_type #0
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
+    return
+}
+
+function optional_chain_type_args.<(user.optional_chain_type_args.Pair<#0> as user.optional_chain_type_args.Tagged)>.tag(self: optional_chain_type_args.Pair<#0>) -> string {
+    load_type #0
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
+    load_type #1
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
+    store_var _5
+    load_const "/"
+    bin_op +
+    load_var _5
+    bin_op +
+    return
+}
+
 function optional_chain_type_args.Boxed.both(self: optional_chain_type_args.Boxed<#0>) -> string {
     load_type #0
-    call baml.TypeValue.baml.ToString.to_string
-    store_var _3
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     load_type #1
-    call baml.TypeValue.baml.ToString.to_string
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     store_var _5
-    load_var _3
     load_const "/"
     bin_op +
     load_var _5
@@ -121,40 +158,26 @@ function optional_chain_type_args.Boxed.both(self: optional_chain_type_args.Boxe
 
 function optional_chain_type_args.Boxed.describe(self: optional_chain_type_args.Boxed<#0>) -> string {
     load_type #0
-    call baml.TypeValue.baml.ToString.to_string
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     return
 }
 
 function optional_chain_type_args.Callables.method(self: optional_chain_type_args.Callables, v: int) -> string {
+    load_const "method:"
     load_type int
     load_var v
     call baml.String.from
-    store_var _3
-    load_const "method:"
-    load_var _3
     bin_op +
-    return
-}
-
-function optional_chain_type_args.Cat.Speaker.speak(self: optional_chain_type_args.Cat) -> string {
-    load_type #0
-    call baml.TypeValue.baml.ToString.to_string
-    store_var _2
-    load_const "cat:"
-    load_var _2
-    bin_op +
-    return
-}
-
-function optional_chain_type_args.Dog.Speaker.speak(self: optional_chain_type_args.Dog) -> string {
-    load_type #0
-    call baml.TypeValue.baml.ToString.to_string
     return
 }
 
 function optional_chain_type_args.Holder.ident(self: optional_chain_type_args.Holder, v: #0) -> string {
     load_type #0
-    call baml.TypeValue.baml.ToString.to_string
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     return
 }
 
@@ -178,22 +201,9 @@ function optional_chain_type_args.Holder.plain(self: optional_chain_type_args.Ho
 
 function optional_chain_type_args.Holder.value(self: optional_chain_type_args.Holder) -> string {
     load_type #0
-    call baml.TypeValue.baml.ToString.to_string
-    return
-}
-
-function optional_chain_type_args.Pair.Tagged.tag(self: optional_chain_type_args.Pair<#0>) -> string {
-    load_type #0
-    call baml.TypeValue.baml.ToString.to_string
-    store_var _3
-    load_type #1
-    call baml.TypeValue.baml.ToString.to_string
-    store_var _5
-    load_var _3
-    load_const "/"
-    bin_op +
-    load_var _5
-    bin_op +
+    load_type baml.ToString
+    load_const "to_string"
+    virtual_call nargs=1 ntypeargs=0
     return
 }
 
@@ -201,48 +211,39 @@ function optional_chain_type_args.animal(which: int) -> optional_chain_type_args
     load_var which
     load_const 0
     cmp_int_op ==
-    pop_jump_if_false L0
-    jump L3
-
-  L0:
+    pop_jump_if_true L1
     load_var which
     load_const 1
     cmp_int_op ==
-    pop_jump_if_false L1
+    pop_jump_if_true L0
+    load_const null
+    jump L2
+
+  L0:
+    load_const "tom"
+    init_instance user.optional_chain_type_args.Cat .name
     jump L2
 
   L1:
-    load_const null
-    jump L4
-
-  L2:
-    load_const "tom"
-    init_instance user.optional_chain_type_args.Cat .name
-    jump L4
-
-  L3:
     load_const "rex"
     init_instance user.optional_chain_type_args.Dog .name
 
-  L4:
+  L2:
     return
 }
 
 function optional_chain_type_args.boxed(present: bool) -> optional_chain_type_args.Boxed<int> | null {
     load_var present
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const null
     jump L1
 
   L0:
-    load_const null
-    jump L2
-
-  L1:
     load_const 1
     load_type int
     init_instance<1> user.optional_chain_type_args.Boxed .v
 
-  L2:
+  L1:
     return
 }
 
@@ -253,10 +254,7 @@ function optional_chain_type_args.callable_field_eval_count_fn() -> string {
     call user.optional_chain_type_args.counted
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_var c
     call user.optional_chain_type_args.counted
     store_var _7
@@ -264,36 +262,35 @@ function optional_chain_type_args.callable_field_eval_count_fn() -> string {
     load_var _7
     load_field .0
     call_indirect
-    store_var out
-    jump L2
+    jump L1
+
+  L0:
+    load_const null
 
   L1:
-    load_const null
-    store_var out
+    jump_if_not_null_or_pop L2
+    jump L3
 
   L2:
-    load_var out
-    store_var_load_var _12
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L3
+    store_var _12
+    jump L4
+
+  L3:
     load_const "null"
     store_var _12
 
-  L3:
+  L4:
     load_type string
     load_var _12
     call baml.String.from
-    store_var _10
     load_type int
     load_var c
     load_field .n
     call baml.String.from
-    store_var _16
-    load_var _10
+    store_var _15
     load_const "/"
     bin_op +
-    load_var _16
+    load_var _15
     bin_op +
     return
 }
@@ -305,10 +302,7 @@ function optional_chain_type_args.callable_field_null_after_two_fn() -> string {
     call user.optional_chain_type_args.counted_null_after_two
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_var c
     call user.optional_chain_type_args.counted_null_after_two
     store_var _7
@@ -316,36 +310,35 @@ function optional_chain_type_args.callable_field_null_after_two_fn() -> string {
     load_var _7
     load_field .0
     call_indirect
-    store_var out
-    jump L2
+    jump L1
+
+  L0:
+    load_const null
 
   L1:
-    load_const null
-    store_var out
+    jump_if_not_null_or_pop L2
+    jump L3
 
   L2:
-    load_var out
-    store_var_load_var _12
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L3
+    store_var _12
+    jump L4
+
+  L3:
     load_const "null"
     store_var _12
 
-  L3:
+  L4:
     load_type string
     load_var _12
     call baml.String.from
-    store_var _10
     load_type int
     load_var c
     load_field .n
     call baml.String.from
-    store_var _16
-    load_var _10
+    store_var _15
     load_const "/"
     bin_op +
-    load_var _16
+    load_var _15
     bin_op +
     return
 }
@@ -355,27 +348,18 @@ function optional_chain_type_args.chained_fn() -> string | null {
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L3
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     call user.optional_chain_type_args.Holder.inner
     load_const null
     cmp_op ==
-    pop_jump_if_false L1
-    jump L3
-
-  L1:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L2
-    jump L3
-
-  L2:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     call user.optional_chain_type_args.Holder.inner
@@ -383,12 +367,12 @@ function optional_chain_type_args.chained_fn() -> string | null {
     load_type int
     load_var _6
     call user.optional_chain_type_args.Holder.value
-    jump L4
+    jump L1
 
-  L3:
+  L0:
     load_const null
 
-  L4:
+  L1:
     return
 }
 
@@ -397,27 +381,18 @@ function optional_chain_type_args.chained_null_fn() -> string | null {
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L3
-
-  L0:
+    pop_jump_if_true L0
     load_const false
     call user.optional_chain_type_args.holder
     call user.optional_chain_type_args.Holder.inner
     load_const null
     cmp_op ==
-    pop_jump_if_false L1
-    jump L3
-
-  L1:
+    pop_jump_if_true L0
     load_const false
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L2
-    jump L3
-
-  L2:
+    pop_jump_if_true L0
     load_const false
     call user.optional_chain_type_args.holder
     call user.optional_chain_type_args.Holder.inner
@@ -425,12 +400,12 @@ function optional_chain_type_args.chained_null_fn() -> string | null {
     load_type int
     load_var _6
     call user.optional_chain_type_args.Holder.value
-    jump L4
+    jump L1
 
-  L3:
+  L0:
     load_const null
 
-  L4:
+  L1:
     return
 }
 
@@ -439,27 +414,18 @@ function optional_chain_type_args.chained_null_second_stage_fn() -> string | nul
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L3
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     call user.optional_chain_type_args.Holder.inner_missing
     load_const null
     cmp_op ==
-    pop_jump_if_false L1
-    jump L3
-
-  L1:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L2
-    jump L3
-
-  L2:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     call user.optional_chain_type_args.Holder.inner_missing
@@ -467,12 +433,12 @@ function optional_chain_type_args.chained_null_second_stage_fn() -> string | nul
     load_type int
     load_var _6
     call user.optional_chain_type_args.Holder.value
-    jump L4
+    jump L1
 
-  L3:
+  L0:
     load_const null
 
-  L4:
+  L1:
     return
 }
 
@@ -481,10 +447,7 @@ function optional_chain_type_args.class_and_method_type_args_fn() -> string | nu
     call user.optional_chain_type_args.boxed
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.boxed
     store_var _3
@@ -492,12 +455,12 @@ function optional_chain_type_args.class_and_method_type_args_fn() -> string | nu
     load_type string
     load_var _3
     call user.optional_chain_type_args.Boxed.both
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const null
 
-  L2:
+  L1:
     return
 }
 
@@ -506,22 +469,19 @@ function optional_chain_type_args.class_type_arg_fn() -> string | null {
     call user.optional_chain_type_args.boxed
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.boxed
     store_var _3
     load_type int
     load_var _3
     call user.optional_chain_type_args.Boxed.describe
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const null
 
-  L2:
+  L1:
     return
 }
 
@@ -530,10 +490,7 @@ function optional_chain_type_args.concrete_receiver_interface_method_fn() -> str
     call user.optional_chain_type_args.dog
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.dog
     store_var _3
@@ -542,15 +499,12 @@ function optional_chain_type_args.concrete_receiver_interface_method_fn() -> str
     load_type optional_chain_type_args.Speaker
     load_const "speak"
     virtual_call nargs=1 ntypeargs=1
-    store_var _0
-    jump L2
+    jump L1
+
+  L0:
+    load_const null
 
   L1:
-    load_const null
-    store_var _0
-
-  L2:
-    load_var _0
     return
 }
 
@@ -575,35 +529,29 @@ function optional_chain_type_args.counted_null_after_two(c: optional_chain_type_
     load_field .n
     load_const 2
     cmp_int_op <=
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const null
     jump L1
 
   L0:
-    load_const null
-    jump L2
-
-  L1:
     make_closure .<lambda(counted_null_after_two, 0)>, 0
     init_instance user.optional_chain_type_args.Callables .describe
 
-  L2:
+  L1:
     return
 }
 
 function optional_chain_type_args.dog(present: bool) -> optional_chain_type_args.Dog | null {
     load_var present
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const null
     jump L1
 
   L0:
-    load_const null
-    jump L2
-
-  L1:
     load_const "rex"
     init_instance user.optional_chain_type_args.Dog .name
 
-  L2:
+  L1:
     return
 }
 
@@ -612,22 +560,19 @@ function optional_chain_type_args.explicit_type_arg_fn() -> string | null {
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     store_var _3
     load_type int
     load_var _3
     call user.optional_chain_type_args.Holder.value
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const null
 
-  L2:
+  L1:
     return
 }
 
@@ -637,19 +582,16 @@ function optional_chain_type_args.explicit_type_arg_let_else_fn() -> string {
     store_var _2
     load_var _2
     narrow_bind optional_chain_type_args.Holder, slot=1
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const "none"
     jump L1
 
   L0:
-    load_const "none"
-    jump L2
-
-  L1:
     load_type int
     load_var _2
     call user.optional_chain_type_args.Holder.value
 
-  L2:
+  L1:
     return
 }
 
@@ -658,39 +600,33 @@ function optional_chain_type_args.explicit_type_arg_null_receiver_fn() -> string
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const false
     call user.optional_chain_type_args.holder
     store_var _3
     load_type int
     load_var _3
     call user.optional_chain_type_args.Holder.value
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const null
 
-  L2:
+  L1:
     return
 }
 
 function optional_chain_type_args.holder(present: bool) -> optional_chain_type_args.Holder | null {
     load_var present
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const null
     jump L1
 
   L0:
-    load_const null
-    jump L2
-
-  L1:
     load_const "seven"
     init_instance user.optional_chain_type_args.Holder .raw
 
-  L2:
+  L1:
     return
 }
 
@@ -699,10 +635,7 @@ function optional_chain_type_args.inferred_type_arg_fn() -> string | null {
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     store_var _3
@@ -710,12 +643,12 @@ function optional_chain_type_args.inferred_type_arg_fn() -> string | null {
     load_var _3
     load_const "hi"
     call user.optional_chain_type_args.Holder.ident
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const null
 
-  L2:
+  L1:
     return
 }
 
@@ -724,10 +657,7 @@ function optional_chain_type_args.interface_receiver_fn() -> string | null {
     call user.optional_chain_type_args.speaker
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.speaker
     store_var _3
@@ -736,15 +666,12 @@ function optional_chain_type_args.interface_receiver_fn() -> string | null {
     load_type optional_chain_type_args.Speaker
     load_const "speak"
     virtual_call nargs=1 ntypeargs=1
-    store_var _0
-    jump L2
+    jump L1
+
+  L0:
+    load_const null
 
   L1:
-    load_const null
-    store_var _0
-
-  L2:
-    load_var _0
     return
 }
 
@@ -755,44 +682,40 @@ function optional_chain_type_args.method_eval_count_fn() -> string {
     call user.optional_chain_type_args.counted
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_var c
     call user.optional_chain_type_args.counted
     load_const 1
     call user.optional_chain_type_args.Callables.method
-    store_var out
-    jump L2
+    jump L1
+
+  L0:
+    load_const null
 
   L1:
-    load_const null
-    store_var out
+    jump_if_not_null_or_pop L2
+    jump L3
 
   L2:
-    load_var out
-    store_var_load_var _11
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L3
+    store_var _11
+    jump L4
+
+  L3:
     load_const "null"
     store_var _11
 
-  L3:
+  L4:
     load_type string
     load_var _11
     call baml.String.from
-    store_var _9
     load_type int
     load_var c
     load_field .n
     call baml.String.from
-    store_var _15
-    load_var _9
+    store_var _14
     load_const "/"
     bin_op +
-    load_var _15
+    load_var _14
     bin_op +
     return
 }
@@ -802,19 +725,16 @@ function optional_chain_type_args.non_generic_call_fn() -> string | null {
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const true
     call user.optional_chain_type_args.holder
     call user.optional_chain_type_args.Holder.plain
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const null
 
-  L2:
+  L1:
     return
 }
 
@@ -823,19 +743,16 @@ function optional_chain_type_args.non_generic_call_null_fn() -> string | null {
     call user.optional_chain_type_args.holder
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const false
     call user.optional_chain_type_args.holder
     call user.optional_chain_type_args.Holder.plain
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const null
 
-  L2:
+  L1:
     return
 }
 
@@ -849,6 +766,7 @@ function optional_chain_type_args.optional_chain_tmp_path(name: string) -> strin
     store_var _6
     load_const 0
     load_const 1000000000
+    load_const <omitted>
     call baml.Int.random
     store_var _11
     load_type int
@@ -880,32 +798,26 @@ function optional_chain_type_args.pair(which: int) -> optional_chain_type_args.P
     load_var which
     load_const 0
     cmp_int_op ==
-    pop_jump_if_false L0
-    jump L3
-
-  L0:
+    pop_jump_if_true L1
     load_var which
     load_const 1
     cmp_int_op ==
-    pop_jump_if_false L1
+    pop_jump_if_true L0
+    load_const null
     jump L2
 
-  L1:
-    load_const null
-    jump L4
-
-  L2:
+  L0:
     load_const "a"
     load_type string
     init_instance<1> user.optional_chain_type_args.Pair .v
-    jump L4
+    jump L2
 
-  L3:
+  L1:
     load_const 1
     load_type int
     init_instance<1> user.optional_chain_type_args.Pair .v
 
-  L4:
+  L2:
     return
 }
 
@@ -915,45 +827,37 @@ function optional_chain_type_args.reflected_field_read_fn() -> int | null {
     init_instance user.optional_chain_type_args.Point .x, .label
     store_var _2
     load_var _2
-    narrow_bind baml.AnyClass, slot=1
-    pop_jump_if_false L0
-    jump L1
+    narrow_bind reflect.AnyClass, slot=1
+    pop_jump_if_true L0
+    load_const null
+    jump L2
 
   L0:
-    load_const null
-    jump L4
-
-  L1:
     load_var _2
     store_var value
     load_var value
     load_const "x"
-    load_type baml.AnyClass
+    load_type reflect.AnyClass
     load_const "get_field"
     virtual_call nargs=2 ntypeargs=0
-    store_var _4
-    load_var _4
     load_const null
     cmp_op ==
-    pop_jump_if_false L2
-    jump L3
-
-  L2:
+    pop_jump_if_true L1
     load_var value
     load_const "x"
-    load_type baml.AnyClass
+    load_type reflect.AnyClass
     load_const "get_field"
     virtual_call nargs=2 ntypeargs=0
     store_var _6
     load_type int
     load_var _6
-    call baml.reflect.class.Field.value
-    jump L4
+    call reflect.class.Field.value
+    jump L2
 
-  L3:
+  L1:
     load_const null
 
-  L4:
+  L2:
     return
 }
 
@@ -963,71 +867,50 @@ function optional_chain_type_args.reflected_field_wrong_type_arg_fn() -> string 
     init_instance user.optional_chain_type_args.Point .x, .label
     store_var _2
     load_var _2
-    narrow_bind baml.AnyClass, slot=1
-    pop_jump_if_false L0
-    jump L1
+    narrow_bind reflect.AnyClass, slot=1
+    pop_jump_if_true L0
+    load_const "no-class"
+    jump L4
 
   L0:
-    load_const "no-class"
-    jump L8
-
-  L1:
     load_var _2
     store_var value
     load_var value
     load_const "x"
-    load_type baml.AnyClass
+    load_type reflect.AnyClass
     load_const "get_field"
     virtual_call nargs=2 ntypeargs=0
-    store_var _6
-    load_var _6
     load_const null
     cmp_op ==
-    pop_jump_if_false L2
-    jump L5
-
-  L2:
+    pop_jump_if_true L2
     load_var value
     load_const "x"
-    load_type baml.AnyClass
+    load_type reflect.AnyClass
     load_const "get_field"
     virtual_call nargs=2 ntypeargs=0
     store_var _8
     load_type string
     load_var _8
-    call baml.reflect.class.Field.value
-    store_var read
-    jump L6
+    call reflect.class.Field.value
+    jump L3
     load_var e
-    is_type baml.errors.TypeMismatch
-    pop_jump_if_false L3
-    jump L4
-
-  L3:
+    is_type reflect.errors.TypeMismatch
+    pop_jump_if_true L1
     load_var e
     rethrow
 
-  L4:
+  L1:
     load_const "type-mismatch"
-    jump L8
+    jump L4
 
-  L5:
+  L2:
     load_const null
-    store_var read
 
-  L6:
-    load_var read
-    store_var_load_var _12
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L7
+  L3:
+    jump_if_not_null_or_pop L4
     load_const "null"
-    store_var _12
 
-  L7:
-    load_var _12
-
-  L8:
+  L4:
     return
 }
 
@@ -1037,62 +920,51 @@ function optional_chain_type_args.reflected_missing_field_fn() -> int | null {
     init_instance user.optional_chain_type_args.Point .x, .label
     store_var _2
     load_var _2
-    narrow_bind baml.AnyClass, slot=1
-    pop_jump_if_false L0
-    jump L1
+    narrow_bind reflect.AnyClass, slot=1
+    pop_jump_if_true L0
+    load_const null
+    jump L2
 
   L0:
-    load_const null
-    jump L4
-
-  L1:
     load_var _2
     store_var value
     load_var value
     load_const "absent"
-    load_type baml.AnyClass
+    load_type reflect.AnyClass
     load_const "get_field"
     virtual_call nargs=2 ntypeargs=0
-    store_var _4
-    load_var _4
     load_const null
     cmp_op ==
-    pop_jump_if_false L2
-    jump L3
-
-  L2:
+    pop_jump_if_true L1
     load_var value
     load_const "absent"
-    load_type baml.AnyClass
+    load_type reflect.AnyClass
     load_const "get_field"
     virtual_call nargs=2 ntypeargs=0
     store_var _6
     load_type int
     load_var _6
-    call baml.reflect.class.Field.value
-    jump L4
+    call reflect.class.Field.value
+    jump L2
 
-  L3:
+  L1:
     load_const null
 
-  L4:
+  L2:
     return
 }
 
 function optional_chain_type_args.speaker(present: bool) -> optional_chain_type_args.Speaker | null {
     load_var present
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const null
     jump L1
 
   L0:
-    load_const null
-    jump L2
-
-  L1:
     load_const "rex"
     init_instance user.optional_chain_type_args.Dog .name
 
-  L2:
+  L1:
     return
 }
 
@@ -1108,34 +980,28 @@ function optional_chain_type_args.sys_op_optional_receiver_fn() -> string {
     call user.optional_chain_type_args.optional_file
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_var path
+    call user.optional_chain_type_args.optional_file
+    load_type baml.io.Read
+    load_const "text"
+    virtual_call nargs=1 ntypeargs=0
+    store_var text
     jump L1
 
   L0:
-    load_var path
-    call user.optional_chain_type_args.optional_file
-    sys_op baml.fs.File.text
-    store_var text
-    jump L2
-
-  L1:
     load_const null
     store_var text
 
-  L2:
+  L1:
     load_var path
     sys_op baml.fs.remove
     pop 1
     load_var text
-    store_var_load_var _12
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L3
+    jump_if_not_null_or_pop L2
     load_const "null"
-    store_var _12
 
-  L3:
-    load_var _12
+  L2:
     return
 }
 
@@ -1150,7 +1016,9 @@ function optional_chain_type_args.sys_op_plain_receiver_fn() -> string {
     load_var path
     load_const "r"
     sys_op baml.fs.open
-    sys_op baml.fs.File.text
+    load_type baml.io.Read
+    load_const "text"
+    virtual_call nargs=1 ntypeargs=0
     store_var text
     load_var path
     sys_op baml.fs.remove
@@ -1164,10 +1032,7 @@ function optional_chain_type_args.union_class_type_args_fn(which: int) -> string
     call user.optional_chain_type_args.pair
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_var which
     call user.optional_chain_type_args.pair
     store_var _4
@@ -1176,15 +1041,12 @@ function optional_chain_type_args.union_class_type_args_fn(which: int) -> string
     load_type optional_chain_type_args.Tagged
     load_const "tag"
     virtual_call nargs=1 ntypeargs=1
-    store_var _0
-    jump L2
+    jump L1
+
+  L0:
+    load_const null
 
   L1:
-    load_const null
-    store_var _0
-
-  L2:
-    load_var _0
     return
 }
 
@@ -1193,10 +1055,7 @@ function optional_chain_type_args.union_receiver_fn(which: int) -> string | null
     call user.optional_chain_type_args.animal
     load_const null
     cmp_op ==
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_var which
     call user.optional_chain_type_args.animal
     store_var _4
@@ -1205,14 +1064,11 @@ function optional_chain_type_args.union_receiver_fn(which: int) -> string | null
     load_type optional_chain_type_args.Speaker
     load_const "speak"
     virtual_call nargs=1 ntypeargs=1
-    store_var _0
-    jump L2
+    jump L1
+
+  L0:
+    load_const null
 
   L1:
-    load_const null
-    store_var _0
-
-  L2:
-    load_var _0
     return
 }

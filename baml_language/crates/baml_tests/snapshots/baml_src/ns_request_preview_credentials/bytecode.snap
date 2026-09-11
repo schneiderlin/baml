@@ -41,7 +41,7 @@ function request_preview_credentials.$init_test_ns_request_preview_credentials_r
     return
 }
 
-function request_preview_credentials.PreviewShape(client: ai.Client | null) -> string {
+function request_preview_credentials.PreviewShape(client: ai.Client | null, on_event: ((ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced) -> void throws unknown) | null) -> string {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -50,27 +50,34 @@ function request_preview_credentials.PreviewShape(client: ai.Client | null) -> s
     store_var client
 
   L0:
-    load_type string
+    load_var on_event
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L1
+    load_const null
+    store_var on_event
+
+  L1:
+    load_type unknown
     load_const <omitted>
     load_const <omitted>
     load_var client
     load_const <omitted>
-    load_const <omitted>
+    load_var on_event
     call ai.Agent.new
-    store_var _4
-    call user.request_preview_credentials.PreviewShape$spec
     store_var _6
+    call user.request_preview_credentials.PreviewShape@spec
+    store_var _8
+    load_type string
     load_var2 3 4
-    load_type ai.Runner<string, Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | baml.panics.Cancelled | baml.reflect.errors.CompilationError | ai.errors.Failure, Output = ai.RunResult<string>>
+    load_type ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure>
     load_const "run"
-    virtual_call nargs=2 ntypeargs=0
-    store_var _3
-    load_var _3
+    virtual_call nargs=2 ntypeargs=1
     load_field .value
     return
 }
 
-function request_preview_credentials.PreviewShape$build_request(client: ai.Client | null) -> baml.http.Request {
+function request_preview_credentials.PreviewShape@build_request(client: ai.Client | null) -> baml.http.Request {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -79,7 +86,7 @@ function request_preview_credentials.PreviewShape$build_request(client: ai.Clien
     store_var client
 
   L0:
-    call user.request_preview_credentials.PreviewShape$spec
+    call user.request_preview_credentials.PreviewShape@spec
     store_var _3
     load_type string
     load_var2 2 1
@@ -87,31 +94,29 @@ function request_preview_credentials.PreviewShape$build_request(client: ai.Clien
     return
 }
 
-function request_preview_credentials.PreviewShape$parse(json: string) -> string {
+function request_preview_credentials.PreviewShape@parse(json: string) -> string {
     load_type string
     load_var json
     call baml.sap.parse
     return
 }
 
-function request_preview_credentials.PreviewShape$render_prompt() -> ai.Prompt {
-    call user.request_preview_credentials.PreviewShape$spec
+function request_preview_credentials.PreviewShape@render_prompt() -> ai.Prompt {
+    call user.request_preview_credentials.PreviewShape@spec
     store_var _1
     load_type string
-    call ai.wire.render_output_format
-    store_var _2
-    load_type string
-    load_var2 1 2
+    load_var _1
     call ai.FunctionSpec.prompt
     return
 }
 
-function request_preview_credentials.PreviewShape$spec() -> ai.FunctionSpec<string> {
+function request_preview_credentials.PreviewShape@spec() -> ai.FunctionSpec<string> {
     load_type ai.tools.Tool
     alloc_array 0
     call ai.tools.Toolbox.new
     store_var _3
     load_const "gpt-4o-mini"
+    load_const <omitted>
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
@@ -133,14 +138,14 @@ function request_preview_credentials.PreviewShape$spec() -> ai.FunctionSpec<stri
     load_type string
     load_type unknown
     alloc_map 0
-    make_closure .<lambda(PreviewShape$spec, 0)>, 0
+    make_closure .<lambda(PreviewShape@spec, 0)>, 0
     load_var2 1 2
     load_type string
     init_instance<1> ai.FunctionSpec .spec_name, .args, .prompt_template, .toolbox, .default_client
     return
 }
 
-function request_preview_credentials.PreviewShape$stream(client: ai.stream.StreamingClient | null) -> ai.stream.Stream<string | null, string> {
+function request_preview_credentials.PreviewShape@stream(client: ai.stream.StreamingClient | null, on_event: ((ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced) -> void throws unknown) | null) -> ai.stream.Stream<string | null, string> {
     load_var client
     load_const <omitted>
     cmp_op ==
@@ -149,11 +154,20 @@ function request_preview_credentials.PreviewShape$stream(client: ai.stream.Strea
     store_var client
 
   L0:
-    call user.request_preview_credentials.PreviewShape$spec
-    store_var _3
+    load_var on_event
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L1
+    load_const null
+    store_var on_event
+
+  L1:
+    call user.request_preview_credentials.PreviewShape@spec
+    store_var _5
     load_type string | null
     load_type string
-    load_var2 2 1
+    load_var2 3 1
+    load_var on_event
     call ai.stream.from_spec
     return
 }
@@ -177,7 +191,7 @@ function request_preview_credentials._google_timeout_source() -> string {
 }
 
 function request_preview_credentials._preview_input() -> ai.ModelTurnInput {
-    call user.request_preview_credentials.PreviewShape$spec
+    call user.request_preview_credentials.PreviewShape@spec
     store_var spec
     load_var spec
     load_field .prompt_template

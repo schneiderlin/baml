@@ -32,57 +32,64 @@ function streaming_composite_clients.$init_test_ns_streaming_composite_clients_s
     pop 1
     load_var registry
     load_const "root.streaming_composite_clients"
-    load_const "fallback_stream_advances_before_first_delta_in_order"
+    load_const "retry_stream_does_not_retry_after_reasoning"
     make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 4)>, 0
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
     load_var registry
     load_const "root.streaming_composite_clients"
-    load_const "fallback_stream_does_not_advance_after_delta"
+    load_const "fallback_stream_advances_before_first_delta_in_order"
     make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 5)>, 0
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
     load_var registry
     load_const "root.streaming_composite_clients"
-    load_const "round_robin_stream_rotates_once_per_stream"
+    load_const "fallback_stream_does_not_advance_after_delta"
     make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 6)>, 0
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
     load_var registry
     load_const "root.streaming_composite_clients"
-    load_const "streaming_composites_enforce_member_capability"
+    load_const "round_robin_stream_rotates_once_per_stream"
     make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 7)>, 0
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
     load_var registry
     load_const "root.streaming_composite_clients"
-    load_const "streaming_composites_nest_as_capabilities"
+    load_const "streaming_composites_enforce_member_capability"
     make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 8)>, 0
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
     load_var registry
     load_const "root.streaming_composite_clients"
-    load_const "streaming_composites_propagate_cancellation"
+    load_const "streaming_composites_nest_as_capabilities"
     make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 9)>, 0
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
     load_var registry
     load_const "root.streaming_composite_clients"
-    load_const "streaming_composites_do_not_retry_unsafe_failure"
+    load_const "streaming_composites_propagate_cancellation"
     make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 10)>, 0
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
     load_var registry
     load_const "root.streaming_composite_clients"
-    load_const "nonstream_composites_preserve_typed_cancellation"
+    load_const "streaming_composites_do_not_retry_unsafe_failure"
     make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 11)>, 0
+    load_const null
+    call testing.TestCollector.register_test_at
+    pop 1
+    load_var registry
+    load_const "root.streaming_composite_clients"
+    load_const "nonstream_composites_preserve_typed_cancellation"
+    make_closure .<lambda($init_test_ns_streaming_composite_clients_streaming_composite_clients, 12)>, 0
     load_const null
     call testing.TestCollector.register_test_at
     pop 1
@@ -90,124 +97,7 @@ function streaming_composite_clients.$init_test_ns_streaming_composite_clients_s
     return
 }
 
-function streaming_composite_clients.CompositeStreamSpec(client: ai.Client | null) -> string {
-    load_var client
-    load_const <omitted>
-    cmp_op ==
-    pop_jump_if_false L0
-    load_const null
-    store_var client
-
-  L0:
-    load_type string
-    load_const <omitted>
-    load_const <omitted>
-    load_var client
-    load_const <omitted>
-    load_const <omitted>
-    call ai.Agent.new
-    store_var _4
-    call user.streaming_composite_clients.CompositeStreamSpec$spec
-    store_var _6
-    load_var2 3 4
-    load_type ai.Runner<string, Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | baml.panics.Cancelled | baml.reflect.errors.CompilationError | ai.errors.Failure, Output = ai.RunResult<string>>
-    load_const "run"
-    virtual_call nargs=2 ntypeargs=0
-    store_var _3
-    load_var _3
-    load_field .value
-    return
-}
-
-function streaming_composite_clients.CompositeStreamSpec$build_request(client: ai.Client | null) -> baml.http.Request {
-    load_var client
-    load_const <omitted>
-    cmp_op ==
-    pop_jump_if_false L0
-    load_const null
-    store_var client
-
-  L0:
-    call user.streaming_composite_clients.CompositeStreamSpec$spec
-    store_var _3
-    load_type string
-    load_var2 2 1
-    call ai.FunctionSpec.build_request
-    return
-}
-
-function streaming_composite_clients.CompositeStreamSpec$parse(json: string) -> string {
-    load_type string
-    load_var json
-    call baml.sap.parse
-    return
-}
-
-function streaming_composite_clients.CompositeStreamSpec$render_prompt() -> ai.Prompt {
-    call user.streaming_composite_clients.CompositeStreamSpec$spec
-    store_var _1
-    load_type string
-    call ai.wire.render_output_format
-    store_var _2
-    load_type string
-    load_var2 1 2
-    call ai.FunctionSpec.prompt
-    return
-}
-
-function streaming_composite_clients.CompositeStreamSpec$spec() -> ai.FunctionSpec<string> {
-    load_type ai.tools.Tool
-    alloc_array 0
-    call ai.tools.Toolbox.new
-    store_var _3
-    load_const "gpt-4o-mini"
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    load_const <omitted>
-    call openai.ResponsesClient.new
-    store_var _5
-    load_const "CompositeStreamSpec"
-    load_type string
-    load_type unknown
-    alloc_map 0
-    make_closure .<lambda(CompositeStreamSpec$spec, 0)>, 0
-    load_var2 1 2
-    load_type string
-    init_instance<1> ai.FunctionSpec .spec_name, .args, .prompt_template, .toolbox, .default_client
-    return
-}
-
-function streaming_composite_clients.CompositeStreamSpec$stream(client: ai.stream.StreamingClient | null) -> ai.stream.Stream<string | null, string> {
-    load_var client
-    load_const <omitted>
-    cmp_op ==
-    pop_jump_if_false L0
-    load_const null
-    store_var client
-
-  L0:
-    call user.streaming_composite_clients.CompositeStreamSpec$spec
-    store_var _3
-    load_type string | null
-    load_type string
-    load_var2 2 1
-    call ai.stream.from_spec
-    return
-}
-
-function streaming_composite_clients.NonStreamingClient.ai.Client.id(self: streaming_composite_clients.NonStreamingClient) -> string {
+function streaming_composite_clients.<(user.streaming_composite_clients.NonStreamingClient as ai.Client)>.id(self: streaming_composite_clients.NonStreamingClient) -> string {
     load_var self
     load_field .probe
     load_field .events
@@ -229,19 +119,21 @@ function streaming_composite_clients.NonStreamingClient.ai.Client.id(self: strea
     return
 }
 
-function streaming_composite_clients.NonStreamingClient.ai.Client.invoke(self: streaming_composite_clients.NonStreamingClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
+function streaming_composite_clients.<(user.streaming_composite_clients.NonStreamingClient as ai.Client)>.invoke(self: streaming_composite_clients.NonStreamingClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
     load_const "not streamed"
     init_instance ai.content.Text .text
-    load_type ai.content.Text | ai.content.Reasoning | ai.content.ToolUse | ai.content.Media
+    load_type ai.content.Text | ai.content.Media | ai.content.Reasoning | ai.content.ToolUse
     alloc_array 1
     load_const ai.content.StopReason.Complete
     alloc_variant ai.content.StopReason
     load_const null
-    init_instance ai.ModelTurn .content, .stop_reason, .usage
+    load_type ai.events.LLMCall
+    alloc_array 0
+    init_instance ai.ModelTurn .content, .stop_reason, .usage, .calls
     return
 }
 
-function streaming_composite_clients.NonStreamingClient.ai.Client.render(self: streaming_composite_clients.NonStreamingClient, input: ai.ModelTurnInput) -> baml.http.Request {
+function streaming_composite_clients.<(user.streaming_composite_clients.NonStreamingClient as ai.Client)>.render(self: streaming_composite_clients.NonStreamingClient, input: ai.ModelTurnInput) -> baml.http.Request {
     load_type string
     load_var self
     load_field .client_id
@@ -259,31 +151,33 @@ function streaming_composite_clients.NonStreamingClient.ai.Client.render(self: s
     return
 }
 
-function streaming_composite_clients.ScriptedStreamClient.ai.Client.id(self: streaming_composite_clients.ScriptedStreamClient) -> string {
+function streaming_composite_clients.<(user.streaming_composite_clients.ScriptedStreamClient as ai.Client)>.id(self: streaming_composite_clients.ScriptedStreamClient) -> string {
     load_var self
     load_field .client_id
     return
 }
 
-function streaming_composite_clients.ScriptedStreamClient.ai.Client.invoke(self: streaming_composite_clients.ScriptedStreamClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
+function streaming_composite_clients.<(user.streaming_composite_clients.ScriptedStreamClient as ai.Client)>.invoke(self: streaming_composite_clients.ScriptedStreamClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
     load_type string
     load_var self
     load_field .chunks
     load_const ""
     call baml.Array.join
-    store_var _5
-    load_var _5
+    store_var _6
+    load_var _6
     init_instance ai.content.Text .text
-    load_type ai.content.Text | ai.content.Reasoning | ai.content.ToolUse | ai.content.Media
+    load_type ai.content.Text | ai.content.Media | ai.content.Reasoning | ai.content.ToolUse
     alloc_array 1
     load_const ai.content.StopReason.Complete
     alloc_variant ai.content.StopReason
     load_const null
-    init_instance ai.ModelTurn .content, .stop_reason, .usage
+    load_type ai.events.LLMCall
+    alloc_array 0
+    init_instance ai.ModelTurn .content, .stop_reason, .usage, .calls
     return
 }
 
-function streaming_composite_clients.ScriptedStreamClient.ai.Client.render(self: streaming_composite_clients.ScriptedStreamClient, input: ai.ModelTurnInput) -> baml.http.Request {
+function streaming_composite_clients.<(user.streaming_composite_clients.ScriptedStreamClient as ai.Client)>.render(self: streaming_composite_clients.ScriptedStreamClient, input: ai.ModelTurnInput) -> baml.http.Request {
     load_type string
     load_var self
     load_field .client_id
@@ -301,7 +195,7 @@ function streaming_composite_clients.ScriptedStreamClient.ai.Client.render(self:
     return
 }
 
-function streaming_composite_clients.ScriptedStreamClient.ai.stream.StreamingClient.invoke_stream(self: streaming_composite_clients.ScriptedStreamClient, input: ai.ModelTurnInput) -> ai.stream.TurnStream {
+function streaming_composite_clients.<(user.streaming_composite_clients.ScriptedStreamClient as ai.stream.StreamingClient)>.invoke_stream(self: streaming_composite_clients.ScriptedStreamClient, input: ai.ModelTurnInput) -> ai.stream.TurnStream {
     load_var ?3
     make_cell
     store_var ?3
@@ -323,6 +217,15 @@ function streaming_composite_clients.ScriptedStreamClient.ai.stream.StreamingCli
     load_var ?12
     make_cell
     store_var ?12
+    load_var ?13
+    make_cell
+    store_var ?13
+    load_var ?14
+    make_cell
+    store_var ?14
+    load_var ?15
+    make_cell
+    store_var ?15
     load_var self
     copy 0
     load_field .attempts
@@ -360,10 +263,7 @@ function streaming_composite_clients.ScriptedStreamClient.ai.stream.StreamingCli
     load_var self
     load_field .fail_open_attempts
     cmp_int_op <=
-    pop_jump_if_false L0
-    jump L11
-
-  L0:
+    pop_jump_if_true L7
     load_deref ?3
     load_var self
     load_field .fail_open_attempts
@@ -371,34 +271,52 @@ function streaming_composite_clients.ScriptedStreamClient.ai.stream.StreamingCli
     load_field .fail_pull_attempts
     add_int
     cmp_int_op <=
-    pop_jump_if_false L1
-    jump L9
-
-  L1:
+    pop_jump_if_true L5
     load_var self
     load_field .cancel_before_delta
-    pop_jump_if_false L2
-    jump L8
-
-  L2:
+    pop_jump_if_true L4
     load_var self
     load_field .unsafe_before_delta
-    pop_jump_if_false L3
-    jump L7
-
-  L3:
+    pop_jump_if_true L3
+    load_var self
+    load_field .reasoning_before_failure
+    pop_jump_if_true L2
     load_var self
     load_field .fail_after_delta
-    pop_jump_if_false L4
-    jump L5
-
-  L4:
+    pop_jump_if_true L0
     load_var self
     load_field .chunks
     call ai.stream.TurnStream.from_chunks
-    jump L10
+    jump L6
 
-  L5:
+  L0:
+    load_const 0
+    store_deref ?12
+    load_var self
+    load_field .probe
+    store_deref ?13
+    load_var self
+    load_field .client_id
+    store_deref ?14
+    load_type string
+    load_var self
+    load_field .chunks
+    load_const 0
+    call baml.Array.at
+    jump_if_not_null_or_pop L1
+    load_const "prefix"
+
+  L1:
+    store_deref ?15
+    load_var2 12 15
+    load_var2 13 14
+    load_var attempt
+    make_closure .<lambda(ScriptedStreamClient.invoke_stream, 4)>, 5
+    load_const <omitted>
+    call ai.stream.TurnStream.from_event_source
+    jump L6
+
+  L2:
     load_const 0
     store_deref ?9
     load_var self
@@ -407,39 +325,26 @@ function streaming_composite_clients.ScriptedStreamClient.ai.stream.StreamingCli
     load_var self
     load_field .client_id
     store_deref ?11
-    load_type string
-    load_var self
-    load_field .chunks
-    load_const 0
-    call baml.Array.at
-    store_var_load_var _38
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L6
-    load_const "prefix"
-    store_var _38
-
-  L6:
-    load_var _38
-    store_deref ?12
-    load_var2 9 12
-    load_var2 10 11
-    load_var attempt
-    make_closure .<lambda(ScriptedStreamClient.invoke_stream, 3)>, 5
+    load_var2 9 10
+    load_var2 11 3
+    make_closure .<lambda(ScriptedStreamClient.invoke_stream, 3)>, 4
+    load_const <omitted>
     call ai.stream.TurnStream.from_event_source
-    jump L10
+    jump L6
 
-  L7:
+  L3:
     make_closure .<lambda(ScriptedStreamClient.invoke_stream, 2)>, 0
+    load_const <omitted>
     call ai.stream.TurnStream.from_event_source
-    jump L10
+    jump L6
 
-  L8:
+  L4:
     make_closure .<lambda(ScriptedStreamClient.invoke_stream, 1)>, 0
+    load_const <omitted>
     call ai.stream.TurnStream.from_event_source
-    jump L10
+    jump L6
 
-  L9:
+  L5:
     load_var self
     load_field .probe
     store_deref ?7
@@ -449,26 +354,28 @@ function streaming_composite_clients.ScriptedStreamClient.ai.stream.StreamingCli
     load_var2 7 8
     load_var attempt
     make_closure .<lambda(ScriptedStreamClient.invoke_stream, 0)>, 3
+    load_const <omitted>
     call ai.stream.TurnStream.from_event_source
 
-  L10:
+  L6:
     return
 
-  L11:
+  L7:
     load_var self
     load_field .client_id
     load_const "failed while opening"
     load_const null
-    init_instance ai.errors.NetworkFailure .provider, .detail, .raw_body
+    load_const null
+    init_instance ai.errors.NetworkFailure .provider, .detail, .status_code, .raw_body
     throw
 }
 
-function streaming_composite_clients.SyntheticInvokeClient.ai.Client.id(self: streaming_composite_clients.SyntheticInvokeClient) -> string {
+function streaming_composite_clients.<(user.streaming_composite_clients.SyntheticInvokeClient as ai.Client)>.id(self: streaming_composite_clients.SyntheticInvokeClient) -> string {
     load_const "synthetic-invoke"
     return
 }
 
-function streaming_composite_clients.SyntheticInvokeClient.ai.Client.invoke(self: streaming_composite_clients.SyntheticInvokeClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
+function streaming_composite_clients.<(user.streaming_composite_clients.SyntheticInvokeClient as ai.Client)>.invoke(self: streaming_composite_clients.SyntheticInvokeClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
     load_var self
     copy 0
     load_field .attempts
@@ -477,23 +384,21 @@ function streaming_composite_clients.SyntheticInvokeClient.ai.Client.invoke(self
     store_field .attempts
     load_var self
     load_field .cancel_immediately
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_const "synthetic-invoke"
     load_const "retryable failure"
     load_const null
-    init_instance ai.errors.NetworkFailure .provider, .detail, .raw_body
+    load_const null
+    init_instance ai.errors.NetworkFailure .provider, .detail, .status_code, .raw_body
     throw
 
-  L1:
+  L0:
     load_const "scripted non-stream cancellation"
     init_instance baml.panics.Cancelled .message
     throw
 }
 
-function streaming_composite_clients.SyntheticInvokeClient.ai.Client.render(self: streaming_composite_clients.SyntheticInvokeClient, input: ai.ModelTurnInput) -> baml.http.Request {
+function streaming_composite_clients.<(user.streaming_composite_clients.SyntheticInvokeClient as ai.Client)>.render(self: streaming_composite_clients.SyntheticInvokeClient, input: ai.ModelTurnInput) -> baml.http.Request {
     load_const "POST"
     load_const "https://example.invalid/synthetic-invoke"
     load_type string
@@ -504,8 +409,139 @@ function streaming_composite_clients.SyntheticInvokeClient.ai.Client.render(self
     return
 }
 
+function streaming_composite_clients.CompositeStreamSpec(client: ai.Client | null, on_event: ((ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced) -> void throws unknown) | null) -> string {
+    load_var client
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L0
+    load_const null
+    store_var client
+
+  L0:
+    load_var on_event
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L1
+    load_const null
+    store_var on_event
+
+  L1:
+    load_type unknown
+    load_const <omitted>
+    load_const <omitted>
+    load_var client
+    load_const <omitted>
+    load_var on_event
+    call ai.Agent.new
+    store_var _6
+    call user.streaming_composite_clients.CompositeStreamSpec@spec
+    store_var _8
+    load_type string
+    load_var2 3 4
+    load_type ai.Runner<Error = baml.errors.InvalidArgument | baml.errors.Timeout | baml.errors.UnknownError | reflect.errors.CompilationError | ai.errors.Failure>
+    load_const "run"
+    virtual_call nargs=2 ntypeargs=1
+    load_field .value
+    return
+}
+
+function streaming_composite_clients.CompositeStreamSpec@build_request(client: ai.Client | null) -> baml.http.Request {
+    load_var client
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L0
+    load_const null
+    store_var client
+
+  L0:
+    call user.streaming_composite_clients.CompositeStreamSpec@spec
+    store_var _3
+    load_type string
+    load_var2 2 1
+    call ai.FunctionSpec.build_request
+    return
+}
+
+function streaming_composite_clients.CompositeStreamSpec@parse(json: string) -> string {
+    load_type string
+    load_var json
+    call baml.sap.parse
+    return
+}
+
+function streaming_composite_clients.CompositeStreamSpec@render_prompt() -> ai.Prompt {
+    call user.streaming_composite_clients.CompositeStreamSpec@spec
+    store_var _1
+    load_type string
+    load_var _1
+    call ai.FunctionSpec.prompt
+    return
+}
+
+function streaming_composite_clients.CompositeStreamSpec@spec() -> ai.FunctionSpec<string> {
+    load_type ai.tools.Tool
+    alloc_array 0
+    call ai.tools.Toolbox.new
+    store_var _3
+    load_const "gpt-4o-mini"
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    call openai.ResponsesClient.new
+    store_var _5
+    load_const "CompositeStreamSpec"
+    load_type string
+    load_type unknown
+    alloc_map 0
+    make_closure .<lambda(CompositeStreamSpec@spec, 0)>, 0
+    load_var2 1 2
+    load_type string
+    init_instance<1> ai.FunctionSpec .spec_name, .args, .prompt_template, .toolbox, .default_client
+    return
+}
+
+function streaming_composite_clients.CompositeStreamSpec@stream(client: ai.stream.StreamingClient | null, on_event: ((ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced) -> void throws unknown) | null) -> ai.stream.Stream<string | null, string> {
+    load_var client
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L0
+    load_const null
+    store_var client
+
+  L0:
+    load_var on_event
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L1
+    load_const null
+    store_var on_event
+
+  L1:
+    call user.streaming_composite_clients.CompositeStreamSpec@spec
+    store_var _5
+    load_type string | null
+    load_type string
+    load_var2 3 1
+    load_var on_event
+    call ai.stream.from_spec
+    return
+}
+
 function streaming_composite_clients.composite_input() -> ai.ModelTurnInput {
-    call user.streaming_composite_clients.CompositeStreamSpec$spec
+    call user.streaming_composite_clients.CompositeStreamSpec@spec
     store_var spec
     load_var spec
     load_field .prompt_template
@@ -519,7 +555,7 @@ function streaming_composite_clients.composite_input() -> ai.ModelTurnInput {
     call ai.FunctionSpec.output_type
     store_var _7
     load_var _2
-    load_type ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.FinalProduced
+    load_type ai.events.RunStarted | ai.events.UserMessage | ai.events.AssistantMessage | ai.events.ToolRequested | ai.events.ToolCompleted | ai.events.ToolFailed | ai.events.Usage | ai.events.LLMCall | ai.events.FinalProduced
     alloc_array 0
     init_instance ai.Journal .log
     load_var2 3 4
@@ -530,23 +566,16 @@ function streaming_composite_clients.composite_input() -> ai.ModelTurnInput {
 function streaming_composite_clients.drain_streaming(client_value: ai.stream.StreamingClient) -> string {
     call user.streaming_composite_clients.composite_input
     store_var _6
-    load_var2 1 4
+    load_var2 1 2
     load_type ai.stream.StreamingClient
     load_const "invoke_stream"
     virtual_call nargs=2 ntypeargs=0
-    store_var _5
-    load_var _5
     call ai.stream.TurnStream.final_turn
     call ai.ModelTurn.terminal_text
-    store_var_load_var _2
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L0
+    jump_if_not_null_or_pop L0
     load_const ""
-    store_var _2
 
   L0:
-    load_var _2
     return
 }
 
@@ -555,91 +584,69 @@ function streaming_composite_clients.failure_name(error: unknown) -> string {
     store_var _2
     load_var _2
     narrow_bind ai.errors.NetworkFailure, slot=2
-    pop_jump_if_false L0
-    jump L7
-
-  L0:
+    pop_jump_if_true L3
     load_var error
     store_var _7
     load_var _7
-    narrow_bind ai.errors.StepBudgetExceeded, slot=4
-    pop_jump_if_false L1
-    jump L6
-
-  L1:
+    narrow_bind ai.errors.StepBudgetExceeded, slot=3
+    pop_jump_if_true L2
     load_var error
     store_var _12
     load_var _12
-    narrow_bind ai.errors.StreamingUnsupported, slot=6
-    pop_jump_if_false L2
-    jump L5
-
-  L2:
+    narrow_bind ai.errors.StreamingUnsupported, slot=4
+    pop_jump_if_true L1
     load_var error
     store_var _17
     load_var _17
-    narrow_bind baml.panics.Cancelled, slot=8
-    pop_jump_if_false L3
-    jump L4
-
-  L3:
+    narrow_bind baml.panics.Cancelled, slot=5
+    pop_jump_if_true L0
     load_type unknown
     load_var error
     call baml.String.from
     store_var _23
+    load_const "other:"
     load_type string
     load_var _23
     call baml.String.from
-    store_var _22
-    load_const "other:"
-    load_var _22
     bin_op +
-    jump L8
+    jump L4
 
-  L4:
+  L0:
+    load_const "Cancelled:"
     load_type string
     load_var _17
     load_field .message
     call baml.String.from
-    store_var _19
-    load_const "Cancelled:"
-    load_var _19
     bin_op +
-    jump L8
+    jump L4
 
-  L5:
+  L1:
+    load_const "StreamingUnsupported:"
     load_type string
     load_var _12
     load_field .client_id
     call baml.String.from
-    store_var _14
-    load_const "StreamingUnsupported:"
-    load_var _14
     bin_op +
-    jump L8
+    jump L4
 
-  L6:
+  L2:
+    load_const "StepBudgetExceeded:"
     load_type int
     load_var _7
     load_field .steps
     call baml.String.from
-    store_var _9
-    load_const "StepBudgetExceeded:"
-    load_var _9
     bin_op +
-    jump L8
+    jump L4
 
-  L7:
+  L3:
+    load_const "NetworkFailure:"
     load_type string
     load_var _2
     load_field .detail
     call baml.String.from
-    store_var _4
-    load_const "NetworkFailure:"
-    load_var _4
     bin_op +
 
-  L8:
+  L4:
     return
 }
 
@@ -658,6 +665,7 @@ function streaming_composite_clients.fallback_stream_advances_before_first_delta
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var first
     load_const "second"
@@ -665,6 +673,7 @@ function streaming_composite_clients.fallback_stream_advances_before_first_delta
     load_type string
     alloc_array 1
     load_var probe
+    load_const <omitted>
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
@@ -681,7 +690,6 @@ function streaming_composite_clients.fallback_stream_advances_before_first_delta
     load_type string
     load_var _15
     call baml.String.from
-    store_var _14
     load_type string
     load_var probe
     load_field .events
@@ -692,7 +700,6 @@ function streaming_composite_clients.fallback_stream_advances_before_first_delta
     load_var _19
     call baml.String.from
     store_var _18
-    load_var _14
     load_const "|"
     bin_op +
     load_var _18
@@ -715,6 +722,7 @@ function streaming_composite_clients.fallback_stream_does_not_advance_after_delt
     load_const true
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var first
     load_const "second"
@@ -722,6 +730,7 @@ function streaming_composite_clients.fallback_stream_does_not_advance_after_delt
     load_type string
     alloc_array 1
     load_var probe
+    load_const <omitted>
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
@@ -744,61 +753,59 @@ function streaming_composite_clients.fallback_stream_does_not_advance_after_delt
     call ai.stream.TurnStream.next
     store_var _17
     load_var _17
-    narrow_bind string, slot=7
-    pop_jump_if_false L0
+    narrow_bind string[], slot=7
+    pop_jump_if_true L0
+    load_const "done"
+    store_var first_delta
     jump L1
 
   L0:
-    load_const "done"
+    load_type string
+    load_var _17
+    load_const ""
+    call baml.Array.join
     store_var first_delta
-    jump L2
 
   L1:
-    load_var _17
-    store_var first_delta
-
-  L2:
     load_var stream
     call ai.stream.TurnStream.next
     store_var outcome
-    jump L3
+    jump L2
     load_var e
     throw_if_panic
     load_var e
     call user.streaming_composite_clients.failure_name
     store_var outcome
 
-  L3:
+  L2:
     load_type string
     load_var first_delta
     call baml.String.from
-    store_var _25
-    load_type string | ai.stream.Done
+    load_type string | ai.stream.Done | string[]
     load_var outcome
     call baml.String.from
-    store_var _29
+    store_var _30
     load_type string
-    load_var _29
+    load_var _30
     call baml.String.from
-    store_var _28
+    store_var _29
     load_type string
     load_var probe
     load_field .events
     load_const ","
     call baml.Array.join
-    store_var _33
+    store_var _34
     load_type string
-    load_var _33
+    load_var _34
     call baml.String.from
-    store_var _32
-    load_var _25
+    store_var _33
     load_const "|"
     bin_op +
-    load_var _28
+    load_var _29
     bin_op +
     load_const "|"
     bin_op +
-    load_var _32
+    load_var _33
     bin_op +
     return
 }
@@ -818,34 +825,28 @@ function streaming_composite_clients.nonstream_composites_preserve_cancellation_
     load_const <omitted>
     load_var _4
     call ai.clients.Retry.new
-    store_var retry
     call user.streaming_composite_clients.composite_input
-    store_var _7
-    load_var2 2 6
     load_type ai.Client
     load_const "invoke"
     virtual_call nargs=2 ntypeargs=0
     store_var retry_outcome
-    jump L2
+    jump L1
     load_var e
     store_var _8
     load_var _8
-    narrow_bind baml.panics.Cancelled, slot=7
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    narrow_bind baml.panics.Cancelled, slot=5
+    pop_jump_if_true L0
     load_var e
     throw_if_panic
     load_const "other"
     store_var retry_outcome
-    jump L2
+    jump L1
 
-  L1:
+  L0:
     load_const "cancelled"
     store_var retry_outcome
 
-  L2:
+  L1:
     load_const 0
     load_const true
     init_instance user.streaming_composite_clients.SyntheticInvokeClient .attempts, .cancel_immediately
@@ -853,34 +854,28 @@ function streaming_composite_clients.nonstream_composites_preserve_cancellation_
     load_type ai.Client
     alloc_array 1
     call ai.clients.RoundRobin.new
-    store_var round_robin
     call user.streaming_composite_clients.composite_input
-    store_var _15
-    load_var2 9 12
     load_type ai.Client
     load_const "invoke"
     virtual_call nargs=2 ntypeargs=0
     store_var round_robin_outcome
-    jump L5
+    jump L3
     load_var e
     store_var _16
     load_var _16
-    narrow_bind baml.panics.Cancelled, slot=13
-    pop_jump_if_false L3
-    jump L4
-
-  L3:
+    narrow_bind baml.panics.Cancelled, slot=9
+    pop_jump_if_true L2
     load_var e
     throw_if_panic
     load_const "other"
     store_var round_robin_outcome
-    jump L5
+    jump L3
 
-  L4:
+  L2:
     load_const "cancelled"
     store_var round_robin_outcome
 
-  L5:
+  L3:
     load_const 0
     load_const true
     init_instance user.streaming_composite_clients.SyntheticInvokeClient .attempts, .cancel_immediately
@@ -891,7 +886,7 @@ function streaming_composite_clients.nonstream_composites_preserve_cancellation_
     store_var fallback_backup
     call user.streaming_composite_clients.composite_input
     store_var _25
-    load_var2 14 15
+    load_var2 10 11
     load_type ai.Client
     alloc_array 2
     init_instance ai.clients.Fallback .members
@@ -900,30 +895,27 @@ function streaming_composite_clients.nonstream_composites_preserve_cancellation_
     load_const "invoke"
     virtual_call nargs=2 ntypeargs=0
     store_var fallback_outcome
-    jump L8
+    jump L5
     load_var e
     store_var _26
     load_var _26
-    narrow_bind baml.panics.Cancelled, slot=19
-    pop_jump_if_false L6
-    jump L7
-
-  L6:
+    narrow_bind baml.panics.Cancelled, slot=15
+    pop_jump_if_true L4
     load_var e
     throw_if_panic
     load_const "other"
     store_var fallback_outcome
-    jump L8
+    jump L5
 
-  L7:
+  L4:
     load_const "cancelled"
     store_var fallback_outcome
 
-  L8:
+  L5:
+    load_const "retry="
     load_type string | ai.ModelTurn
     load_var retry_outcome
     call baml.String.from
-    store_var _39
     load_type int
     load_var retry_inner
     load_field .attempts
@@ -952,8 +944,6 @@ function streaming_composite_clients.nonstream_composites_preserve_cancellation_
     load_field .attempts
     call baml.String.from
     store_var _57
-    load_const "retry="
-    load_var _39
     bin_op +
     load_const ":"
     bin_op +
@@ -997,6 +987,7 @@ function streaming_composite_clients.retry_stream_does_not_retry_after_delta_cas
     load_const true
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var inner
     load_const 0
@@ -1009,10 +1000,7 @@ function streaming_composite_clients.retry_stream_does_not_retry_after_delta_cas
     load_const <omitted>
     load_var _8
     call ai.clients.Retry.new
-    store_var retry
     call user.streaming_composite_clients.composite_input
-    store_var _10
-    load_var2 3 6
     load_type ai.stream.StreamingClient
     load_const "invoke_stream"
     virtual_call nargs=2 ntypeargs=0
@@ -1021,36 +1009,126 @@ function streaming_composite_clients.retry_stream_does_not_retry_after_delta_cas
     call ai.stream.TurnStream.next
     store_var _13
     load_var _13
-    narrow_bind string, slot=8
-    pop_jump_if_false L0
+    narrow_bind string[], slot=6
+    pop_jump_if_true L0
+    load_const "done"
+    store_var first
     jump L1
 
   L0:
-    load_const "done"
+    load_type string
+    load_var _13
+    load_const ""
+    call baml.Array.join
     store_var first
-    jump L2
 
   L1:
-    load_var _13
-    store_var first
-
-  L2:
     load_var stream
     call ai.stream.TurnStream.next
     store_var second
-    jump L3
+    jump L2
     load_var e
     throw_if_panic
     load_var e
     call user.streaming_composite_clients.failure_name
     store_var second
 
-  L3:
+  L2:
     load_type string
     load_var first
     call baml.String.from
-    store_var _21
-    load_type string | ai.stream.Done
+    load_type string | ai.stream.Done | string[]
+    load_var second
+    call baml.String.from
+    store_var _26
+    load_type string
+    load_var _26
+    call baml.String.from
+    store_var _25
+    load_type string
+    load_var probe
+    load_field .events
+    load_const ","
+    call baml.Array.join
+    store_var _30
+    load_type string
+    load_var _30
+    call baml.String.from
+    store_var _29
+    load_const "|"
+    bin_op +
+    load_var _25
+    bin_op +
+    load_const "|"
+    bin_op +
+    load_var _29
+    bin_op +
+    return
+}
+
+function streaming_composite_clients.retry_stream_does_not_retry_after_reasoning_case() -> string {
+    load_type string
+    alloc_array 0
+    init_instance user.streaming_composite_clients.StreamProbe .events
+    store_var probe
+    load_const "reasoning-partial"
+    load_type string
+    alloc_array 0
+    load_var probe
+    load_const <omitted>
+    load_const <omitted>
+    load_const <omitted>
+    load_const true
+    load_const <omitted>
+    load_const <omitted>
+    call user.streaming_composite_clients.scripted_client
+    store_var inner
+    load_const 0
+    load_const <omitted>
+    load_const 0
+    call ai.clients.Backoff.new
+    store_var _8
+    load_var inner
+    load_const 3
+    load_const <omitted>
+    load_var _8
+    call ai.clients.Retry.new
+    call user.streaming_composite_clients.composite_input
+    load_type ai.stream.StreamingClient
+    load_const "invoke_stream"
+    virtual_call nargs=2 ntypeargs=0
+    store_var stream
+    load_var stream
+    call ai.stream.TurnStream.next_event
+    store_var _13
+    load_var _13
+    narrow_bind ai.stream.ReasoningDelta, slot=6
+    pop_jump_if_true L0
+    load_const "unexpected"
+    store_var first
+    jump L1
+
+  L0:
+    load_var _13
+    load_field .summary
+    store_var first
+
+  L1:
+    load_var stream
+    call ai.stream.TurnStream.next_event
+    store_var second
+    jump L2
+    load_var e
+    throw_if_panic
+    load_var e
+    call user.streaming_composite_clients.failure_name
+    store_var second
+
+  L2:
+    load_type string
+    load_var first
+    call baml.String.from
+    load_type string | ai.stream.Done | ai.stream.ReasoningDelta | ai.stream.TextDelta | ai.stream.ToolUseDelta | ai.stream.ToolUseDone | ai.stream.TurnDone | ai.stream.TurnMeta
     load_var second
     call baml.String.from
     store_var _25
@@ -1068,7 +1146,6 @@ function streaming_composite_clients.retry_stream_does_not_retry_after_delta_cas
     load_var _29
     call baml.String.from
     store_var _28
-    load_var _21
     load_const "|"
     bin_op +
     load_var _24
@@ -1095,6 +1172,7 @@ function streaming_composite_clients.retry_stream_retries_before_first_delta_cas
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var inner
     load_const 0
@@ -1112,7 +1190,6 @@ function streaming_composite_clients.retry_stream_retries_before_first_delta_cas
     load_type string
     load_var _11
     call baml.String.from
-    store_var _10
     load_type string
     load_var probe
     load_field .events
@@ -1123,7 +1200,6 @@ function streaming_composite_clients.retry_stream_retries_before_first_delta_cas
     load_var _15
     call baml.String.from
     store_var _14
-    load_var _10
     load_const "|"
     bin_op +
     load_var _14
@@ -1146,6 +1222,7 @@ function streaming_composite_clients.retry_stream_retries_when_open_fails_case()
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var inner
     load_const 0
@@ -1163,7 +1240,6 @@ function streaming_composite_clients.retry_stream_retries_when_open_fails_case()
     load_type string
     load_var _11
     call baml.String.from
-    store_var _10
     load_type string
     load_var probe
     load_field .events
@@ -1174,7 +1250,6 @@ function streaming_composite_clients.retry_stream_retries_when_open_fails_case()
     load_var _15
     call baml.String.from
     store_var _14
-    load_var _10
     load_const "|"
     bin_op +
     load_var _14
@@ -1198,6 +1273,7 @@ function streaming_composite_clients.retry_stream_success_case() -> string {
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var inner
     load_const 0
@@ -1215,7 +1291,6 @@ function streaming_composite_clients.retry_stream_success_case() -> string {
     load_type string
     load_var _11
     call baml.String.from
-    store_var _10
     load_type string
     load_var probe
     load_field .events
@@ -1226,7 +1301,6 @@ function streaming_composite_clients.retry_stream_success_case() -> string {
     load_var _15
     call baml.String.from
     store_var _14
-    load_var _10
     load_const "|"
     bin_op +
     load_var _14
@@ -1249,6 +1323,7 @@ function streaming_composite_clients.round_robin_stream_rotates_once_per_stream_
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var first
     load_const "second"
@@ -1256,6 +1331,7 @@ function streaming_composite_clients.round_robin_stream_rotates_once_per_stream_
     load_type string
     alloc_array 1
     load_var probe
+    load_const <omitted>
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
@@ -1288,7 +1364,6 @@ function streaming_composite_clients.round_robin_stream_rotates_once_per_stream_
     load_type string
     load_var _22
     call baml.String.from
-    store_var _21
     load_type string
     load_var probe
     load_field .events
@@ -1299,7 +1374,6 @@ function streaming_composite_clients.round_robin_stream_rotates_once_per_stream_
     load_var _26
     call baml.String.from
     store_var _25
-    load_var _21
     load_const "|"
     bin_op +
     load_var _25
@@ -1307,7 +1381,7 @@ function streaming_composite_clients.round_robin_stream_rotates_once_per_stream_
     return
 }
 
-function streaming_composite_clients.scripted_client(client_id: string, chunks: string[], probe: streaming_composite_clients.StreamProbe, fail_open_attempts: int, fail_pull_attempts: int, fail_after_delta: bool, cancel_before_delta: bool, unsafe_before_delta: bool) -> streaming_composite_clients.ScriptedStreamClient {
+function streaming_composite_clients.scripted_client(client_id: string, chunks: string[], probe: streaming_composite_clients.StreamProbe, fail_open_attempts: int, fail_pull_attempts: int, fail_after_delta: bool, reasoning_before_failure: bool, cancel_before_delta: bool, unsafe_before_delta: bool) -> streaming_composite_clients.ScriptedStreamClient {
     load_var fail_open_attempts
     load_const <omitted>
     cmp_op ==
@@ -1332,29 +1406,37 @@ function streaming_composite_clients.scripted_client(client_id: string, chunks: 
     store_var fail_after_delta
 
   L2:
-    load_var cancel_before_delta
+    load_var reasoning_before_failure
     load_const <omitted>
     cmp_op ==
     pop_jump_if_false L3
     load_const false
-    store_var cancel_before_delta
+    store_var reasoning_before_failure
 
   L3:
-    load_var unsafe_before_delta
+    load_var cancel_before_delta
     load_const <omitted>
     cmp_op ==
     pop_jump_if_false L4
     load_const false
-    store_var unsafe_before_delta
+    store_var cancel_before_delta
 
   L4:
+    load_var unsafe_before_delta
+    load_const <omitted>
+    cmp_op ==
+    pop_jump_if_false L5
+    load_const false
+    store_var unsafe_before_delta
+
+  L5:
     load_var2 1 2
     load_var2 4 5
     load_var2 6 7
-    load_var unsafe_before_delta
+    load_var2 8 9
     load_const 0
     load_var probe
-    init_instance user.streaming_composite_clients.ScriptedStreamClient .client_id, .chunks, .fail_open_attempts, .fail_pull_attempts, .fail_after_delta, .cancel_before_delta, .unsafe_before_delta, .attempts, .probe
+    init_instance user.streaming_composite_clients.ScriptedStreamClient .client_id, .chunks, .fail_open_attempts, .fail_pull_attempts, .fail_after_delta, .reasoning_before_failure, .cancel_before_delta, .unsafe_before_delta, .attempts, .probe
     return
 }
 
@@ -1368,6 +1450,7 @@ function streaming_composite_clients.streaming_composites_do_not_retry_unsafe_fa
     load_type string
     alloc_array 1
     load_var probe
+    load_const <omitted>
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
@@ -1398,7 +1481,6 @@ function streaming_composite_clients.streaming_composites_do_not_retry_unsafe_fa
     load_type string
     load_var outcome
     call baml.String.from
-    store_var _14
     load_type string
     load_var probe
     load_field .events
@@ -1409,7 +1491,6 @@ function streaming_composite_clients.streaming_composites_do_not_retry_unsafe_fa
     load_var _18
     call baml.String.from
     store_var _17
-    load_var _14
     load_const "|"
     bin_op +
     load_var _17
@@ -1427,6 +1508,7 @@ function streaming_composite_clients.streaming_composites_enforce_member_capabil
     load_type string
     alloc_array 1
     load_var fallback_probe
+    load_const <omitted>
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
@@ -1478,6 +1560,7 @@ function streaming_composite_clients.streaming_composites_enforce_member_capabil
     load_type string
     alloc_array 1
     load_var rr_probe
+    load_const <omitted>
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
@@ -1601,6 +1684,7 @@ function streaming_composite_clients.streaming_composites_nest_as_capabilities_c
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var first
     load_const "second"
@@ -1608,6 +1692,7 @@ function streaming_composite_clients.streaming_composites_nest_as_capabilities_c
     load_type string
     alloc_array 1
     load_var probe
+    load_const <omitted>
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
@@ -1633,7 +1718,6 @@ function streaming_composite_clients.streaming_composites_nest_as_capabilities_c
     load_type string
     load_var _18
     call baml.String.from
-    store_var _17
     load_type string
     load_var probe
     load_field .events
@@ -1644,7 +1728,6 @@ function streaming_composite_clients.streaming_composites_nest_as_capabilities_c
     load_var _22
     call baml.String.from
     store_var _21
-    load_var _17
     load_const "|"
     bin_op +
     load_var _21
@@ -1665,6 +1748,7 @@ function streaming_composite_clients.streaming_composites_propagate_cancellation
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     load_const true
     load_const <omitted>
     call user.streaming_composite_clients.scripted_client
@@ -1679,6 +1763,7 @@ function streaming_composite_clients.streaming_composites_propagate_cancellation
     load_const <omitted>
     load_const <omitted>
     load_const <omitted>
+    load_const <omitted>
     call user.streaming_composite_clients.scripted_client
     store_var backup
     load_var2 2 3
@@ -1687,28 +1772,24 @@ function streaming_composite_clients.streaming_composites_propagate_cancellation
     init_instance ai.clients.Fallback .members
     call user.streaming_composite_clients.drain_streaming
     store_var outcome
-    jump L2
+    jump L1
     load_var e
     store_var _16
     load_var _16
     narrow_bind baml.panics.Cancelled, slot=6
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    pop_jump_if_true L0
     load_var e
     rethrow
 
-  L1:
+  L0:
     load_var _16
     call user.streaming_composite_clients.failure_name
     store_var outcome
 
-  L2:
+  L1:
     load_type string
     load_var outcome
     call baml.String.from
-    store_var _20
     load_type string
     load_var probe
     load_field .events
@@ -1719,7 +1800,6 @@ function streaming_composite_clients.streaming_composites_propagate_cancellation
     load_var _24
     call baml.String.from
     store_var _23
-    load_var _20
     load_const "|"
     bin_op +
     load_var _23

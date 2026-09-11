@@ -7,12 +7,35 @@ use baml_base::{ClientOptionsValidationError, FileId, Span};
 use baml_compiler_diagnostics::diagnostic::{Diagnostic, DiagnosticId, DiagnosticPhase, Severity};
 use text_size::TextRange;
 
+/// Where a written type lives, which decides what an author can do about a
+/// runtime type appearing in it: a body can introduce a `type T = …;`
+/// binding before the type is written, a declaration cannot - it has no
+/// scope of its own, so the runtime type has to arrive as a type argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeExprOwner {
+    /// A type written inside a function, lambda, or block body.
+    Body,
+    /// A type written in a declaration: a field, a signature, a bound, an
+    /// `implements` argument, or a top-level alias.
+    Declaration,
+}
+
 /// Diagnostic emitted during CST → AST lowering.
 ///
 /// These are structural problems ("missing name token", "unparseable type")
 /// rather than semantic ones ("duplicate definition", "type mismatch").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoweringDiagnostic {
+    /// Builtin aliases have a fixed arity and no associated bindings. Report
+    /// these before AST lowering erases their written type arguments.
+    InvalidBuiltinTypeArguments {
+        name: String,
+        expected: usize,
+        got: usize,
+        associated_bindings: usize,
+        span: TextRange,
+    },
+
     /// A top-level item (class, function, enum, etc.) has no name token.
     MissingItemName {
         item_kind: &'static str,
@@ -28,24 +51,6 @@ pub enum LoweringDiagnostic {
         span: TextRange,
     },
 
-    /// A class-literal turbofish supplied an inline `unreflect(value)` type
-    /// argument (`Holder<unreflect(t)> { .. }`). The constructed value's type
-    /// is `Holder<T>` — it mentions the call-scoped runtime parameter, which
-    /// stops existing the moment the literal finishes — so the runtime type
-    /// has to be named with a `type` binding first. The literal is the one
-    /// shape whose answer never depends on a callee signature, so it is
-    /// decided here, where the written source is still at hand.
-    RuntimeTypeMustBeNamed {
-        /// The carrier expression inside `unreflect(...)`, when it prints
-        /// cleanly on one line.
-        carrier: Option<String>,
-        /// The written literal with the inline slot replaced by the suggested
-        /// name, when it prints cleanly on one line.
-        named: Option<String>,
-        /// The `unreflect(...)` slot itself.
-        span: TextRange,
-    },
-
     /// A function parameter has no name token.
     MissingParamName {
         function_name: String,
@@ -55,11 +60,12 @@ pub enum LoweringDiagnostic {
     /// A parameter default was parsed in a context that does not support defaults.
     UnsupportedParameterDefault { context: String, span: TextRange },
 
-    /// A user-authored LLM function declared `client`, which is reserved for
-    /// the compiler-injected client override parameter.
-    ReservedLlmClientParam {
+    /// A user-authored LLM function parameter collides with a binding owned by
+    /// the compiler's LLM lowering.
+    ReservedLlmParam {
         function_name: String,
         param_name: String,
+        reserved_for: &'static str,
         span: TextRange,
     },
 
@@ -138,6 +144,24 @@ pub enum LoweringDiagnostic {
     /// annotation or a `throws`-clause member).
     WildcardTypeNotAllowed { context: String, span: TextRange },
 
+    /// `unreflect(…)` written anywhere other than as the whole right-hand
+    /// side of a body-level `type T = …;` binding: a type argument, an
+    /// annotation, a pattern, an item signature, a top-level alias, or nested
+    /// inside a binding's static type. The binding is the one spelling that
+    /// lifts a runtime type; every other position names the bound `T`.
+    /// `owner` decides the remedy: a body can bind the type where it stands,
+    /// a declaration has no scope to bind one in at all.
+    UnreflectOutsideTypeBinding {
+        span: TextRange,
+        owner: TypeExprOwner,
+    },
+
+    /// `unreflect(expr)` nested inside the right-hand side of a body
+    /// `type T = …` statement (`type T = Wrapper<unreflect(t)>`). The
+    /// statement lifts exactly one runtime type, as its whole right-hand
+    /// side; compose through a second binding.
+    UnreflectNestedInTypeBinding { span: TextRange },
+
     /// A `:` type ascription was applied to a pattern that doesn't accept
     /// one. Only `let x: T` and `[…]: T` are supported. Things like
     /// `_: T`, `int: T`, `Class { … }: T`, `(a | b): T`, and progressive
@@ -168,6 +192,11 @@ pub enum LoweringDiagnostic {
     /// has no value; without this diagnostic it would lower to a `Missing` that
     /// only fails at runtime.
     AssignmentInExpressionPosition { span: TextRange },
+
+    /// Parser recovery produced an object-literal node without a constructor
+    /// identifier. The AST cannot represent a constructor-less object, so the
+    /// expression lowers to `Missing` and this diagnostic preserves the error.
+    MissingObjectConstructor { span: TextRange },
 
     /// Top-level `implements I for T` where `T` does not match any class in the file.
     UnresolvedImplementsForTarget {
@@ -271,7 +300,7 @@ pub enum LoweringDiagnostic {
 /// `anthropic` block to write `openai.ResponsesClient` is migration guidance
 /// that changes behavior. The mapping is the legacy `provider` name -> the
 /// native client, and it is deliberately the same set the `"provider/model"`
-/// shorthand resolves (`baml_std/ai/ns_internal/clients.baml::_from_shorthand`).
+/// shorthand resolves (`SHORTHAND_PROVIDERS` in `lower_cst.rs`).
 ///
 /// An unrecognized or absent provider keeps the generic `OpenAI` suggestion:
 /// there is nothing better to say, and it is still a valid client expression.
@@ -280,8 +309,8 @@ pub enum LoweringDiagnostic {
 /// `strategy` list — the diagnostic does not carry the block's option values.
 fn client_replacement_expr(provider: Option<&str>) -> &'static str {
     match provider.map(str::trim).map(|p| p.trim_matches('"')) {
-        Some("anthropic") => "anthropic.AnthropicClient.new(model = \"...\")",
-        Some("google-ai" | "google" | "gemini") => "google.GoogleClient.new(model = \"...\")",
+        Some("anthropic") => "anthropic.Client.new(model = \"...\")",
+        Some("google-ai" | "google" | "gemini") => "google.GeminiClient.new(model = \"...\")",
         Some("vertex-ai" | "vertex") => "google.VertexClient.new(model = \"...\")",
         Some("aws-bedrock" | "bedrock") => "aws.BedrockClient.new(model = \"...\")",
         Some("azure-openai" | "azure") => {
@@ -304,6 +333,23 @@ impl LoweringDiagnostic {
     /// construct `Span` values from the stored `TextRange`s.
     pub fn to_diagnostic(&self, file_id: FileId) -> Diagnostic {
         let (id, severity, message, range, label) = match self {
+            LoweringDiagnostic::InvalidBuiltinTypeArguments {
+                name,
+                expected,
+                got,
+                associated_bindings,
+                span,
+            } => (
+                DiagnosticId::InvalidBuiltinTypeArguments,
+                Severity::Error,
+                if *associated_bindings == 0 {
+                    format!("type `{name}` expects {expected} type argument(s), got {got}")
+                } else {
+                    format!("builtin type `{name}` does not accept associated-type bindings")
+                },
+                *span,
+                "invalid builtin type arguments",
+            ),
             LoweringDiagnostic::MissingItemName { item_kind, span } => (
                 DiagnosticId::MissingName,
                 Severity::Error,
@@ -325,32 +371,6 @@ impl LoweringDiagnostic {
                 *span,
                 "unparseable type",
             ),
-            LoweringDiagnostic::RuntimeTypeMustBeNamed {
-                carrier,
-                named,
-                span,
-            } => {
-                let span = Span {
-                    file_id,
-                    range: *span,
-                };
-                let rewrite = baml_compiler_diagnostics::runtime_type::RuntimeTypeNameRewrite {
-                    carrier: carrier.clone(),
-                    named: named.clone(),
-                };
-                return baml_compiler_diagnostics::runtime_type::runtime_type_must_be_named()
-                    .with_primary(
-                        span,
-                        baml_compiler_diagnostics::runtime_type::RUNTIME_TYPE_MUST_BE_NAMED_NOTE,
-                    )
-                    .with_related(
-                        span,
-                        baml_compiler_diagnostics::runtime_type::runtime_type_must_be_named_help(
-                            &rewrite,
-                        ),
-                    )
-                    .with_phase(DiagnosticPhase::Hir);
-            }
             LoweringDiagnostic::MissingParamName {
                 function_name,
                 span,
@@ -368,18 +388,19 @@ impl LoweringDiagnostic {
                 *span,
                 "default value is not allowed here",
             ),
-            LoweringDiagnostic::ReservedLlmClientParam {
+            LoweringDiagnostic::ReservedLlmParam {
                 function_name,
                 param_name,
+                reserved_for,
                 span,
             } => (
                 DiagnosticId::InvalidSyntax,
                 Severity::Error,
                 format!(
-                    "LLM function `{function_name}` cannot declare a parameter named `{param_name}`; `client` is reserved for the compiler-injected LLM client override"
+                    "LLM function `{function_name}` cannot declare a parameter named `{param_name}`; `{param_name}` is reserved for {reserved_for}"
                 ),
                 *span,
-                "`client` is reserved here",
+                "reserved LLM parameter name",
             ),
             LoweringDiagnostic::MissingVariantName { enum_name, span } => (
                 DiagnosticId::MissingName,
@@ -565,6 +586,46 @@ impl LoweringDiagnostic {
                 *span,
                 "`_` cannot be inferred here",
             ),
+            LoweringDiagnostic::UnreflectOutsideTypeBinding { span, owner } => {
+                // One constructor owns E0168's headline (the diagnostics
+                // crate), so the lowering gate and any later reporter can
+                // never drift apart on the message. Only the remedy differs:
+                // a declaration has no scope to bind a runtime type in, so
+                // pointing it at a `type` statement would name a spelling
+                // that is E0168 there too.
+                let label = match owner {
+                    TypeExprOwner::Body => {
+                        "bind it first with `type T = unreflect(…);`, then write `T` here"
+                    }
+                    // Deliberately does not promise a type parameter: a
+                    // field or a signature can take one, but a top-level
+                    // alias cannot, and every declaration position shares
+                    // the one true remedy - move it into a body.
+                    TypeExprOwner::Declaration => {
+                        "a runtime type has no scope in a declaration; bind it inside a function body with `type T = unreflect(…);`"
+                    }
+                };
+                return baml_compiler_diagnostics::runtime_type::runtime_type_must_be_named()
+                    .with_primary(
+                        Span {
+                            file_id,
+                            range: *span,
+                        },
+                        label,
+                    )
+                    .with_phase(DiagnosticPhase::Hir);
+            }
+            LoweringDiagnostic::UnreflectNestedInTypeBinding { span } => {
+                return baml_compiler_diagnostics::runtime_type::runtime_type_must_be_named()
+                    .with_primary(
+                        Span {
+                            file_id,
+                            range: *span,
+                        },
+                        "a `type` binding lifts one runtime type as its whole right-hand side; give this one a `type` statement of its own first, then write that name here",
+                    )
+                    .with_phase(DiagnosticPhase::Hir);
+            }
             LoweringDiagnostic::InvalidPatternAscription { reason, span } => (
                 DiagnosticId::TypeMismatch,
                 Severity::Error,
@@ -607,6 +668,13 @@ impl LoweringDiagnostic {
                     .to_string(),
                 *span,
                 "assignment not allowed here",
+            ),
+            LoweringDiagnostic::MissingObjectConstructor { span } => (
+                DiagnosticId::InvalidSyntax,
+                Severity::Error,
+                "object construction requires a class or type name".to_string(),
+                *span,
+                "expected a constructor name before `{`",
             ),
             LoweringDiagnostic::UnresolvedImplementsForTarget {
                 interface_name,

@@ -32,7 +32,7 @@ use std::{
     path::PathBuf,
 };
 
-use baml_base::qualified_name::{AI_STREAM_DONE, AI_STREAM_STREAM};
+use baml_base::qualified_name::{AI_FUNCTION_SPEC, AI_STREAM_DONE, AI_STREAM_STREAM};
 use baml_codegen_types::{Function, Symbol, SymbolPool, Ty};
 pub use baml_codegen_types::{NamingConvention, OutputType};
 
@@ -68,6 +68,8 @@ const RUNTIME_OWNED_FQNS: &[&str] = &[
     "baml.media.Audio",
     "baml.media.Video",
     "baml.media.Pdf",
+    "ai.Prompt",
+    AI_FUNCTION_SPEC,
     AI_STREAM_STREAM,
     // The stream-done sentinel is runtime-owned: its body ships in
     // `baml-bridge` as `baml_sdk.ai.stream.Done` and
@@ -479,7 +481,7 @@ pub(crate) fn signature_token(ty: &Ty, aliases: &AliasTable) -> String {
         Ty::Null { .. } => "null".to_string(),
         Ty::Uint8Array { .. } => "uint8array".to_string(),
         Ty::Void { .. } => "void".to_string(),
-        Ty::BuiltinUnknown { .. } => "unknown".to_string(),
+        Ty::Unknown { .. } => "unknown".to_string(),
         // A generic class carries its concrete type args in its identity token
         // (`Wrapper<int>` vs `Wrapper<string>`) — kept for parity with
         // `registry_arm_expr`, which distinguishes two instantiations so a union /
@@ -688,7 +690,7 @@ mod tests {
         Ty::TypeVar(baml_codegen_types::ParamTy::new(0, BaseName::new(n)), a())
     }
     fn t_union(items: Vec<Ty>) -> Ty {
-        Ty::Union(items, a())
+        Ty::Union(items.into(), a())
     }
     fn t_list(inner: Ty) -> Ty {
         Ty::List(Box::new(inner), a())
@@ -697,14 +699,14 @@ mod tests {
         Ty::TypeAlias(n, a())
     }
     fn t_class(n: Name) -> Ty {
-        Ty::Class(n, Vec::new(), a())
+        Ty::Class(n, Box::new([]), a())
     }
     fn t_null() -> Ty {
         Ty::Null { attr: a() }
     }
     /// `T?` — a nullable BAML type (`T | null`).
     fn t_opt(inner: Ty) -> Ty {
-        Ty::Union(vec![inner, t_null()], a())
+        Ty::Union(Box::new([inner, t_null()]), a())
     }
 
     fn class_sym_with_props(
@@ -761,6 +763,7 @@ mod tests {
             generic_params: Vec::new(),
             docstring: None,
             arguments: vec![FunctionArgument {
+                injected: false,
                 name: BaseName::new("x"),
                 docstring: None,
                 ty: t_int(),
@@ -782,6 +785,7 @@ mod tests {
             generic_params: Vec::new(),
             docstring: None,
             arguments: vec![FunctionArgument {
+                injected: false,
                 name: BaseName::new(arg.0),
                 docstring: None,
                 ty: arg.1,
@@ -953,6 +957,7 @@ mod tests {
                 generic_params: Vec::new(),
                 docstring: None,
                 arguments: vec![FunctionArgument {
+                    injected: false,
                     name: BaseName::new("ctx"),
                     docstring: None,
                     ty: t_string(),
@@ -1052,6 +1057,7 @@ mod tests {
             generic_params: Vec::new(),
             docstring: Some("Load a document from a path.".to_string()),
             arguments: vec![FunctionArgument {
+                injected: false,
                 name: BaseName::new("path"),
                 docstring: None,
                 ty: t_string(),
@@ -1179,12 +1185,14 @@ mod tests {
             docstring: None,
             arguments: vec![
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("x"),
                     docstring: None,
                     ty: t_int(),
                     default: None,
                 },
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("opt1"),
                     docstring: None,
                     ty: t_int(),
@@ -1193,6 +1201,7 @@ mod tests {
                     ))),
                 },
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("opt2"),
                     docstring: None,
                     ty: t_string(),
@@ -1261,6 +1270,54 @@ mod tests {
     }
 
     #[test]
+    fn stream_options_include_client_and_preserve_event_callback_types() {
+        use baml_codegen_types::{
+            CallableParam, CodegenFunctionParamMode, FunctionArgumentDefault,
+        };
+
+        let mut pool = SymbolPool::new();
+        let event = name("vendor", &["ai", "events"], "Event");
+        pool.insert(event.clone(), class_sym(&event, &[], 0));
+        let callback = Ty::Function {
+            params: Box::new([CallableParam {
+                name: None,
+                ty: t_class(event),
+                mode: CodegenFunctionParamMode::Required,
+            }]),
+            ret: Box::new(Ty::Void { attr: a() }),
+            throws: Box::new(Ty::Never { attr: a() }),
+            attr: a(),
+        };
+        pool.insert(
+            name("user", &[], "probe@stream"),
+            Symbol::Function(Function {
+                name: BaseName::new("probe@stream"),
+                generic_params: Vec::new(),
+                docstring: None,
+                arguments: vec![FunctionArgument {
+                    injected: true,
+                    name: BaseName::new("on_event"),
+                    docstring: None,
+                    ty: t_opt(callback),
+                    default: Some(FunctionArgumentDefault::Null),
+                }],
+                return_type: t_int(),
+                throws: None,
+                watchers: Vec::new(),
+                origin: origin(1),
+            }),
+        );
+
+        let out = emit_sdk(&pool);
+        let file = &out[&PathBuf::from("Fns.java")];
+        assert!(file.contains("public probe_stream$Opts client(java.lang.Object v) {"));
+        assert!(file.contains("this.$values.put(\"client\", v);"));
+        assert!(
+            file.contains("this.$values.put(\"on_event\", new baml_bridge.BamlTypedCallable(v")
+        );
+    }
+
+    #[test]
     fn optional_args_instance_method_puts_configurator_last() {
         use baml_codegen_types::{DefaultLiteral, FunctionArgumentDefault};
         let mut pool = SymbolPool::new();
@@ -1271,12 +1328,14 @@ mod tests {
             docstring: None,
             arguments: vec![
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("arg0"),
                     docstring: None,
                     ty: t_int(),
                     default: None,
                 },
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("opt1"),
                     docstring: None,
                     ty: t_int(),
@@ -1319,7 +1378,7 @@ mod tests {
         // interface, and the interface file is emitted beside `Fns`.
         let mut pool = SymbolPool::new();
         let callback_ty = Ty::Function {
-            params: vec![
+            params: Box::new([
                 CallableParam {
                     name: Some(BaseName::new("x")),
                     ty: t_int(),
@@ -1335,7 +1394,7 @@ mod tests {
                     ty: t_int(),
                     mode: CodegenFunctionParamMode::Optional,
                 },
-            ],
+            ]),
             ret: Box::new(t_int()),
             throws: Box::new(Ty::Never { attr: a() }),
             attr: a(),
@@ -1346,12 +1405,14 @@ mod tests {
             docstring: None,
             arguments: vec![
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("callback"),
                     docstring: None,
                     ty: callback_ty,
                     default: None,
                 },
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("x"),
                     docstring: None,
                     ty: t_int(),
@@ -1419,11 +1480,11 @@ mod tests {
         use baml_codegen_types::{CallableParam, CodegenFunctionParamMode};
 
         let returned = Ty::Function {
-            params: vec![CallableParam {
+            params: Box::new([CallableParam {
                 name: Some(BaseName::new("value")),
                 ty: t_int(),
                 mode: CodegenFunctionParamMode::Optional,
-            }],
+            }]),
             ret: Box::new(t_int()),
             throws: Box::new(Ty::Never { attr: a() }),
             attr: a(),
@@ -1450,11 +1511,11 @@ mod tests {
         use baml_codegen_types::{CallableParam, CodegenFunctionParamMode};
 
         let returned = Ty::Function {
-            params: vec![CallableParam {
+            params: Box::new([CallableParam {
                 name: None,
                 ty: t_int(),
                 mode: CodegenFunctionParamMode::Required,
-            }],
+            }]),
             ret: Box::new(t_int()),
             throws: Box::new(Ty::Never { attr: a() }),
             attr: a(),
@@ -1605,12 +1666,18 @@ mod tests {
         pool.insert(stream.clone(), class_sym(&stream, &[], 1));
         let done = name("ai", &["stream"], "Done");
         pool.insert(done.clone(), class_sym(&done, &[], 2));
+        let prompt = name("ai", &[], "Prompt");
+        pool.insert(prompt.clone(), class_sym(&prompt, &[], 3));
+        let spec = name("ai", &[], "FunctionSpec");
+        pool.insert(spec.clone(), class_sym(&spec, &[], 4));
         let resp = name("baml", &["http"], "Response");
-        pool.insert(resp.clone(), class_sym(&resp, &[], 3));
+        pool.insert(resp.clone(), class_sym(&resp, &[], 5));
         let out = emit_sdk(&pool);
         assert!(!out.contains_key(&PathBuf::from("baml/media/Image.java")));
         assert!(!out.contains_key(&PathBuf::from("vendor/ai/stream/Stream.java")));
         assert!(!out.contains_key(&PathBuf::from("vendor/ai/stream/Done.java")));
+        assert!(!out.contains_key(&PathBuf::from("vendor/ai/Prompt.java")));
+        assert!(!out.contains_key(&PathBuf::from("vendor/ai/FunctionSpec.java")));
         assert!(out.contains_key(&PathBuf::from("baml/http/Response.java")));
     }
 
@@ -1641,6 +1708,7 @@ mod tests {
             generic_params: vec![BaseName::new("T")],
             docstring: None,
             arguments: vec![FunctionArgument {
+                injected: false,
                 name: BaseName::new("x"),
                 docstring: None,
                 ty: t_typevar("T"),
@@ -1736,12 +1804,14 @@ mod tests {
             docstring: None,
             arguments: vec![
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("x"),
                     docstring: None,
                     ty: t_typevar("T"),
                     default: None,
                 },
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("opt1"),
                     docstring: None,
                     ty: t_int(),
@@ -2157,6 +2227,7 @@ mod tests {
             generic_params: Vec::new(),
             docstring: None,
             arguments: vec![FunctionArgument {
+                injected: false,
                 name: BaseName::new("needle"),
                 docstring: None,
                 ty: t_opt(t_string()),
@@ -2196,12 +2267,14 @@ mod tests {
             docstring: None,
             arguments: vec![
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("x"),
                     docstring: None,
                     ty: t_int(),
                     default: None,
                 },
                 FunctionArgument {
+                    injected: false,
                     name: BaseName::new("hint"),
                     docstring: None,
                     ty: t_opt(t_string()),

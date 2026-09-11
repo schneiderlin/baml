@@ -12,7 +12,7 @@ pub fn runtime_ty_structurally_equal(left: &RuntimeTy, right: &RuntimeTy) -> boo
         | (T::Bool { .. }, T::Bool { .. })
         | (T::Null { .. }, T::Null { .. })
         | (T::Uint8Array { .. }, T::Uint8Array { .. }) => true,
-        (T::BuiltinUnknown { .. }, T::BuiltinUnknown { .. })
+        (T::Unknown { .. }, T::Unknown { .. })
         | (T::RustType { .. }, T::RustType { .. })
         | (T::Type { .. }, T::Type { .. })
         | (T::Resource { .. }, T::Resource { .. })
@@ -159,7 +159,7 @@ mod tests {
     use super::runtime_ty_structurally_equal;
 
     fn union(members: Vec<RuntimeTy>) -> RuntimeTy {
-        RuntimeTy::Union(members, TyAttr::default())
+        RuntimeTy::Union(members.into(), TyAttr::default())
     }
 
     #[test]

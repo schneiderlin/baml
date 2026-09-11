@@ -41,10 +41,16 @@ use crate::{
 ///
 /// Renderers use this to distinguish a finite sequence of specializations from
 /// a recursive type transform whose arguments grow forever.
-#[derive(Clone, Debug, Default)]
-pub struct TyTemplateOrigins(Vec<Option<TyTemplate>>);
+#[derive(Clone, Debug)]
+pub struct TyTemplateOrigins<N: Clone = TypeName>(Vec<Option<TyTemplate<N>>>);
 
-impl TyTemplateOrigins {
+impl<N: Clone> Default for TyTemplateOrigins<N> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<N: Clone + PartialEq> TyTemplateOrigins<N> {
     /// No enclosing generic classes contribute symbolic origins at the root.
     pub fn root() -> Self {
         Self::default()
@@ -57,12 +63,7 @@ impl TyTemplateOrigins {
 
     /// Compose a class field template through every enclosing class transform,
     /// then add the field's template relative to its immediate class.
-    pub fn through_field(
-        &self,
-        class_name: &TypeName,
-        class_arity: usize,
-        field: &TyTemplate,
-    ) -> Self {
+    pub fn through_field(&self, class_name: &N, class_arity: usize, field: &TyTemplate<N>) -> Self {
         let mut origins = self
             .0
             .iter()
@@ -80,7 +81,7 @@ impl TyTemplateOrigins {
     pub fn class_transform_expands(
         &self,
         ancestry_index: usize,
-        class_name: &TypeName,
+        class_name: &N,
         class_arity: usize,
     ) -> bool {
         self.0
@@ -162,7 +163,7 @@ impl TyTemplateOrigins {
         })
     }
 
-    fn project(&self, mut project: impl FnMut(&TyTemplate) -> Option<TyTemplate>) -> Self {
+    fn project(&self, mut project: impl FnMut(&TyTemplate<N>) -> Option<TyTemplate<N>>) -> Self {
         Self(
             self.0
                 .iter()
@@ -172,7 +173,10 @@ impl TyTemplateOrigins {
     }
 }
 
-fn compose_template(template: &TyTemplate, type_args: &[TyTemplate]) -> TyTemplate {
+fn compose_template<N: Clone>(
+    template: &TyTemplate<N>,
+    type_args: &[TyTemplate<N>],
+) -> TyTemplate<N> {
     let mut composed = template.clone();
     walk_template(&mut composed, false, &mut |template, _| {
         if let TyTemplate::TypeArgRef(index) = template {
@@ -187,15 +191,15 @@ fn compose_template(template: &TyTemplate, type_args: &[TyTemplate]) -> TyTempla
     composed
 }
 
-fn walk_template(
-    template: &mut TyTemplate,
+fn walk_template<N: Clone>(
+    template: &mut TyTemplate<N>,
     nested: bool,
-    visitor: &mut impl FnMut(&mut TyTemplate, bool) -> bool,
+    visitor: &mut impl FnMut(&mut TyTemplate<N>, bool) -> bool,
 ) {
     if !visitor(template, nested) {
         return;
     }
-    let mut child = |template: &mut TyTemplate| walk_template(template, true, visitor);
+    let mut child = |template: &mut TyTemplate<N>| walk_template(template, true, visitor);
     match template {
         TyTemplate::List(inner, _) => child(inner),
         TyTemplate::Map { key, value, .. } => {
@@ -253,23 +257,91 @@ fn walk_template(
         | TyTemplate::PromptAst { .. }
         | TyTemplate::Void { .. }
         | TyTemplate::TypeAlias(..)
-        | TyTemplate::BuiltinUnknown { .. }
+        | TyTemplate::Unknown { .. }
         | TyTemplate::Never { .. } => {}
     }
 }
 
-fn class_origin_args<'a>(
-    origin: Option<&'a TyTemplate>,
-    class_name: &TypeName,
+/// Read-only pre-order traversal: the immutable sibling of [`walk_template`],
+/// arm for arm, so the two cannot disagree about where children live.
+/// `visitor` sees every node, parents before children.
+fn visit_template<N: Clone>(template: &TyTemplate<N>, visitor: &mut impl FnMut(&TyTemplate<N>)) {
+    visitor(template);
+    let mut child = |template: &TyTemplate<N>| visit_template(template, visitor);
+    match template {
+        TyTemplate::List(inner, _) => child(inner),
+        TyTemplate::Map { key, value, .. } => {
+            child(key);
+            child(value);
+        }
+        TyTemplate::Union(members, _) | TyTemplate::Class(_, members, _) => {
+            members.iter().for_each(&mut child);
+        }
+        TyTemplate::Interface(_, args, associated_bindings, _) => {
+            args.iter().for_each(&mut child);
+            associated_bindings
+                .iter()
+                .for_each(|(_, binding)| child(binding));
+        }
+        TyTemplate::Function {
+            params,
+            ret,
+            throws,
+            ..
+        } => {
+            params.iter().for_each(|param| child(&param.ty));
+            child(ret);
+            child(throws);
+        }
+        TyTemplate::Future(value, error, _) => {
+            child(value);
+            child(error);
+        }
+        TyTemplate::AssociatedTypeProjection {
+            base, interface, ..
+        } => {
+            child(base);
+            interface.generics.iter().for_each(&mut child);
+            interface
+                .associated_types
+                .iter()
+                .for_each(|(_, binding)| child(binding));
+        }
+        TyTemplate::TypeArgRef(_)
+        | TyTemplate::Int { .. }
+        | TyTemplate::Bigint { .. }
+        | TyTemplate::Float { .. }
+        | TyTemplate::String { .. }
+        | TyTemplate::Bool { .. }
+        | TyTemplate::Null { .. }
+        | TyTemplate::Uint8Array { .. }
+        | TyTemplate::Media(..)
+        | TyTemplate::Literal(..)
+        | TyTemplate::Enum(..)
+        | TyTemplate::EnumVariant(..)
+        | TyTemplate::RustType { .. }
+        | TyTemplate::Type { .. }
+        | TyTemplate::Resource { .. }
+        | TyTemplate::PromptAst { .. }
+        | TyTemplate::Void { .. }
+        | TyTemplate::TypeAlias(..)
+        | TyTemplate::Unknown { .. }
+        | TyTemplate::Never { .. } => {}
+    }
+}
+
+fn class_origin_args<'a, N: Clone + PartialEq>(
+    origin: Option<&'a TyTemplate<N>>,
+    class_name: &N,
     class_arity: usize,
-) -> Option<&'a [TyTemplate]> {
+) -> Option<&'a [TyTemplate<N>]> {
     let Some(TyTemplate::Class(origin_name, type_args, _)) = origin else {
         return None;
     };
     (origin_name == class_name && type_args.len() == class_arity).then_some(type_args)
 }
 
-fn transform_has_expanding_cycle(type_args: &[TyTemplate], arity: usize) -> bool {
+fn transform_has_expanding_cycle<N: Clone>(type_args: &[TyTemplate<N>], arity: usize) -> bool {
     fn reaches(
         edges: &[Vec<(usize, bool)>],
         current: usize,
@@ -393,16 +465,20 @@ impl fmt::Display for SubstituteError {
 
 impl std::error::Error for SubstituteError {}
 
-impl TyTemplate {
+impl<N: Clone> TyTemplate<N> {
     // --- Ergonomic constructors (default TyAttr) ---
+    //
+    // Head-generic: a constructor only *places* a head, it never reads one, so
+    // pinning these to the compiler's head would leave the runtime hand-rolling
+    // the same variants.
 
     /// `T[]` (list) with default attributes.
-    pub fn list(inner: TyTemplate) -> Self {
+    pub fn list(inner: Self) -> Self {
         TyTemplate::List(Box::new(inner), TyAttr::default())
     }
 
     /// `map<K, V>` with default attributes.
-    pub fn map(key: TyTemplate, value: TyTemplate) -> Self {
+    pub fn map(key: Self, value: Self) -> Self {
         TyTemplate::Map {
             key: Box::new(key),
             value: Box::new(value),
@@ -411,29 +487,34 @@ impl TyTemplate {
     }
 
     /// `A | B | ...` (union) with default attributes.
-    pub fn union(members: impl IntoIterator<Item = TyTemplate>) -> Self {
+    pub fn union(members: impl IntoIterator<Item = Self>) -> Self {
         TyTemplate::Union(members.into_iter().collect(), TyAttr::default())
     }
 
     /// `Class<A1, A2, ...>` (generic class instantiation) with default attributes.
-    pub fn class(name: TypeName, args: Vec<TyTemplate>) -> Self {
-        TyTemplate::Class(name, args, TyAttr::default())
+    pub fn class(head: N, args: Box<[Self]>) -> Self {
+        TyTemplate::Class(head, args, TyAttr::default())
     }
 
     /// `Interface<A1, Assoc = A2, ...>` with default attributes.
-    pub fn interface(
-        name: TypeName,
-        args: Vec<TyTemplate>,
-        associated_bindings: Vec<(Name, TyTemplate)>,
-    ) -> Self {
-        TyTemplate::Interface(name, args, associated_bindings, TyAttr::default())
+    pub fn interface(head: N, args: Box<[Self]>, associated_bindings: Box<[(Name, Self)]>) -> Self {
+        TyTemplate::Interface(head, args, associated_bindings, TyAttr::default())
     }
+}
 
-    /// Materialize this template against a frame's fully realized `type_args`,
-    /// producing a [`RealizedTy`] — every `TypeArgRef(n)` replaced by
-    /// `type_args[n]`, every associated-type projection reduced through `ctx` to
-    /// its impl binding.
-    ///
+impl std::fmt::Display for TyTemplateInterface {
+    /// Renders as the existential template it denotes, so an interface constraint
+    /// and the type it lifts to print identically in diagnostics and MIR dumps.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_template())
+    }
+}
+
+/// Substitution is head-agnostic: it replaces frame references with realized
+/// arguments and reduces projections through `ctx`, neither of which inspects a
+/// nominal head. The runtime therefore realizes its `TyTemplate<TypeHead>`s with
+/// the very same code the compiler uses on name-headed ones.
+impl<N: crate::Head> TyTemplate<N> {
     /// Runtime type arguments are always realized (a generic call binds each
     /// parameter to a concrete type), so a template that occurs at a
     /// materialization site — a `LoadType`, a generic-function value, an instance's
@@ -445,11 +526,11 @@ impl TyTemplate {
     /// A projection reduces because its qualifier is always known (the interface is
     /// non-optional) and its base realizes here, so `ctx.project` — the same impl
     /// consultation the canonical algebra uses — determines the concrete witness.
-    pub fn substitute<C: TypeContext>(
+    pub fn substitute<C: TypeContext<N>>(
         &self,
-        type_args: &[RealizedTy],
+        type_args: &[RealizedTy<N>],
         ctx: &C,
-    ) -> Result<RealizedTy, SubstituteError> {
+    ) -> Result<RealizedTy<N>, SubstituteError> {
         self.substitute_with_fuel(type_args, ctx, crate::normalize::PROJECTION_REDUCTION_FUEL)
     }
 
@@ -464,19 +545,19 @@ impl TyTemplate {
     /// `normalize`'s `from_ty` walk. The public [`Self::substitute`] seeds the full
     /// `PROJECTION_REDUCTION_FUEL` budget; `ctx.project` threads the remainder back
     /// in for the binding it realizes.
-    pub fn substitute_with_fuel<C: TypeContext>(
+    pub fn substitute_with_fuel<C: TypeContext<N>>(
         &self,
-        type_args: &[RealizedTy],
+        type_args: &[RealizedTy<N>],
         ctx: &C,
         fuel: u32,
-    ) -> Result<RealizedTy, SubstituteError> {
+    ) -> Result<RealizedTy<N>, SubstituteError> {
         match self {
             // ── Template-only leaf ────────────────────────────────────────────
             // A frame reference materializes to its bound type argument. The
             // frame always supplies every slot the template can reference: the
             // compiler seeds generic frames at full declared width, with an
             // unconstrained parameter seeded as an explicit `unknown` (so
-            // `type.of<T>()` under an unknown-typed call still reflects
+            // `reflect.Type.of<T>()` under an unknown-typed call still reflects
             // the honest top type through a real slot). An out-of-range index is
             // therefore a frame-layout bug — reported, never silently realized.
             Self::TypeArgRef(n) => match type_args.get(*n as usize) {
@@ -593,14 +674,105 @@ impl TyTemplate {
                 .unwrap_or_else(|e| unreachable!("realized-leaf template narrowing failed: {e}"))),
         }
     }
+}
 
-    /// Returns `true` when the template contains no template-only leaf
-    /// (`TypeArgRef` or an unresolved projection) at any depth — i.e. it is a
-    /// fully realized type that narrows to a [`RealizedTy`].
-    pub fn is_fully_concrete(&self) -> bool {
-        <&RealizedTy>::try_from(self).is_ok()
+impl TyTemplateInterface {
+    /// The interface *existential* template ([`TyTemplate::Interface`]) denoted by
+    /// this constraint, with default attributes — the template-level counterpart of
+    /// [`Interface::to_ty`].
+    ///
+    /// Needed only at boundaries that carry a *type* rather than a constraint (the
+    /// bytecode constant pool a `LoadType` reads from). Prefer holding the
+    /// constraint itself wherever an interface is meant: a `TyTemplate` slot admits
+    /// non-interface types, which an interface position can never legitimately hold.
+    pub fn to_template(&self) -> TyTemplate {
+        TyTemplate::interface(
+            self.name.clone(),
+            self.generics.clone(),
+            self.associated_types.clone(),
+        )
+    }
+}
+
+/// Symbolic substitution needs no more of a head than cloning it, so it sits at
+/// the same bound as [`TyTemplate::substitute_symbolic`] rather than the
+/// stronger one reduction requires.
+impl<N: Clone> TyTemplateInterface<N> {
+    /// [`TyTemplate::for_each_type_arg_ref`] over every template position of
+    /// the constraint: the generic arguments, then the associated-type bindings.
+    pub fn for_each_type_arg_ref(&self, f: &mut impl FnMut(u32)) {
+        for generic in &self.generics {
+            generic.for_each_type_arg_ref(f);
+        }
+        for (_, binding) in &self.associated_types {
+            binding.for_each_type_arg_ref(f);
+        }
     }
 
+    /// Compile-time counterpart to [`Self::substitute`] (see
+    /// [`TyTemplate::substitute_symbolic`]): resolve frame refs but leave
+    /// unresolved positions symbolic, producing a `RuntimeInterface`.
+    ///
+    /// Head-generic for the same reason: heads are cloned through, never read.
+    pub(crate) fn substitute_symbolic(&self, type_args: &[RuntimeTy<N>]) -> RuntimeInterface<N> {
+        RuntimeInterface::new(
+            self.name.clone(),
+            self.generics
+                .iter()
+                .map(|g| g.substitute_symbolic(type_args))
+                .collect(),
+            self.associated_types
+                .iter()
+                .map(|(name, ty)| (name.clone(), ty.substitute_symbolic(type_args)))
+                .collect(),
+        )
+    }
+}
+
+/// Head-agnostic for the same reason as [`TyTemplate::substitute`].
+impl<N: crate::Head> TyTemplateInterface<N> {
+    /// Substitute frame type args through the interface's generic and
+    /// associated-binding positions, producing the realized [`Interface`]
+    /// constraint used to reduce the enclosing projection (see
+    /// [`TyTemplate::substitute`]). Each realized position widens into `Ty` for the
+    /// [`Interface`] the projection query consumes.
+    fn substitute<C: TypeContext<N>>(
+        &self,
+        type_args: &[RealizedTy<N>],
+        ctx: &C,
+        fuel: u32,
+    ) -> Result<Interface<N>, SubstituteError> {
+        Ok(Interface::new(
+            self.name.clone(),
+            self.generics
+                .iter()
+                .map(|g| g.substitute_with_fuel(type_args, ctx, fuel).map(Ty::from))
+                .collect::<Result<_, _>>()?,
+            self.associated_types
+                .iter()
+                .map(|(name, ty)| {
+                    Ok((
+                        name.clone(),
+                        Ty::from(ty.substitute_with_fuel(type_args, ctx, fuel)?),
+                    ))
+                })
+                .collect::<Result<_, _>>()?,
+        ))
+    }
+}
+
+impl<N: Clone + crate::HeadDisplay> fmt::Display for TyTemplate<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Render through `Ty`'s `Display` so every shared construct (list-postfix
+        // parenthesization, `future<…>` casing, function `throws` handling, …)
+        // stays byte-identical to the canonical type renderer — no per-variant
+        // drift. Only the template-only leaf needs a placeholder: a frame ref
+        // shows as `#n` (a `TypeVar` named `#n`).
+        fmt::Display::fmt(&self.to_display_ty(), f)
+    }
+}
+
+impl<N: Clone> TyTemplate<N> {
     /// Compile-time counterpart to [`Self::substitute`]: resolve each
     /// `TypeArgRef(n)` against `type_args` but leave every unresolved position
     /// *symbolic*. An associated projection stays a projection; an out-of-range
@@ -609,7 +781,9 @@ impl TyTemplate {
     /// where the args may themselves be symbolic — an unspecialized generic — so
     /// the result is a `RuntimeTy` that can still carry type variables, unlike the
     /// runtime [`Self::substitute`], which realizes fully or fails.
-    pub fn substitute_symbolic(&self, type_args: &[RuntimeTy]) -> RuntimeTy {
+    ///
+    /// Head-generic: every head position is cloned through, never inspected.
+    pub fn substitute_symbolic(&self, type_args: &[RuntimeTy<N>]) -> RuntimeTy<N> {
         match self {
             Self::TypeArgRef(n) => type_args
                 .get(*n as usize)
@@ -683,101 +857,40 @@ impl TyTemplate {
                 attr: attr.clone(),
             },
             // A realized leaf narrows to `RealizedTy` then widens to `RuntimeTy`.
-            other => RealizedTy::try_from(other.clone())
+            other => RealizedTy::<N>::try_from(other.clone())
                 .unwrap_or_else(|e| unreachable!("realized-leaf template narrowing failed: {e}"))
                 .into(),
         }
     }
-}
 
-impl std::fmt::Display for TyTemplateInterface {
-    /// Renders as the existential template it denotes, so an interface constraint
-    /// and the type it lifts to print identically in diagnostics and MIR dumps.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_template())
-    }
-}
-
-impl TyTemplateInterface {
-    /// The interface *existential* template ([`TyTemplate::Interface`]) denoted by
-    /// this constraint, with default attributes — the template-level counterpart of
-    /// [`Interface::to_ty`].
+    /// Returns `true` when the template contains no template-only leaf
+    /// (`TypeArgRef` or an unresolved projection) at any depth — i.e. it is a
+    /// fully realized type that narrows to a [`RealizedTy`].
     ///
-    /// Needed only at boundaries that carry a *type* rather than a constraint (the
-    /// bytecode constant pool a `LoadType` reads from). Prefer holding the
-    /// constraint itself wherever an interface is meant: a `TyTemplate` slot admits
-    /// non-interface types, which an interface position can never legitimately hold.
-    pub fn to_template(&self) -> TyTemplate {
-        TyTemplate::interface(
-            self.name.clone(),
-            self.generics.clone(),
-            self.associated_types.clone(),
-        )
+    /// Narrowing is a family conversion and never inspects a head, so this
+    /// answers the same at either head.
+    pub fn is_fully_concrete(&self) -> bool {
+        <&RealizedTy<N>>::try_from(self).is_ok()
     }
 
-    /// Substitute frame type args through the interface's generic and
-    /// associated-binding positions, producing the realized [`Interface`]
-    /// constraint used to reduce the enclosing projection (see
-    /// [`TyTemplate::substitute`]). Each realized position widens into `Ty` for the
-    /// [`Interface`] the projection query consumes.
-    fn substitute<C: TypeContext>(
-        &self,
-        type_args: &[RealizedTy],
-        ctx: &C,
-        fuel: u32,
-    ) -> Result<Interface, SubstituteError> {
-        Ok(Interface::new(
-            self.name.clone(),
-            self.generics
-                .iter()
-                .map(|g| g.substitute_with_fuel(type_args, ctx, fuel).map(Ty::from))
-                .collect::<Result<_, _>>()?,
-            self.associated_types
-                .iter()
-                .map(|(name, ty)| {
-                    Ok((
-                        name.clone(),
-                        Ty::from(ty.substitute_with_fuel(type_args, ctx, fuel)?),
-                    ))
-                })
-                .collect::<Result<_, _>>()?,
-        ))
+    /// Calls `f` with the frame slot of every [`TyTemplate::TypeArgRef`] leaf,
+    /// in traversal order. A slot referenced more than once is reported once
+    /// per reference.
+    ///
+    /// These are exactly the frame type-arg slots evaluating the template reads,
+    /// which is what a pass that moves or repeats an evaluation has to respect.
+    pub fn for_each_type_arg_ref(&self, f: &mut impl FnMut(u32)) {
+        visit_template(self, &mut |template| {
+            if let TyTemplate::TypeArgRef(index) = template {
+                f(*index);
+            }
+        });
     }
 
-    /// Compile-time counterpart to [`Self::substitute`] (see
-    /// [`TyTemplate::substitute_symbolic`]): resolve frame refs but leave
-    /// unresolved positions symbolic, producing a `RuntimeInterface`.
-    fn substitute_symbolic(&self, type_args: &[RuntimeTy]) -> RuntimeInterface {
-        RuntimeInterface::new(
-            self.name.clone(),
-            self.generics
-                .iter()
-                .map(|g| g.substitute_symbolic(type_args))
-                .collect(),
-            self.associated_types
-                .iter()
-                .map(|(name, ty)| (name.clone(), ty.substitute_symbolic(type_args)))
-                .collect(),
-        )
-    }
-}
-
-impl fmt::Display for TyTemplate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Render through `Ty`'s `Display` so every shared construct (list-postfix
-        // parenthesization, `future<…>` casing, function `throws` handling, …)
-        // stays byte-identical to the canonical type renderer — no per-variant
-        // drift. Only the template-only leaf needs a placeholder: a frame ref
-        // shows as `#n` (a `TypeVar` named `#n`).
-        fmt::Display::fmt(&self.to_display_ty(), f)
-    }
-}
-
-impl TyTemplate {
     /// A lossy [`Ty`] view for rendering only: frame refs become
     /// `TypeVar("#n")`. Every other node maps structurally, so
     /// [`fmt::Display`] can delegate to `Ty`'s renderer.
-    fn to_display_ty(&self) -> crate::Ty {
+    fn to_display_ty(&self) -> crate::Ty<N> {
         use crate::Ty;
         match self {
             Self::TypeArgRef(n) => Ty::TypeVar(
@@ -867,38 +980,56 @@ mod tests {
     /// resolution and realization, not projection reduction, so every query fails
     /// safe (no aliases, memberships, bounds, or reducible projections).
     struct NoCtx;
-    impl TypeContext for NoCtx {
-        fn alias_def(&self, _: &QualifiedTypeName) -> Option<Ty> {
+    impl TypeContext<TypeName> for NoCtx {
+        /// A name-based context represents a declaration by its own name, so this
+        /// is the identity — no resolution step, and never `None`.
+        fn well_known(&self, head: crate::normalize::WellKnownHead) -> Option<TypeName> {
+            Some(<TypeName as crate::normalize::SpelledHead>::well_known(
+                head,
+            ))
+        }
+
+        fn alias_def(&self, _: &QualifiedTypeName) -> Option<Ty<TypeName>> {
             None
         }
-        fn implements_interface(&self, _: &Ty, _: &Interface) -> bool {
+        fn implements_interface(&self, _: &Ty<TypeName>, _: &Interface<TypeName>) -> bool {
             false
         }
-        fn type_var_bound(&self, _: &crate::ParamTy) -> Vec<Interface> {
+        fn type_var_bound(&self, _: &crate::ParamTy) -> Vec<Interface<TypeName>> {
             Vec::new()
         }
-        fn interface_requires(&self, _: &Interface, _: &Interface) -> bool {
+        fn interface_requires(&self, _: &Interface<TypeName>, _: &Interface<TypeName>) -> bool {
             false
         }
         fn enum_variants(&self, _: &QualifiedTypeName) -> Option<Vec<Name>> {
             None
         }
-        fn associated_type_bound(&self, _: &Interface, _: Name) -> Vec<Interface> {
+        fn associated_type_bound(
+            &self,
+            _: &Interface<TypeName>,
+            _: Name,
+        ) -> Vec<Interface<TypeName>> {
             Vec::new()
         }
-        fn project(&self, _: &Ty, _: &Interface, _: &Name, _fuel: u32) -> ProjectionStep {
+        fn project(
+            &self,
+            _: &Ty<TypeName>,
+            _: &Interface<TypeName>,
+            _: &Name,
+            _fuel: u32,
+        ) -> ProjectionStep<TypeName> {
             ProjectionStep::Opaque
         }
     }
 
-    /// Build a `RealizedTy` frame argument from a `RuntimeTy` constructor.
-    fn r(ty: RuntimeTy) -> RealizedTy {
+    /// Build a `RealizedTy<TypeName>` frame argument from a `RuntimeTy<TypeName>` constructor.
+    fn r(ty: RuntimeTy<TypeName>) -> RealizedTy<TypeName> {
         RealizedTy::try_from(ty).expect("test arg is realized")
     }
 
-    /// Materialize against a frame, upcasting the realized result to `RuntimeTy`
-    /// so it can be compared with `RuntimeTy`'s ergonomic constructors.
-    fn sub(tmpl: &TyTemplate, args: &[RealizedTy]) -> RuntimeTy {
+    /// Materialize against a frame, upcasting the realized result to `RuntimeTy<TypeName>`
+    /// so it can be compared with `RuntimeTy<TypeName>`'s ergonomic constructors.
+    fn sub(tmpl: &TyTemplate<TypeName>, args: &[RealizedTy<TypeName>]) -> RuntimeTy<TypeName> {
         RuntimeTy::from(
             tmpl.substitute(args, &NoCtx)
                 .expect("substitution realizes"),
@@ -910,10 +1041,10 @@ mod tests {
         let step = TypeName::local(crate::Name::new("Step"));
         let step_field = TyTemplate::class(
             step.clone(),
-            vec![
+            Box::new([
                 TyTemplate::list(TyTemplate::TypeArgRef(1)),
                 TyTemplate::from(RealizedTy::int()),
-            ],
+            ]),
         );
         let step_origins = TyTemplateOrigins::root().through_field(&step, 2, &step_field);
         assert!(!step_origins.class_transform_expands(0, &step, 2));
@@ -921,10 +1052,10 @@ mod tests {
         let chain = TypeName::local(crate::Name::new("Chain"));
         let chain_field = TyTemplate::class(
             chain.clone(),
-            vec![TyTemplate::class(
+            Box::new([TyTemplate::class(
                 chain.clone(),
-                vec![TyTemplate::TypeArgRef(0)],
-            )],
+                Box::new([TyTemplate::TypeArgRef(0)]),
+            )]),
         );
         let chain_origins = TyTemplateOrigins::root().through_field(&chain, 1, &chain_field);
         assert!(chain_origins.class_transform_expands(0, &chain, 1));
@@ -932,15 +1063,91 @@ mod tests {
         let interface = TypeName::local(crate::Name::new("Wrapped"));
         let interface_field = TyTemplate::class(
             chain.clone(),
-            vec![TyTemplate::interface(
+            Box::new([TyTemplate::interface(
                 interface,
-                vec![TyTemplate::TypeArgRef(0)],
-                Vec::new(),
-            )],
+                Box::new([TyTemplate::TypeArgRef(0)]),
+                Box::new([]),
+            )]),
         );
         let interface_origins =
             TyTemplateOrigins::root().through_field(&chain, 1, &interface_field);
         assert!(interface_origins.class_transform_expands(0, &chain, 1));
+    }
+
+    /// [`visit_template`] and [`walk_template`] are separate traversals - one
+    /// immutable and total, one mutable and prunable - and only a doc comment
+    /// claims they agree about where children live. A slot walk that missed an
+    /// arm would silently under-report the frame slots a template reads, which
+    /// is what emit's virtualization leans on, so the claim is enforced: both
+    /// must reach the same nodes of a template carrying every child-bearing
+    /// variant.
+    #[test]
+    fn both_template_traversals_reach_the_same_children() {
+        let name = TypeName::local(crate::Name::new("Holder"));
+        let iface = TyTemplateInterface {
+            name: TypeName::local(crate::Name::new("Shown")),
+            generics: Box::new([TyTemplate::TypeArgRef(0)]),
+            associated_types: Box::new([(crate::Name::new("Item"), TyTemplate::TypeArgRef(1))]),
+        };
+        let every_shape = TyTemplate::class(
+            name.clone(),
+            Box::new([
+                TyTemplate::List(Box::new(TyTemplate::TypeArgRef(2)), TyAttr::default()),
+                TyTemplate::Map {
+                    key: Box::new(TyTemplate::TypeArgRef(3)),
+                    value: Box::new(TyTemplate::TypeArgRef(4)),
+                    attr: TyAttr::default(),
+                },
+                TyTemplate::Union(
+                    Box::new([TyTemplate::TypeArgRef(5), TyTemplate::TypeArgRef(6)]),
+                    TyAttr::default(),
+                ),
+                TyTemplate::interface(
+                    TypeName::local(crate::Name::new("Shown")),
+                    Box::new([TyTemplate::TypeArgRef(7)]),
+                    Box::new([(crate::Name::new("Item"), TyTemplate::TypeArgRef(8))]),
+                ),
+                TyTemplate::Function {
+                    params: Box::new([crate::TyTemplateFunctionParamTy {
+                        name: Some(crate::Name::new("a")),
+                        ty: TyTemplate::TypeArgRef(9),
+                        mode: crate::FunctionParamMode::Required,
+                    }]),
+                    ret: Box::new(TyTemplate::TypeArgRef(10)),
+                    throws: Box::new(TyTemplate::TypeArgRef(11)),
+                    attr: TyAttr::default(),
+                },
+                TyTemplate::Future(
+                    Box::new(TyTemplate::TypeArgRef(12)),
+                    Box::new(TyTemplate::TypeArgRef(13)),
+                    TyAttr::default(),
+                ),
+                TyTemplate::AssociatedTypeProjection {
+                    base: Box::new(TyTemplate::TypeArgRef(14)),
+                    interface: Box::new(iface),
+                    member: crate::Name::new("Item"),
+                    attr: TyAttr::default(),
+                },
+            ]),
+        );
+
+        let mut visited = 0usize;
+        visit_template(&every_shape, &mut |_| visited += 1);
+        let mut walked = 0usize;
+        walk_template(&mut every_shape.clone(), false, &mut |_, _| {
+            walked += 1;
+            true
+        });
+        assert_eq!(
+            visited, walked,
+            "the two traversals disagree about a template's children"
+        );
+
+        // And the slot walk built on the immutable one sees every leaf.
+        let mut slots = Vec::new();
+        every_shape.for_each_type_arg_ref(&mut |slot| slots.push(slot));
+        slots.sort_unstable();
+        assert_eq!(slots, (0..=14).collect::<Vec<u32>>());
     }
 
     #[test]
@@ -1000,13 +1207,13 @@ mod tests {
     }
 
     /// `(#0 as Cyclic).member` — a projection whose base is a realized frame ref.
-    fn cyclic_projection(member: crate::Name) -> TyTemplate {
+    fn cyclic_projection(member: crate::Name) -> TyTemplate<TypeName> {
         TyTemplate::AssociatedTypeProjection {
             base: Box::new(TyTemplate::TypeArgRef(0)),
             interface: Box::new(TyTemplateInterface {
                 name: TypeName::local(crate::Name::new("Cyclic")),
-                generics: vec![],
-                associated_types: vec![],
+                generics: Box::new([]),
+                associated_types: Box::new([]),
             }),
             member,
             attr: TyAttr::default(),
@@ -1017,26 +1224,44 @@ mod tests {
     /// again — a cyclic associated-type binding. Without the fuel backstop this
     /// recurses forever; with it, the chain exhausts its budget and fails.
     struct CyclicCtx;
-    impl TypeContext for CyclicCtx {
-        fn alias_def(&self, _: &QualifiedTypeName) -> Option<Ty> {
+    impl TypeContext<TypeName> for CyclicCtx {
+        /// A name-based context represents a declaration by its own name, so this
+        /// is the identity — no resolution step, and never `None`.
+        fn well_known(&self, head: crate::normalize::WellKnownHead) -> Option<TypeName> {
+            Some(<TypeName as crate::normalize::SpelledHead>::well_known(
+                head,
+            ))
+        }
+
+        fn alias_def(&self, _: &QualifiedTypeName) -> Option<Ty<TypeName>> {
             None
         }
-        fn implements_interface(&self, _: &Ty, _: &Interface) -> bool {
+        fn implements_interface(&self, _: &Ty<TypeName>, _: &Interface<TypeName>) -> bool {
             false
         }
-        fn type_var_bound(&self, _: &crate::ParamTy) -> Vec<Interface> {
+        fn type_var_bound(&self, _: &crate::ParamTy) -> Vec<Interface<TypeName>> {
             Vec::new()
         }
-        fn interface_requires(&self, _: &Interface, _: &Interface) -> bool {
+        fn interface_requires(&self, _: &Interface<TypeName>, _: &Interface<TypeName>) -> bool {
             false
         }
         fn enum_variants(&self, _: &QualifiedTypeName) -> Option<Vec<Name>> {
             None
         }
-        fn associated_type_bound(&self, _: &Interface, _: Name) -> Vec<Interface> {
+        fn associated_type_bound(
+            &self,
+            _: &Interface<TypeName>,
+            _: Name,
+        ) -> Vec<Interface<TypeName>> {
             Vec::new()
         }
-        fn project(&self, _: &Ty, _: &Interface, member: &Name, fuel: u32) -> ProjectionStep {
+        fn project(
+            &self,
+            _: &Ty<TypeName>,
+            _: &Interface<TypeName>,
+            member: &Name,
+            fuel: u32,
+        ) -> ProjectionStep<TypeName> {
             // The binding for `member` is the same projection, so realizing it
             // re-enters `project`. The threaded `fuel` bounds the cycle; an
             // exhausted budget surfaces as a substitution error (→ `Opaque`).
@@ -1077,13 +1302,13 @@ mod tests {
 
     #[test]
     fn concrete_array_is_fully_concrete() {
-        let tmpl = TyTemplate::list(TyTemplate::from(RealizedTy::int()));
+        let tmpl: TyTemplate<TypeName> = TyTemplate::list(TyTemplate::from(RealizedTy::int()));
         assert!(tmpl.is_fully_concrete());
     }
 
     #[test]
     fn union_of_concrete_is_fully_concrete() {
-        let tmpl = TyTemplate::union([
+        let tmpl: TyTemplate<TypeName> = TyTemplate::union([
             TyTemplate::from(RealizedTy::int()),
             TyTemplate::from(RealizedTy::string()),
         ]);
@@ -1096,7 +1321,7 @@ mod tests {
 
     #[test]
     fn union_containing_type_arg_ref_not_concrete() {
-        let tmpl = TyTemplate::union([
+        let tmpl: TyTemplate<TypeName> = TyTemplate::union([
             TyTemplate::from(RealizedTy::int()),
             TyTemplate::TypeArgRef(0),
         ]);
@@ -1107,25 +1332,28 @@ mod tests {
     fn class_with_type_arg_ref_substitution() {
         let tmpl = TyTemplate::class(
             TypeName::local(crate::Name::new("Container")),
-            vec![TyTemplate::TypeArgRef(0)],
+            Box::new([TyTemplate::TypeArgRef(0)]),
         );
         let user = RuntimeTy::user_class("User");
         assert_eq!(
             sub(&tmpl, &[r(user.clone())]),
-            RuntimeTy::class_with_args(TypeName::local(crate::Name::new("Container")), vec![user])
+            RuntimeTy::class_with_args(
+                TypeName::local(crate::Name::new("Container")),
+                Box::new([user])
+            )
         );
         assert!(!tmpl.is_fully_concrete());
     }
 
     #[test]
     fn class_no_args_is_fully_concrete() {
-        let tmpl = TyTemplate::class(TypeName::local(crate::Name::new("User")), vec![]);
+        let tmpl = TyTemplate::class(TypeName::local(crate::Name::new("User")), Box::new([]));
         assert!(tmpl.is_fully_concrete());
         assert_eq!(
             sub(&tmpl, &[]),
             RuntimeTy::Class(
                 TypeName::local(crate::Name::new("User")),
-                vec![],
+                Box::new([]),
                 crate::TyAttr::default()
             )
         );

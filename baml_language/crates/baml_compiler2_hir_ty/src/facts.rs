@@ -9,11 +9,11 @@
 //! all LIVE since I1/I2/I5, backed by the impl registry and the scope's
 //! param env.
 
-use baml_compiler2_hir::{contributions::Definition, package::PackageId};
+use baml_compiler2_hir::{contributions::Definition, package::lang_roots};
 use baml_type::{
-    Interface, Name, ParamTy, QualifiedTypeName, Ty,
-    interned::InterfaceRef,
-    normalize::{ProjectionStep, TypeContext},
+    DeclName, Interface, Name, ParamTy, Ty,
+    interned::InferInterface,
+    normalize::{ProjectionStep, TypeContext, WellKnownHead, well_known_decl},
 };
 
 pub struct Facts<'db> {
@@ -24,8 +24,8 @@ pub struct Facts<'db> {
     /// Canonicalization asks for the same recursive alias and enum facts many
     /// times inside one body. Cache the owned plain rows at the oracle boundary
     /// instead of repeatedly materializing them from interned compiler data.
-    alias_defs: std::cell::RefCell<rustc_hash::FxHashMap<QualifiedTypeName, Option<Ty>>>,
-    enum_variants: std::cell::RefCell<rustc_hash::FxHashMap<QualifiedTypeName, Option<Vec<Name>>>>,
+    alias_defs: std::cell::RefCell<rustc_hash::FxHashMap<DeclName, Option<Ty>>>,
+    enum_variants: std::cell::RefCell<rustc_hash::FxHashMap<DeclName, Option<Vec<Name>>>>,
 }
 
 impl<'db> Facts<'db> {
@@ -56,29 +56,32 @@ impl<'db> Facts<'db> {
         &self.bounds
     }
 
+    /// Where the language packages are installed.
+    pub fn lang(&self) -> baml_base::LangRoots {
+        lang_roots(self.db)
+    }
+
     /// Resolves a qualified name back to its definition through the owning
     /// package's canonical (ppir) items.
-    pub fn definition_of(&self, name: &QualifiedTypeName) -> Option<Definition<'db>> {
+    pub fn definition_of(&self, name: &DeclName) -> Option<Definition<'db>> {
         definition_of(self.db, name)
     }
 }
 
-fn definition_of<'db>(
+/// The source definition a qualified type name points at, if its package is
+/// served from source and declares the item.
+pub(crate) fn definition_of<'db>(
     db: &'db dyn baml_compiler2_ppir::Db,
-    name: &QualifiedTypeName,
+    name: &DeclName,
 ) -> Option<Definition<'db>> {
-    let package = PackageId::new(db, name.package().clone());
-    baml_compiler2_ppir::package_items(db, package).lookup_type(name.namespace(), name.name())
+    baml_compiler2_ppir::package_items(db, name.root()).lookup_type(name.namespace(), name.name())
 }
 
 /// Resolves an alias without retaining the result in a memo. One-shot
 /// fact-poor contexts use this directly; repeated scans use a cached context.
-pub(crate) fn uncached_alias_def(
-    db: &dyn baml_compiler2_ppir::Db,
-    name: &QualifiedTypeName,
-) -> Option<Ty> {
+pub(crate) fn uncached_alias_def(db: &dyn baml_compiler2_ppir::Db, name: &DeclName) -> Option<Ty> {
     if let Some(Definition::TypeAlias(alias)) = definition_of(db, name) {
-        return Some(crate::lower::type_alias_value(db, alias).to_plain());
+        return Some(crate::lower::type_alias_value(db, alias));
     }
     match crate::package_interface::mounted_type_row(db, name) {
         Some(crate::package_interface::ExportedType::TypeAlias { resolved, .. }) => {
@@ -92,7 +95,7 @@ pub(crate) fn uncached_alias_def(
 /// fact-poor contexts use this directly; repeated scans use a cached context.
 pub(crate) fn uncached_enum_variants(
     db: &dyn baml_compiler2_ppir::Db,
-    name: &QualifiedTypeName,
+    name: &DeclName,
 ) -> Option<Vec<Name>> {
     if let Some(Definition::Enum(enum_loc)) = definition_of(db, name) {
         return Some(
@@ -112,7 +115,11 @@ pub(crate) fn uncached_enum_variants(
 }
 
 impl TypeContext for Facts<'_> {
-    fn alias_def(&self, name: &QualifiedTypeName) -> Option<Ty> {
+    fn well_known(&self, head: WellKnownHead) -> Option<DeclName> {
+        well_known_decl(lang_roots(self.db), head)
+    }
+
+    fn alias_def(&self, name: &DeclName) -> Option<Ty> {
         if let Some(cached) = self.alias_defs.borrow().get(name) {
             return cached.clone();
         }
@@ -123,7 +130,7 @@ impl TypeContext for Facts<'_> {
         resolved
     }
 
-    fn enum_variants(&self, name: &QualifiedTypeName) -> Option<Vec<Name>> {
+    fn enum_variants(&self, name: &DeclName) -> Option<Vec<Name>> {
         if let Some(cached) = self.enum_variants.borrow().get(name) {
             return cached.clone();
         }
@@ -139,7 +146,7 @@ impl TypeContext for Facts<'_> {
 
     fn implements_interface(&self, concrete: &Ty, interface: &Interface) -> bool {
         let concrete = crate::impls::interned_ty(concrete);
-        let target = InterfaceRef::from_constraint(interface);
+        let target = InferInterface::from_constraint(interface);
         crate::impls::implements_interface(self.db, &concrete, &target)
     }
 
@@ -148,7 +155,7 @@ impl TypeContext for Facts<'_> {
     }
 
     fn interface_requires(&self, sub: &Interface, sup: &Interface) -> bool {
-        let sub = InterfaceRef::from_constraint(sub);
+        let sub = InferInterface::from_constraint(sub);
         // No better subject at this fact boundary: `Self` in `sub`'s
         // requires targets realizes as the existential itself (rustc's
         // `dyn A: B` elaboration).
@@ -156,7 +163,7 @@ impl TypeContext for Facts<'_> {
         crate::impls::interface_requires(
             self.db,
             &sub,
-            &InterfaceRef::from_constraint(sup),
+            &InferInterface::from_constraint(sup),
             &subject,
             8,
         )
@@ -167,31 +174,39 @@ impl TypeContext for Facts<'_> {
         // args with `Self` left symbolic (the trait's contract: the oracle
         // is a function of the reference, not an implementor) - rustc's
         // `explicit_item_bounds` instantiated.
-        let target = InterfaceRef::from_constraint(interface);
-        let symbolic_self = baml_type::interned::Ty::intern(baml_type::interned::TyKind::TypeVar(
+        let symbolic_self = Ty::TypeVar(
             ParamTy::new(0, Name::new("Self")),
             baml_type::TyAttr::default(),
-        ));
-        crate::impls::realized_assoc_bound(self.db, &target, &symbolic_self, &assoc)
-            .and_then(|bound| bound.to_plain().as_interface())
+        );
+        crate::impls::realized_assoc_bound_plain(self.db, interface, &symbolic_self, &assoc)
+            .and_then(|bound| bound.as_interface())
             .map(|bound| {
                 // Reduce sibling-pin projections the substitution left behind
-                // (`Producer<(Self as Parser<Item = int>).Item>` -> the pin):
-                // TIR re-lowered the bound with the realized pins in scope, so
-                // its callers always saw the collapsed form; hir_ty realizes a
-                // once-lowered form by substitution, so collapse here at the
-                // oracle boundary.
+                // (`Producer<(Self as Parser).Item>` with `Item` pinned on the
+                // qualifier -> the pin): TIR re-lowered the bound with the
+                // realized pins in scope, so its callers always saw the
+                // collapsed form; hir_ty realizes a once-lowered form by
+                // substitution, so collapse here at the oracle boundary — the
+                // qualifier's own pins first (the declared bound's projection
+                // rides the pinless declaration ref, which `project` cannot
+                // answer from a bare symbolic `Self`), then normalize.
+                let collapse = |ty: &baml_type::Ty| {
+                    let collapsed = crate::interfaces::collapse_self_assoc_projections(
+                        ty,
+                        &[&symbolic_self],
+                        Some(&interface.name),
+                        &interface.generics,
+                        &interface.associated_types,
+                    );
+                    baml_type::normalize::normalize(&collapsed, self)
+                };
                 Interface {
                     name: bound.name,
-                    generics: bound
-                        .generics
-                        .iter()
-                        .map(|arg| baml_type::normalize::normalize(arg, self))
-                        .collect(),
+                    generics: bound.generics.iter().map(collapse).collect(),
                     associated_types: bound
                         .associated_types
                         .iter()
-                        .map(|(name, ty)| (name.clone(), baml_type::normalize::normalize(ty, self)))
+                        .map(|(name, ty)| (name.clone(), collapse(ty)))
                         .collect(),
                 }
             })
@@ -218,7 +233,6 @@ impl TypeContext for Facts<'_> {
         // fuel across the reduction chain (the TIR-side precedent).
         _fuel: u32,
     ) -> ProjectionStep {
-        use baml_type::normalize::equivalent_interned;
         if let Some((_, pin)) = interface
             .associated_types
             .iter()
@@ -226,13 +240,13 @@ impl TypeContext for Facts<'_> {
         {
             return ProjectionStep::Reduced(pin.clone());
         }
-        let target = InterfaceRef::from_constraint(interface);
+        let target = InferInterface::from_constraint(interface);
         let eq = crate::impls::AliasOnlyFacts::new(self.db);
         if let Ty::TypeVar(param, _) = base {
             let base_interned = crate::impls::interned_ty(base);
             let mut candidates: Vec<baml_type::interned::Ty> = Vec::new();
             for bound in self.type_var_bound(param) {
-                let have = InterfaceRef::from_constraint(&bound);
+                let have = InferInterface::from_constraint(&bound);
                 for head in crate::impls::requires_heads(self.db, &have, &base_interned, 8) {
                     if !crate::impls::head_matches(&head, &target, &eq) {
                         continue;
@@ -247,10 +261,13 @@ impl TypeContext for Facts<'_> {
                         .iter()
                         .find(|(name, _)| name == member)
                         .map(|(_, ty)| ty.clone());
+                    // Identity dedup (hash-consing makes handle equality
+                    // structural identity): merging by relate-equivalence
+                    // let compatible-but-distinct candidates collapse into
+                    // a forced pick; distinct spellings now stay distinct
+                    // and disagree into Opaque, the ambiguity disposition.
                     if let Some(value) = value
-                        && !candidates
-                            .iter()
-                            .any(|have| equivalent_interned(have, &value, &eq))
+                        && !candidates.contains(&value)
                     {
                         candidates.push(value);
                     }
@@ -258,7 +275,11 @@ impl TypeContext for Facts<'_> {
             }
             // A rigid var reaches no impl, so the param env decides alone.
             return match candidates.as_slice() {
-                [only] => ProjectionStep::Reduced(only.to_plain()),
+                [only] => match baml_type::interned::ClosedTy::try_from(only) {
+                    Ok(only) => ProjectionStep::Reduced(only.to_plain()),
+                    // An open candidate cannot reduce — fail closed.
+                    Err(_) => ProjectionStep::Opaque,
+                },
                 _ => ProjectionStep::Opaque,
             };
         }
@@ -269,7 +290,7 @@ impl TypeContext for Facts<'_> {
             // An existential fixes an omitted defaulted member to the
             // default, with `Self` = the base itself (so a
             // Self-referencing default resolves against the base's pins).
-            let base_target = InterfaceRef::new(
+            let base_target = InferInterface::new(
                 name.clone(),
                 args.iter()
                     .map(crate::impls::interned_ty)
@@ -282,10 +303,51 @@ impl TypeContext for Facts<'_> {
             let Some(base_interned) = crate::impls::try_interned_ty(base) else {
                 return ProjectionStep::Opaque;
             };
+            // A pin inherited through the requires closure (`interface Child
+            // requires Parent<Item = int>`; the projection asks for
+            // `Parent.Item` on a `Child` existential): elaborate the base's
+            // closure and read the matching heads' pins — rustc's supertrait
+            // elaboration, after the base's own reference and before its
+            // declared default. Same discipline as the rigid-var branch: the
+            // closure keeps heads with different pins, so all matching heads
+            // vote — one agreed value reduces, a disagreement stays an
+            // opaque projection (never the declared default, which the
+            // conflicting requirements have both overridden).
+            let mut inherited = Vec::new();
+            for head in crate::impls::requires_heads(self.db, &base_target, &base_interned, 8) {
+                if !crate::impls::head_matches(&head, &target, &eq) {
+                    continue;
+                }
+                if let Some((_, ty)) = head
+                    .associated_types
+                    .iter()
+                    .find(|(name, _)| name == member)
+                    && !inherited
+                        .iter()
+                        .any(|have| crate::impls::eq_admitted(have, ty, &eq))
+                {
+                    inherited.push(ty.clone());
+                }
+            }
+            match inherited.as_slice() {
+                [only] => {
+                    // Fail closed, as the other answers here do: an open
+                    // candidate cannot reduce.
+                    return match baml_type::interned::ClosedTy::try_from(only) {
+                        Ok(only) => ProjectionStep::Reduced(only.to_plain()),
+                        Err(_) => ProjectionStep::Opaque,
+                    };
+                }
+                [] => {}
+                _ => return ProjectionStep::Opaque,
+            }
             if let Some(default) =
                 crate::impls::realized_assoc_default(self.db, &base_target, &base_interned, member)
             {
-                return ProjectionStep::Reduced(default.to_plain());
+                return match baml_type::interned::ClosedTy::try_from(&default) {
+                    Ok(default) => ProjectionStep::Reduced(default.to_plain()),
+                    Err(_) => ProjectionStep::Opaque,
+                };
             }
             return ProjectionStep::Opaque;
         }
@@ -296,7 +358,10 @@ impl TypeContext for Facts<'_> {
             && let Some(pin) =
                 crate::impls::resolved_pin(self.db, &resolved, &base_interned, member)
         {
-            return ProjectionStep::Reduced(pin.to_plain());
+            return match baml_type::interned::ClosedTy::try_from(&pin) {
+                Ok(pin) => ProjectionStep::Reduced(pin.to_plain()),
+                Err(_) => ProjectionStep::Opaque,
+            };
         }
         ProjectionStep::Opaque
     }

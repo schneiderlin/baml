@@ -49,9 +49,12 @@ function promptast_accessors.$init_test_ns_promptast_accessors_promptast_accesso
 }
 
 function promptast_accessors.pa_message_metadata_survives_assembly() -> string {
-    load_var ?1
+    load_var ?2
     make_cell
-    store_var ?1
+    store_var ?2
+    load_type string
+    sys_op ai.internal.build_output_format
+    store_var _6
     load_const "system"
     load_const "ephemeral"
     load_const "type"
@@ -63,7 +66,7 @@ function promptast_accessors.pa_message_metadata_survives_assembly() -> string {
     load_type unknown
     alloc_map 1
     init_instance ai.Role .name, .metadata
-    store_deref ?1
+    store_deref ?2
     load_var cached
     make_closure .<tagged(pa_message_metadata_survives_assembly, 0)>, 1
     call ai.prompt
@@ -82,57 +85,52 @@ function promptast_accessors.pa_message_metadata_survives_assembly() -> string {
     load_type string
     load_type unknown
     alloc_map 0
-    load_const null
-    load_const null
-    init_instance ai.Context .client, .tags, .output_format, ._output_format
+    load_var _6
+    init_instance ai.Context .client, .tags, ._output_format
     load_var render
     call_indirect
     call ai.Prompt.messages
     load_type baml.iter.Iterable<Error = never, Item = ai.PromptMessage>
     load_const "iter"
     virtual_call nargs=1 ntypeargs=0
-    store_var _16
+    store_var _18
 
   L0:
-    load_var _16
+    load_var _18
     load_type baml.iter.Iterator<Error = never, Item = ai.PromptMessage>
     load_const "next"
     virtual_call nargs=1 ntypeargs=0
-    store_var _17
-    load_var _17
+    store_var _19
+    load_var _19
     is_type baml.iter.Done
-    pop_jump_if_false L1
-    jump L2
-
-  L1:
-    load_var _17
+    pop_jump_if_true L1
+    load_var _19
     store_var m
     load_type string
     load_var m
     load_field .role
     call baml.String.from
-    store_var _24
-    load_type map<string, baml.json.json>
+    store_var _26
     load_var m
     load_field .metadata
     call baml.json.to_json
     call baml.json.stringify
-    store_var _28
+    store_var _30
     load_type string
-    load_var _28
+    load_var _30
     call baml.String.from
-    store_var _27
+    store_var _29
     load_type string
-    load_var2 3 7
+    load_var2 4 8
     load_const "="
     bin_op +
-    load_var _27
+    load_var _29
     bin_op +
     call baml.Array.push
     pop 1
     jump L0
 
-  L2:
+  L1:
     load_type string
     load_var out
     load_const ";"
@@ -141,9 +139,6 @@ function promptast_accessors.pa_message_metadata_survives_assembly() -> string {
 }
 
 function promptast_accessors.pa_message_parts_preserve_media() -> string {
-    load_var ?1
-    make_cell
-    store_var ?1
     load_var ?2
     make_cell
     store_var ?2
@@ -153,24 +148,30 @@ function promptast_accessors.pa_message_parts_preserve_media() -> string {
     load_var ?4
     make_cell
     store_var ?4
+    load_var ?5
+    make_cell
+    store_var ?5
+    load_type string
+    sys_op ai.internal.build_output_format
+    store_var _6
     load_const "https://example.com/photo.png"
     load_const "image/png"
     call baml.media.Image.from_url
-    store_deref ?1
+    store_deref ?2
     load_const "https://example.com/sound.mp3"
     load_const "audio/mpeg"
     call baml.media.Audio.from_url
-    store_deref ?2
+    store_deref ?3
     load_const "https://example.com/movie.mp4"
     load_const "video/mp4"
     call baml.media.Video.from_url
-    store_deref ?3
+    store_deref ?4
     load_const "https://example.com/document.pdf"
     load_const "application/pdf"
     call baml.media.Pdf.from_url
-    store_deref ?4
-    load_var2 1 2
-    load_var2 3 4
+    store_deref ?5
+    load_var2 2 3
+    load_var2 4 5
     make_closure .<tagged(pa_message_parts_preserve_media, 0)>, 4
     call ai.prompt
     store_var render
@@ -187,100 +188,92 @@ function promptast_accessors.pa_message_parts_preserve_media() -> string {
     load_type string
     load_type unknown
     alloc_map 0
-    load_const null
-    load_const null
-    init_instance ai.Context .client, .tags, .output_format, ._output_format
+    load_var _6
+    init_instance ai.Context .client, .tags, ._output_format
     load_var render
     call_indirect
     call ai.Prompt.messages
     load_const 0
     load_array_element
     load_field .parts
-    load_type baml.iter.Iterable<Error = never, Item = string | baml.media.Audio | baml.media.Image | baml.media.Pdf | baml.media.Video>
+    load_type baml.iter.Iterable<Error = never, Item = string | image | audio | video | pdf>
     load_const "iter"
     virtual_call nargs=1 ntypeargs=0
-    store_var _20
+    store_var _22
 
   L0:
-    load_var _20
-    load_type baml.iter.Iterator<Error = never, Item = string | baml.media.Audio | baml.media.Image | baml.media.Pdf | baml.media.Video>
+    load_var _22
+    load_type baml.iter.Iterator<Error = never, Item = string | image | audio | video | pdf>
     load_const "next"
     virtual_call nargs=1 ntypeargs=0
-    store_var _21
-    load_var _21
+    store_var _23
+    load_var _23
     is_type baml.iter.Done
-    pop_jump_if_false L1
-    jump L14
-
-  L1:
-    load_var _21
+    pop_jump_if_true L17
+    load_var _23
     store_var part
     load_var part
-    store_var _26
-    load_var _26
-    narrow_bind string, slot=10
-    pop_jump_if_false L2
-    jump L13
-
-  L2:
+    store_var _28
+    load_var _28
+    narrow_bind string, slot=11
+    pop_jump_if_true L16
     load_var part
-    store_var _33
-    load_var _33
-    narrow_bind baml.media.Image, slot=12
-    pop_jump_if_false L3
-    jump L11
-
-  L3:
+    store_var _35
+    load_var _35
+    narrow_bind image, slot=13
+    pop_jump_if_true L12
     load_var part
-    store_var _43
-    load_var _43
-    narrow_bind baml.media.Audio, slot=15
-    pop_jump_if_false L4
-    jump L9
-
-  L4:
+    store_var _44
+    load_var _44
+    narrow_bind audio, slot=16
+    pop_jump_if_true L8
     load_var part
     store_var _53
     load_var _53
-    narrow_bind baml.media.Video, slot=18
-    pop_jump_if_false L5
-    jump L7
-
-  L5:
+    narrow_bind video, slot=19
+    pop_jump_if_true L4
     load_var part
     call baml.media.Pdf.url
-    store_var_load_var _67
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L6
-    load_const ""
-    store_var _67
+    jump_if_not_null_or_pop L1
+    jump L2
 
-  L6:
+  L1:
+    store_var _66
+    jump L3
+
+  L2:
+    load_const ""
+    store_var _66
+
+  L3:
     load_type string
-    load_var _67
+    load_var _66
     call baml.String.from
-    store_var _65
+    store_var _64
     load_type string
     load_var kinds
     load_const "pdf="
-    load_var _65
+    load_var _64
     bin_op +
     call baml.Array.push
     pop 1
     jump L0
 
-  L7:
+  L4:
     load_var _53
     call baml.media.Video.url
-    store_var_load_var _58
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L8
+    jump_if_not_null_or_pop L5
+    jump L6
+
+  L5:
+    store_var _58
+    jump L7
+
+  L6:
     load_const ""
     store_var _58
 
-  L8:
+  L7:
     load_type string
     load_var _58
     call baml.String.from
@@ -294,69 +287,77 @@ function promptast_accessors.pa_message_parts_preserve_media() -> string {
     pop 1
     jump L0
 
-  L9:
-    load_var _43
+  L8:
+    load_var _44
     call baml.media.Audio.url
-    store_var_load_var _48
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L10
-    load_const ""
-    store_var _48
+    jump_if_not_null_or_pop L9
+    jump L10
+
+  L9:
+    store_var _49
+    jump L11
 
   L10:
+    load_const ""
+    store_var _49
+
+  L11:
     load_type string
-    load_var _48
+    load_var _49
     call baml.String.from
-    store_var _46
+    store_var _47
     load_type string
     load_var kinds
     load_const "audio="
-    load_var _46
+    load_var _47
     bin_op +
     call baml.Array.push
     pop 1
     jump L0
 
-  L11:
-    load_var _33
-    call baml.media.Image.url
-    store_var_load_var _38
-    load_const null
-    cmp_op ==
-    pop_jump_if_false L12
-    load_const ""
-    store_var _38
-
   L12:
+    load_var _35
+    call baml.media.Image.url
+    jump_if_not_null_or_pop L13
+    jump L14
+
+  L13:
+    store_var _40
+    jump L15
+
+  L14:
+    load_const ""
+    store_var _40
+
+  L15:
     load_type string
-    load_var _38
+    load_var _40
     call baml.String.from
-    store_var _36
+    store_var _38
     load_type string
     load_var kinds
     load_const "image="
-    load_var _36
+    load_var _38
     bin_op +
     call baml.Array.push
     pop 1
     jump L0
 
-  L13:
+  L16:
     load_type string
-    load_var _26
+    load_var _28
     call baml.String.from
-    store_var _29
+    store_var _31
     load_type string
     load_var kinds
     load_const "text="
-    load_var _29
+    load_var _31
     bin_op +
     call baml.Array.push
     pop 1
     jump L0
 
-  L14:
+  L17:
     load_type string
     load_var kinds
     load_const "|"
@@ -382,10 +383,7 @@ function promptast_accessors.paa_fold_messages_fn() -> string {
     store_var _5
     load_var _5
     is_type baml.iter.Done
-    pop_jump_if_false L1
-    jump L2
-
-  L1:
+    pop_jump_if_true L1
     load_var _5
     store_var m
     load_var2 1 4
@@ -401,12 +399,15 @@ function promptast_accessors.paa_fold_messages_fn() -> string {
     store_var out
     jump L0
 
-  L2:
+  L1:
     load_var out
     return
 }
 
 function promptast_accessors.paa_render_ast() -> ai.Prompt {
+    load_type string
+    sys_op ai.internal.build_output_format
+    store_var _6
     make_closure .<tagged(paa_render_ast, 0)>, 0
     call ai.prompt
     store_var render
@@ -421,15 +422,17 @@ function promptast_accessors.paa_render_ast() -> ai.Prompt {
     load_type string
     load_type unknown
     alloc_map 0
-    load_const null
-    load_const null
-    init_instance ai.Context .client, .tags, .output_format, ._output_format
+    load_var _6
+    init_instance ai.Context .client, .tags, ._output_format
     load_var render
     call_indirect
     return
 }
 
 function promptast_accessors.paa_single_message_fn() -> ai.PromptMessage[] {
+    load_type string
+    sys_op ai.internal.build_output_format
+    store_var _6
     make_closure .<tagged(paa_single_message_fn, 0)>, 0
     call ai.prompt
     store_var render
@@ -443,9 +446,8 @@ function promptast_accessors.paa_single_message_fn() -> ai.PromptMessage[] {
     load_type string
     load_type unknown
     alloc_map 0
-    load_const null
-    load_const null
-    init_instance ai.Context .client, .tags, .output_format, ._output_format
+    load_var _6
+    init_instance ai.Context .client, .tags, ._output_format
     load_var render
     call_indirect
     call ai.Prompt.messages

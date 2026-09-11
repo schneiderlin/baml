@@ -40,8 +40,11 @@
 use std::collections::HashSet;
 
 use baml_compiler_diagnostics::Severity;
-use baml_project::{ProjectDatabase, collect_diagnostics, testing::setup_test_db};
-use baml_tests::baml_test;
+use baml_db::ProjectDatabase;
+use baml_tests::{
+    baml_test,
+    stdlib_prefix::{check_user_files, setup_multi_file_db, setup_test_db},
+};
 use baml_type::Ty;
 use bex_engine::BexExternalValue;
 
@@ -56,19 +59,15 @@ fn collect_compile_errors(source: &str) -> Vec<String> {
 }
 
 fn collect_compile_errors_multi(files: &[(&str, &str)]) -> Vec<String> {
-    let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new("."));
-    for (path, source) in files {
-        db.add_file(*path, source);
-    }
+    let db = setup_multi_file_db(files);
     collect_compile_errors_from_db(&db)
 }
 
 fn collect_compile_errors_from_db(db: &ProjectDatabase) -> Vec<String> {
-    let all_files = db.get_source_files();
+    let all_files = db.workspace_files();
     let user_file_ids: HashSet<_> = all_files.iter().map(|f| f.file_id(db)).collect();
 
-    collect_diagnostics(db)
+    check_user_files(db)
         .into_iter()
         .filter(|d| matches!(d.severity, Severity::Error))
         .filter(|d| {
@@ -1267,8 +1266,8 @@ fn reflect_class_implements_interface() {
         }
 
         function main() -> bool {
-            let dog_t = type.of<Dog>()
-            let animal_t = type.of<Animal>()
+            let dog_t = reflect.Type.of<Dog>()
+            let animal_t = reflect.Type.of<Animal>()
             return dog_t.implements(animal_t)
         }
         "#,
@@ -1289,8 +1288,8 @@ fn reflect_implemented_by_is_reverse() {
         }
 
         function main() -> bool {
-            let dog_t = type.of<Dog>()
-            let animal_t = type.of<Animal>()
+            let dog_t = reflect.Type.of<Dog>()
+            let animal_t = reflect.Type.of<Animal>()
             return animal_t.implemented_by(dog_t)
         }
         "#,
@@ -1677,8 +1676,8 @@ fn self_param_method_rejects_mismatched_literal_arg() {
 fn generic_class_unannotated_self_is_parameterized() {
     // An unannotated `self` in a generic class must be typed `Wrap<T>`, not bare
     // `Wrap`, so it satisfies a parameterized expected type. Regression for the
-    // ParseCache builtin failure: the auto-derived `to_json` passed a bare
-    // `self` to `baml.json.to_string<ParseCache<TStream, TFinal>>`. Because the
+    // _ParseCache builtin failure: the auto-derived `to_json` passed a bare
+    // `self` to `baml.json.to_string`. Because the
     // callee's generic is differently named, the class params stay rigid and the
     // argument is *checked* (not deferred), which surfaced the bare `self`.
     assert_zero_compile_errors(
@@ -2118,7 +2117,7 @@ fn class_inherent_method_does_not_satisfy_interface_method() {
 async fn _unused_imports_compile() {
     // Silence dead-code warnings for `Ty` if all runtime tests above eventually
     // get gated/removed. Touching it here keeps the import live.
-    let _ = Ty::string();
+    let _ = Ty::<baml_type::TypeName>::string();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2450,7 +2449,7 @@ fn llm_function_can_return_interface_type() {
             client: GPT4o
             prompt: `
                 Identify the animal from the description: ${description}.
-                ${ctx.output_format}
+                ${ctx.output_format()}
             `
         }
         "##,
@@ -2486,7 +2485,7 @@ fn llm_function_returning_interface_enumerates_implementors_in_schema() {
             client: GPT4o
             prompt: `
                 Identify the animal: ${description}.
-                ${ctx.output_format}
+                ${ctx.output_format()}
             `
         }
         "##,
@@ -2700,7 +2699,7 @@ fn as_requires_interface_target() {
             return d.as<Dog>
         }
         "#,
-        "requires an interface target",
+        "expected an interface qualifier",
     );
 }
 
@@ -2805,7 +2804,7 @@ fn llm_function_with_interface_array_return_compiles() {
             client: GPT4o
             prompt: `
                 Identify every animal mentioned in ${description}.
-                ${ctx.output_format}
+                ${ctx.output_format()}
             `
         }
         "##,
@@ -2831,7 +2830,7 @@ fn llm_function_with_interface_in_union_return_compiles() {
             prompt: `
                 If ${description} clearly identifies an animal, return one.
                 Otherwise, paraphrase the description.
-                ${ctx.output_format}
+                ${ctx.output_format()}
             `
         }
         "##,
@@ -2860,7 +2859,7 @@ fn llm_function_takes_interface_typed_parameter_compiles() {
             client: GPT4o
             prompt: `
                 Describe the animal named ${a.name}.
-                ${ctx.output_format}
+                ${ctx.output_format()}
             `
         }
         "##,
@@ -3554,9 +3553,73 @@ fn inherited_generic_interface_field_construction_uses_parent_args() {
     );
 }
 
+// The success case — a generic interface's default method as a first-class
+// value through the qualifier — lives in the corpus
+// (baml_src/ns_item_projections, `generic_interface_default_method_reference`)
+// where it pins bytecode and asserts behavior. Only the diagnostic stays here.
 #[test]
-fn generic_interface_default_method_reference_compiles() {
-    assert_no_compile_errors(
+fn selfless_interface_method_is_not_reachable_through_a_value() {
+    // A static method is reached through the TYPE, never a value: the value
+    // carries nothing the call needs, and reading it as a receiver is what
+    // let it be smuggled into the first real parameter.
+    for spelling in ["g.build(1)", "let f = g.build"] {
+        let source = format!(
+            r#"
+        interface Buildable {{
+            function build(seed: int) -> Self
+        }}
+        class Gadget {{
+            implements Buildable {{
+                function build(seed: int) -> Self throws never {{ Gadget {{}} }}
+            }}
+        }}
+        function main() -> void {{
+            let g = Gadget {{}}
+            {spelling}
+        }}
+        "#
+        );
+        assert_compile_error_code(&source, "E0001");
+        // The receiver here is CONCRETE, so the member resolves through the
+        // impl rather than the interface slot. Pin the declaring interface in
+        // the message: reading it off only the symbolic declarer silently
+        // degrades this — the common case — to the un-named wording, which no
+        // code-only assertion would catch.
+        assert_compile_error_contains(&source, "on interface `Buildable`");
+    }
+}
+
+#[test]
+fn selfless_inherent_method_is_not_reachable_through_a_value() {
+    // The same rule for a class-INHERENT static, so the two kinds cannot
+    // diverge: `Widget.make(..)` is the only spelling.
+    for spelling in ["w.make(1)", "let f = w.make"] {
+        let source = format!(
+            r#"
+        class Widget {{
+            n: int
+            function make(seed: int) -> Widget throws never {{ Widget {{ n: seed }} }}
+        }}
+        function main() -> void {{
+            let w = Widget {{ n: 0 }}
+            {spelling}
+        }}
+        "#
+        );
+        assert_compile_error_code(&source, "E0001");
+        // The twin of the interface case: no interface declares `make`, so the
+        // message names the owning TYPE. Pinned so the un-named wording stays
+        // reserved for genuinely inherent statics.
+        assert_compile_error_contains(&source, "`TypeName.make(...)`");
+    }
+}
+
+#[test]
+fn bare_interface_method_value_requires_inferable_self() {
+    // With nothing pinning `Self` — the value is never called and carries no
+    // expectation — the reference is rejected (rustc's `let f = Ord::cmp;`
+    // E0790 shape) rather than emitted with an unresolved `Self` frame slot.
+    assert_compile_error_code(
         r#"
         interface Label<T> {
             function label(self) -> string throws never {
@@ -3570,6 +3633,7 @@ fn generic_interface_default_method_reference_compiles() {
             let label = Label.label
         }
         "#,
+        "E0002",
     );
 }
 
@@ -3866,8 +3930,8 @@ fn impl_generic_bound_must_be_an_interface() {
 fn implements_for_unknown_target_is_rejected() {
     // The user-facing top type `unknown` denotes "any type" — it has no single
     // concrete implementor for dispatch to recover, so it is rejected like a
-    // union/optional/interface (E0138). `unknown` lowers to `Ty::BuiltinUnknown`,
-    // which is distinct from the `Ty::Unknown` error-recovery sentinel, so the
+    // union/optional/interface (E0138). `unknown` lowers to `Ty::Unknown`,
+    // which is distinct from the `Ty::Error` error-recovery sentinel, so the
     // gate must list it explicitly.
     assert_compile_error_code(
         r#"
@@ -4606,7 +4670,7 @@ fn shared_var_across_interface_arg_and_for_type_overlaps_e0132() {
 
 // Two impls whose for-types fail to resolve must not additionally report an
 // overlap — the unresolved-type errors are the only relevant diagnostics. (An
-// unresolved for-type lowers to `Ty::Unknown`, which must never unify.)
+// unresolved for-type lowers to `Ty::Error`, which must never unify.)
 //
 // Asserts both halves so the test can't pass vacuously: the unresolved-type
 // diagnostics (one E0002 per bad target) must be present, and the overlap
@@ -6716,7 +6780,7 @@ fn wf3_out_of_body_primitive_field_bearing_is_e0126_pins() {
 }
 
 /// wf3: a bare generic interface in a type-argument position
-/// (`type.of<Box>()`, no type args) is an arity error like any other
+/// (`reflect.Type.of<Box>()`, no type args) is an arity error like any other
 /// type position — a generic head is written fully explicit or inferred
 /// wholesale, never a partial wildcard. (This replaces the old undocumented
 /// wildcard-matching behavior; a deliberate every-instantiation reflection
@@ -6735,8 +6799,8 @@ async fn wf3_bare_generic_interface_reflection_is_arity_error() {
             }
         }
         function main() -> bool {
-            let bare = type.of<Box>()
-            return bare.implemented_by(type.of<IntBox>())
+            let bare = reflect.Type.of<Box>()
+            return bare.implemented_by(reflect.Type.of<IntBox>())
         }
         "#,
         "type `Box` expects 1 type argument(s), got 0",
@@ -6778,6 +6842,148 @@ fn union_fuzz_class_only_union_method_is_rejected() {
         }
         "#,
         "no common interface that declares",
+    );
+}
+
+/// The MIXED shape is rejected the same way (ruling): one arm provides
+/// `speak` through an interface, the other only as an inherent method. The
+/// methods available on a union-typed receiver are the interface methods of
+/// interfaces implemented by ALL members, nothing else — inherent methods
+/// never participate, so no per-arm join rescues this.
+#[test]
+fn union_ruling_mixed_inherent_and_impl_arm_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+        interface HudSpeaker {
+            function speak(self) -> string throws never
+        }
+        class HudA {
+            implements HudSpeaker {
+                function speak(self) -> string { return "interface" }
+            }
+        }
+        class HudB {
+            function speak(self) -> string { return "inherent" }
+        }
+        function hud_speak(x: HudA | HudB) -> string {
+            return x.speak()
+        }
+        function main() -> string {
+            return hud_speak(HudB {})
+        }
+        "#,
+        "no common interface that declares",
+    );
+}
+
+/// A bounded blanket impl must not resolve a member on a receiver whose
+/// class args are still UNSOLVED by discharging its bound against an
+/// unrelated caller env param that happens to share the `(index, name)`
+/// `ParamTy` identity — the rigid-probe road probes at probe-unique
+/// `$probe$` vars, so the env can never discharge them and the bounded
+/// candidate declines (fail closed) like an argument-pinning impl.
+/// `int` does not implement the marker, so the call must be rejected on
+/// every road; the env-coincidence over-match would have ACCEPTED it with
+/// nothing re-checking after the arg solved.
+#[test]
+fn bounded_blanket_impl_does_not_discharge_against_unrelated_env_param() {
+    let errors = collect_compile_errors(
+        r#"
+        interface ProbeMarker {
+            function probe_tag(self) -> int throws never
+        }
+        class ProbeBin<T> {
+            value: T[]
+        }
+        implements<T extends ProbeMarker> ProbeMarker for ProbeBin<T> {
+            function probe_tag(self) -> int { return 1 }
+        }
+        function probe_caller<T extends ProbeMarker>(x: T) -> int {
+            let items = [];
+            let b = ProbeBin { value: items };
+            let n = b.probe_tag();
+            items.push(3);
+            return n
+        }
+        function main() -> int {
+            return 0
+        }
+        "#,
+    );
+    assert!(
+        !errors.is_empty(),
+        "a bounded blanket impl must not resolve on an unsolved receiver via \
+         env-identity coincidence"
+    );
+}
+
+/// An impl declaring a PHANTOM generic param — one bound by neither the
+/// `for` type nor the interface (`U` here; E0135 diagnoses the header
+/// without rejecting the block) — must fail CLOSED at method resolution:
+/// the candidate cannot realize its impl frame, so it is skipped and a call
+/// through it surfaces next to the header diagnostic. Previously the
+/// candidate was admitted and the unbound frame slot ICE'd inference
+/// ("matched impl left generic unbound").
+#[test]
+fn phantom_impl_param_call_is_diagnosed_not_ice() {
+    let errors = collect_compile_errors(
+        r#"
+        interface PhantomMarker {
+            function tag(self) -> int throws never
+        }
+        class PhantomBin<T> {
+            value: T
+        }
+        implements<T, U> PhantomMarker for PhantomBin<T> {
+            function tag(self) -> int { return 1 }
+        }
+        function use_marker(b: PhantomBin<int>) -> int {
+            return b.tag()
+        }
+        function main() -> int {
+            return use_marker(PhantomBin { value: 3 })
+        }
+        "#,
+    );
+    assert!(
+        errors.iter().any(|e| e.starts_with("[E0135]")),
+        "phantom impl param must be diagnosed at the impl header; got:\n  {}",
+        errors.join("\n  ")
+    );
+}
+
+/// The bare type-qualified impl tier cannot tell a method turbofish from
+/// hoisted receiver args (`PickBin.pick<int>()` vs `PickBin<int>.pick()` —
+/// one written channel), so it hands the written args to the CLASS frame and
+/// leaves the method's own generics to inference. When nothing solves them
+/// that must be a hard "cannot infer" diagnostic — previously the fresh var
+/// silently finalized to Error and ICE'd runtime lowering ("'Error' is not
+/// a valid 'RuntimeTy'"). The `(C<..> as I).m<..>()` qualified spelling
+/// remains the way to write the own args explicitly.
+#[test]
+fn stolen_turbofish_on_generic_class_impl_static_is_diagnosed_not_ice() {
+    let errors = collect_compile_errors(
+        r#"
+        interface Picker {
+            function pick<X>() -> int throws never
+        }
+        class PickBin<T> {
+            value: T
+            implements Picker {
+                function pick<X>() -> int { return 7 }
+            }
+        }
+        function main() -> int {
+            return PickBin.pick<int>()
+        }
+        "#,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("cannot infer type parameter")),
+        "unsolved own generic behind a consumed type-arg channel must be diagnosed; got:\n  {}",
+        errors.join("\n  ")
     );
 }
 
@@ -7397,7 +7603,7 @@ fn ordering_on_same_concrete_primitive_is_ok() {
 #[test]
 fn ordering_on_user_class_implementing_compare_is_ok() {
     // Guards against over-rejection: a class implementing `Compare` may be
-    // ordered. Only the required `lt` is defined — `<=`/`>`/`>=` reach the
+    // ordered. Only the required `cmp` is defined — `<`/`<=`/`>`/`>=` reach the
     // interface's defaults.
     assert_no_compile_errors(
         r#"
@@ -7407,7 +7613,9 @@ fn ordering_on_user_class_implementing_compare_is_ok() {
                 function eq(self, other: Self) -> bool throws never { self.cents == other.cents }
             }
             implements baml.ops.Compare {
-                function lt(self, other: Self) -> bool throws never { self.cents < other.cents }
+                function cmp(self, other: Self) -> baml.ops.Ordering throws never {
+                    self.cents.cmp(other.cents)
+                }
             }
         }
         function f(a: Money, b: Money) -> bool throws never {
@@ -7469,16 +7677,17 @@ fn ordering_on_interface_existential_type_argument_is_rejected() {
 
 #[test]
 fn compare_without_equals_is_rejected() {
-    // `Compare requires Equals`, and the inherited `le` default is literally
-    // `self.lt(other) || self.eq(other)`. If a type could implement `Compare`
-    // without `Equals`, `a <= b` would lower to a virtual call whose `eq` has no
-    // impl to resolve — an uncatchable internal error. E0125 is what prevents it.
+    // `Compare requires Equals`: a total order has to agree with an equality
+    // (`cmp` is `Ordering.Equal` exactly when `eq`), so a `Compare` impl without
+    // one has nothing to be consistent with. E0125 is what prevents it.
     assert_compile_error_code(
         r#"
         class NoEq {
             v: int
             implements baml.ops.Compare {
-                function lt(self, other: Self) -> bool throws never { self.v < other.v }
+                function cmp(self, other: Self) -> baml.ops.Ordering throws never {
+                    self.v.cmp(other.v)
+                }
             }
         }
         "#,

@@ -19,9 +19,8 @@ use std::{
 
 /// Run a baml-cli command and return the output (stdout, stderr, exit code).
 ///
-/// `BAML_HOME` is pointed at an empty directory inside the project (with the
-/// freshness auto-check disabled) so the passive skill check never reads the
-/// developer's real `~/.baml` state or touches the network.
+/// `BAML_HOME` and `HOME` are pointed inside the project so tests never read
+/// developer state.
 ///
 /// Tests here take the CLI from `common::baml_cli()`, never `ensure_built()`:
 /// nothing in this suite runs `baml pack`, and `ensure_built`'s in-test
@@ -40,11 +39,13 @@ fn run_baml_cli_with_env(built: &Path, dir: &Path, args: &[&str], env: &[(&str, 
         cmd.arg(arg);
     }
     cmd.current_dir(dir);
+    cmd.env("HOME", dir);
     cmd.env("BAML_CLI_ALLOW_DIRECT", "1");
     // Pin the human output preset: under a coding agent the inherited
     // CLAUDECODE/AI_AGENT/… environment flips `--output-preset auto` to
     // `agent`, which disables the progress lines some assertions read.
     cmd.env("BAML_OUTPUT_PRESET", "human");
+    cmd.env("BAML_AGENT_SKILL_CHECK", "off");
     cmd.env("BAML_HOME", &home);
     // Tests are quiet unless they explicitly exercise the inherited log level.
     cmd.env_remove("BAML_LOG");
@@ -290,6 +291,74 @@ fn generate_valid_project_returns_zero_exit_code() {
 }
 
 #[test]
+fn generate_reports_identifier_renames_in_normal_verbose_and_quiet_modes() {
+    let built = &common::baml_cli();
+    let tmp = tempfile::tempdir().unwrap();
+    create_project(
+        tmp.path(),
+        "enum Choice {\n  None\n}\n\nfunction pick() -> Choice { Choice.None }\n",
+    );
+    std::fs::write(
+        tmp.path().join("baml.toml"),
+        "[package]\nname = \"test-project\"\n\n\
+         [generator.py]\n\
+         output_type = \"python/pydantic\"\n\
+         output_dir = \"generated\"\n\
+         naming_convention = \"preserve-case\"\n",
+    )
+    .unwrap();
+
+    let normal = run_baml_cli(built, tmp.path(), &["generate", "--from", "."]);
+    assert!(
+        normal.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&normal.stderr)
+    );
+    let normal_stderr = String::from_utf8_lossy(&normal.stderr);
+    assert!(
+        normal_stderr.contains("1 identifier rename →"),
+        "{normal_stderr}"
+    );
+    assert!(
+        !normal_stderr.contains("Renamed enum variant"),
+        "{normal_stderr}"
+    );
+
+    let verbose = run_baml_cli(built, tmp.path(), &["generate", "--from", ".", "--verbose"]);
+    assert!(
+        verbose.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&verbose.stderr)
+    );
+    let verbose_stderr = String::from_utf8_lossy(&verbose.stderr);
+    assert!(
+        verbose_stderr.contains("1 identifier rename →"),
+        "{verbose_stderr}"
+    );
+    assert!(
+        verbose_stderr
+            .contains("Renamed enum variant `user.Choice.None`: `None` → `None_` (Python keyword)"),
+        "{verbose_stderr}"
+    );
+
+    let quiet = run_baml_cli(built, tmp.path(), &["generate", "--from", ".", "--quiet"]);
+    assert!(
+        quiet.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains("identifier rename"),
+        "{quiet_stderr}"
+    );
+    assert!(
+        !quiet_stderr.contains("Renamed enum variant"),
+        "{quiet_stderr}"
+    );
+}
+
+#[test]
 fn generate_rust_language_naming_convention_returns_diagnostic() {
     let built = &common::baml_cli();
     let tmp = tempfile::tempdir().unwrap();
@@ -329,6 +398,44 @@ fn generate_rust_language_naming_convention_returns_diagnostic() {
         "stderr: {stderr}"
     );
     assert!(!stderr.contains("panicked at"), "stderr: {stderr}");
+}
+
+#[test]
+fn generate_rust_default_output_stays_inside_project() {
+    let built = &common::baml_cli();
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    create_project(
+        &project,
+        "function echo(value: string) -> string { value }\n",
+    );
+    std::fs::write(
+        project.join("baml.toml"),
+        "[package]\nname = \"test-project\"\n\n\
+         [generator.rust]\n\
+         output_type = \"rust\"\n\
+         naming_convention = \"preserve-case\"\n",
+    )
+    .unwrap();
+
+    let output = run_baml_cli(built, &project, &["generate", "--from", "."]);
+
+    assert!(
+        output.status.success(),
+        "Rust generation failed: {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project.join("baml_sdk/Cargo.toml").is_file(),
+        "the default Rust SDK should be generated inside the project"
+    );
+    assert!(
+        !tmp.path().join("baml_sdk").exists(),
+        "generation must not create a sibling directory outside the project"
+    );
 }
 
 #[test]
@@ -482,7 +589,11 @@ fn run_valid_project_outputs_only_program_output() {
     // exactly the program's own output.
     let skill_dir = tmp.path().join(".agents/skills/baml-core");
     std::fs::create_dir_all(&skill_dir).unwrap();
-    std::fs::write(skill_dir.join("SKILL.md"), "---\nname: baml-core\n---\n").unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        common::installed_skill_content(),
+    )
+    .unwrap();
 
     let output = run_baml_cli(built, tmp.path(), &["run", "answer", "--from", "."]);
 
@@ -524,7 +635,7 @@ class LoggedConversion {
     value string
 
     implements baml.FromJson {
-        function from_json(j: baml.json.json) -> Self throws baml.json.JsonDecodeError {
+        function from_json(j: baml.json.json) -> Self throws baml.json.DecodeError {
             log.warn("from-json-detail");
             LoggedConversion {
                 value: baml.json.from_json<string>(baml.json.field(j, "value"))
@@ -533,7 +644,7 @@ class LoggedConversion {
     }
 
     implements baml.ToJson {
-        function to_json(self) -> baml.json.json throws baml.json.JsonSerializationError {
+        function to_json(self) -> baml.json.json throws baml.json.SerializationError {
             log.error("to-json-detail");
             self.value
         }
@@ -692,10 +803,11 @@ class BrokenConversion {
     value int
 
     implements baml.ToJson {
-        function to_json(self) -> baml.json.json throws baml.json.JsonSerializationError {
-            throw baml.json.JsonSerializationError {
+        function to_json(self) -> baml.json.json throws baml.json.SerializationError {
+            throw baml.json.SerializationError {
                 message: "serialize-boom",
-                path: ""
+                path: "",
+                reason: "serialize-boom"
             }
         }
     }
@@ -717,8 +829,8 @@ class BrokenConversion {
         ],
     );
 
-    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("failed to serialize output"), "{stderr}");
     assert!(stderr.contains("serialize-boom"), "{stderr}");
 }
@@ -1105,6 +1217,7 @@ test "streams" {
         // Pin the human preset so inherited agent env (CLAUDECODE/AI_AGENT/…)
         // cannot flip `--output-preset auto` to `agent` and hide progress lines.
         .env("BAML_OUTPUT_PRESET", "human")
+        .env("BAML_AGENT_SKILL_CHECK", "off")
         .env("BAML_HOME", &home)
         .env("BAML_CACHE_DIR", common::shared_cache_dir())
         .stdout(Stdio::piped())
@@ -1616,75 +1729,11 @@ testset "suite" with FirstOnlyWithoutNames {
 }
 
 // ============================================================================
-// Tests for project-less introspection (`baml describe` / `baml fmt` without
-// a `baml.toml`). The most expensive thing an agent can
-// do is fail fast and burn a turn, so these read-only commands fall back to
-// a stdlib-only "default state" instead of erroring.
+// Tests for project-less introspection (`baml fmt` without a `baml.toml`).
+// The most expensive thing an agent can do is fail fast and burn a turn, so
+// these read-only commands fall back to a no-op / stdlib-only "default state"
+// instead of erroring.
 // ============================================================================
-
-/// `baml describe baml.String` from a directory with no `baml.toml` must
-/// succeed against the stdlib — the headline use case for the default
-/// state. Regression for the old "doesn't look like a BAML project" bail.
-#[test]
-fn describe_stdlib_without_baml_toml_succeeds() {
-    let built = &common::baml_cli();
-    let tmp = tempfile::tempdir().unwrap();
-
-    let output = run_baml_cli(
-        built,
-        tmp.path(),
-        &["describe", "baml.String", "--from", "."],
-    );
-
-    assert!(
-        output.status.success(),
-        "Expected exit 0 describing stdlib with no baml.toml, got: {:?}\nstdout: {}\nstderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("String"),
-        "Expected stdout to describe `String`, got:\n{stdout}",
-    );
-    // The old failure message must not appear.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("doesn't look like a BAML project"),
-        "Default state should not emit the no-project error, got stderr:\n{stderr}",
-    );
-}
-
-/// `baml describe` walks up to an ancestor `baml.toml`, so introspection
-/// from a project subdirectory resolves a user-defined symbol.
-#[test]
-fn describe_walks_up_to_ancestor_project() {
-    let built = &common::baml_cli();
-    let tmp = tempfile::tempdir().unwrap();
-    create_project(
-        tmp.path(),
-        "function greet(name: string) -> string {\n  \"Hello, \" + name\n}\n",
-    );
-    let nested = tmp.path().join("baml_src").join("nested");
-    std::fs::create_dir_all(&nested).unwrap();
-
-    // Invoke from the nested subdir (default --from is ".").
-    let output = run_baml_cli(built, &nested, &["describe", "greet"]);
-
-    assert!(
-        output.status.success(),
-        "Expected exit 0 resolving a user symbol from a subdir, got: {:?}\nstdout: {}\nstderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("greet"),
-        "Expected stdout to describe `greet`, got:\n{stdout}",
-    );
-}
 
 /// `baml fmt` with no explicit source and no discoverable project is a no-op
 /// success. An explicit `--from` is different: it opts into that source tree.
@@ -1699,29 +1748,6 @@ fn fmt_without_from_or_project_is_noop_success() {
         output.status.success(),
         "Expected exit 0 for `baml fmt` with no project, got: {:?}\nstderr: {}",
         output.status.code(),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-/// `baml describe` walks up to an ancestor with a **malformed** `baml.toml`
-/// (no `[package].name`) and still succeeds — introspection tolerates a bad
-/// manifest, unlike the strict build/execute path.
-#[test]
-fn describe_walks_up_to_ancestor_with_invalid_manifest() {
-    let built = &common::baml_cli();
-    let tmp = tempfile::tempdir().unwrap();
-    // Malformed manifest: no [package] table.
-    std::fs::write(tmp.path().join("baml.toml"), "# no package table\n").unwrap();
-    let nested = tmp.path().join("sub");
-    std::fs::create_dir_all(&nested).unwrap();
-
-    let output = run_baml_cli(built, &nested, &["describe", "baml.String"]);
-
-    assert!(
-        output.status.success(),
-        "Expected exit 0 describing stdlib above an invalid manifest, got: {:?}\nstdout: {}\nstderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 }
@@ -1818,59 +1844,6 @@ fn run_execute_function_without_baml_toml_succeeds() {
     assert!(
         stdout.contains("42"),
         "Expected the result `42`, got:\n{stdout}"
-    );
-}
-
-/// `baml describe --from` uses the same manifest-less `baml_src/` project
-/// marker as `run`; agents should be able to inspect symbols in scratch
-/// projects created without a `baml.toml`.
-#[test]
-fn describe_from_baml_src_only_project_finds_user_symbols() {
-    let built = &common::baml_cli();
-    let tmp = tempfile::tempdir().unwrap();
-    let src = tmp.path().join("baml_src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("main.baml"),
-        r#"
-interface Named {
-  function label(self) -> string
-}
-
-class Ticket {
-  id: string
-
-  implements Named {
-    function label(self) -> string {
-      return self.id
-    }
-  }
-}
-"#,
-    )
-    .unwrap();
-
-    let output = run_baml_cli(
-        built,
-        tmp.path(),
-        &["describe", "Ticket", "--from", ".", "--budget", "120"],
-    );
-
-    assert!(
-        output.status.success(),
-        "Expected describe to find Ticket in a baml_src-only project, got: {:?}\nstdout: {}\nstderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("class Ticket"),
-        "Expected class description, got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("implements Named"),
-        "Expected implements summary, got:\n{stdout}"
     );
 }
 
@@ -2011,7 +1984,6 @@ function read_item<T extends BoxLike>(box: T) -> T.Item {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for expected in [
         "get_public_key(account: AccountRecord) -> string",
-        "UserRepository.Repository.find(self: UserRepository) -> UserRecord",
         "GenericBox.get<T>(self: GenericBox<T>) -> T",
         // The projection renders fully determined — lowering resolves the
         // declaring interface, so `T.Item` prints as its canonical
@@ -2023,6 +1995,15 @@ function read_item<T extends BoxLike>(box: T) -> T.Item {
             "Expected `baml run --list` output to contain `{expected}`, got:\n{stdout}"
         );
     }
+    // Interface-machinery bodies (impl-block methods, interface defaults) are
+    // anonymous at runtime: they are not runnable entries, so the listing must
+    // not offer them. Asserted on the bare `find(` fragment so the pin holds
+    // whatever display spelling a leaked body would carry (`find` names
+    // nothing else in this fixture).
+    assert!(
+        !stdout.contains("find("),
+        "Impl-block method bodies must not be listed as runnable entries:\n{stdout}"
+    );
     assert!(
         !stdout.contains("read_item(box: unknown) -> unknown"),
         "Generic associated projection signatures must not be erased in list output:\n{stdout}"
@@ -2217,6 +2198,7 @@ fn run_file_script_mode_passes_args_after_separator_as_argv() {
     let output = Command::new(&script)
         .args(["--", "alpha", "--beta", "gamma"])
         .current_dir(tmp.path())
+        .env("BAML_AGENT_SKILL_CHECK", "off")
         .env("BAML_CACHE_DIR", common::shared_cache_dir())
         .output()
         .expect("execute the shebang script directly");
@@ -2270,6 +2252,7 @@ fn shebang_can_name_a_specific_function() {
 
     let output = Command::new(&script)
         .current_dir(tmp.path())
+        .env("BAML_AGENT_SKILL_CHECK", "off")
         .env("BAML_CACHE_DIR", common::shared_cache_dir())
         .output()
         .expect("execute the shebang script directly");
@@ -2323,6 +2306,7 @@ fn executable_baml_script_runs_via_kernel_shebang() {
     // takes none. The kernel drives `#! … run --file <this script>`.
     let output = Command::new(&script)
         .current_dir(tmp.path())
+        .env("BAML_AGENT_SKILL_CHECK", "off")
         .env("BAML_CACHE_DIR", common::shared_cache_dir())
         .output()
         .expect("execute the shebang script directly");
@@ -2371,45 +2355,4 @@ fn generate_without_baml_toml_reports_no_generators() {
         stderr.contains("[generator"),
         "Expected a missing-generator hint, got: {stderr}",
     );
-}
-
-/// `describe X --json` emits the typed drill-in document whose ids match
-/// `--export` — the contract the stdlib-matrix tooling keys on.
-#[test]
-fn describe_json_drill_carries_surface_ids() {
-    let built = &common::baml_cli();
-    let tmp = tempfile::tempdir().unwrap();
-    common::write_project(
-        tmp.path(),
-        "function greet(name: string) -> string { name }\n",
-    );
-
-    let output = run_baml_cli(
-        built,
-        tmp.path(),
-        &["describe", "baml.time.Duration", "--json"],
-    );
-    assert!(output.status.success(), "{output:?}");
-    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(doc["id"], "T:baml.time.Duration");
-    assert_eq!(doc["kind"], "class");
-    assert!(
-        doc["methods"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["id"] == "M:baml.time.Duration.abs"),
-        "method ids present"
-    );
-
-    let output = run_baml_cli(
-        built,
-        tmp.path(),
-        &["describe", "baml.time.Duration.abs", "--json"],
-    );
-    assert!(output.status.success(), "{output:?}");
-    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(doc["member_kind"], "method");
-    assert_eq!(doc["id"], "M:baml.time.Duration.abs");
-    assert_eq!(doc["signature"]["returns"]["display"], "baml.time.Duration");
 }

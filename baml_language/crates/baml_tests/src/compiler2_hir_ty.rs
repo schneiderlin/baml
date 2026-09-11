@@ -5,10 +5,12 @@ mod tests {
     use baml_compiler2_hir_ty::lower::{
         FunctionSignature, class_field_types, function_signature, type_alias_value,
     };
-    use baml_project::ProjectDatabase;
+    use baml_db::ProjectDatabase;
 
-    fn render(ty: &baml_type::interned::Ty) -> String {
-        ty.to_plain().render_canonical()
+    use crate::engine::TestDbExt;
+
+    fn render(db: &ProjectDatabase, ty: &baml_type::Ty) -> String {
+        ty.render_with(&baml_compiler2_hir_ty::render::Viewpoint::canonical(db))
     }
 
     fn signature_of(
@@ -28,14 +30,14 @@ mod tests {
         function_signature(db, function).clone()
     }
 
-    fn param_renders(signature: &FunctionSignature) -> Vec<String> {
-        signature.params.iter().map(|p| render(&p.ty)).collect()
+    fn param_renders(db: &ProjectDatabase, signature: &FunctionSignature) -> Vec<String> {
+        signature.params.iter().map(|p| render(db, &p.ty)).collect()
     }
 
     #[test]
     fn lowers_signature_types_with_name_resolution() {
         let mut db = crate::compiler2_tir::support::make_db();
-        let file = db.add_file(
+        let file = db.file(
             "test.baml",
             r#"
 class Box<T> { v T }
@@ -58,7 +60,7 @@ function f(
         );
         let signature = signature_of(&db, file, "f");
         assert_eq!(
-            param_renders(&signature),
+            param_renders(&db, &signature),
             [
                 "int",
                 "user.Box<int>",
@@ -71,14 +73,14 @@ function f(
                 "user.Box<!error>",
             ]
         );
-        assert_eq!(render(&signature.ret), "string");
-        assert_eq!(render(&signature.throws), "never");
+        assert_eq!(render(&db, &signature.ret), "string");
+        assert_eq!(render(&db, &signature.throws), "never");
     }
 
     #[test]
     fn interface_existentials_and_signature_holes() {
         let mut db = crate::compiler2_tir::support::make_db();
-        let file = db.add_file(
+        let file = db.file(
             "test.baml",
             r#"
 interface Show<T> {
@@ -97,7 +99,7 @@ function f(
         );
         let signature = signature_of(&db, file, "f");
         assert_eq!(
-            param_renders(&signature),
+            param_renders(&db, &signature),
             [
                 // An existential denotes one complete instantiation: the
                 // unpinned, defaultless `Out` is diagnosed (E0191-analog)
@@ -114,7 +116,7 @@ function f(
     #[test]
     fn generic_frames_cover_functions_and_methods() {
         let mut db = crate::compiler2_tir::support::make_db();
-        let file = db.add_file(
+        let file = db.file(
             "test.baml",
             r#"
 class Holder<T> {
@@ -130,15 +132,15 @@ function pair<T>(x: T, y: T[]) -> T throws never {
 "#,
         );
         let pair = signature_of(&db, file, "pair");
-        assert_eq!(param_renders(&pair), ["T", "T[]"]);
-        assert_eq!(render(&pair.ret), "T");
+        assert_eq!(param_renders(&db, &pair), ["T", "T[]"]);
+        assert_eq!(render(&db, &pair.ret), "T");
 
         // Method frames prepend the class generics: T = 0, U = 1. The
         // `self` receiver is the owner class applied to its own params
         // (S11 `class_self_ty`).
         let method = signature_of(&db, file, "m");
-        assert_eq!(param_renders(&method), ["user.Holder<T>", "T", "U"]);
-        assert_eq!(render(&method.ret), "T");
+        assert_eq!(param_renders(&db, &method), ["user.Holder<T>", "T", "U"]);
+        assert_eq!(render(&db, &method.ret), "T");
         assert_eq!(
             method
                 .generic_params
@@ -152,8 +154,8 @@ function pair<T>(x: T, y: T[]) -> T throws never {
     #[test]
     fn resolves_across_namespaces_and_packages() {
         let mut db = crate::compiler2_tir::support::make_db();
-        db.add_file("ns_util/util.baml", "class Helper {}");
-        let file = db.add_file(
+        db.file("ns_util/util.baml", "class Helper {}");
+        let file = db.file(
             "main.baml",
             r#"
 function f(
@@ -166,23 +168,23 @@ function f(
         );
         let signature = signature_of(&db, file, "f");
         assert_eq!(
-            param_renders(&signature),
-            ["user.util.Helper", "Future<int, never>"]
+            param_renders(&db, &signature),
+            ["user.util.Helper", "baml.future.Future<int, never>"]
         );
 
         // Inside the namespace, the bare name resolves namespace-relative.
-        let util_file = db.add_file(
+        let util_file = db.file(
             "ns_util/use.baml",
             "function g(h: Helper) -> int throws never { 1 }",
         );
         let inside = signature_of(&db, util_file, "g");
-        assert_eq!(param_renders(&inside), ["user.util.Helper"]);
+        assert_eq!(param_renders(&db, &inside), ["user.util.Helper"]);
     }
 
     #[test]
     fn class_fields_and_alias_values_lower() {
         let mut db = crate::compiler2_tir::support::make_db();
-        let file = db.add_file(
+        let file = db.file(
             "test.baml",
             r#"
 class Pair<L, R> {
@@ -204,7 +206,7 @@ type Loop = Loop[]
             .expect("Pair exists");
         let fields: Vec<(String, String)> = class_field_types(&db, class)
             .iter()
-            .map(|(name, ty)| (name.to_string(), render(ty)))
+            .map(|(name, ty)| (name.to_string(), render(&db, ty)))
             .collect();
         assert_eq!(
             fields,
@@ -227,6 +229,6 @@ type Loop = Loop[]
                     == "Loop"
             })
             .expect("alias exists");
-        assert_eq!(render(&type_alias_value(&db, alias)), "user.Loop[]");
+        assert_eq!(render(&db, &type_alias_value(&db, alias)), "user.Loop[]");
     }
 }

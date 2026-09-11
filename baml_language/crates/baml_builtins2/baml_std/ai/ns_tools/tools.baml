@@ -11,22 +11,26 @@ class Tool {
     name: string,
     description: string,
     input_schema: map<string, unknown>, // JSON Schema for the arguments object
-    handler: baml.AnyFunction?, // signature-derived dispatch; null for raw tools
+    handler: reflect.AnyFunction?, // signature-derived dispatch; null for raw tools
     // Dynamic-source dispatch: the handler receives the validated-by-schema
     // argument map as one value. Set by raw_tool() when the schema does not
     // derive from a BAML signature (MCP servers, OpenAPI specs).
     raw_handler: ((map<string, unknown>) -> string throws unknown)?,
     on_error: ErrorMode?, // null: inherit the run's tool_errors mode
 
-    // The total boundary around one call: validate, dispatch through
-    // reflection, serialize. A throw here is the tool's failure, not the
-    // run's. The reflection boundary widens exactly representable integral
-    // arguments into float parameters (see reflect.call_any).
+    /// The total boundary around one call. A throw here is the tool's
+    /// failure, not the run's.
+    ///
+    /// A raw tool (`raw_tool`) hands the argument map straight to its
+    /// `raw_handler` and returns that string as-is. A schema-derived tool
+    /// validates, dispatches through reflection, and JSON-serializes the
+    /// result; that reflection boundary widens exactly representable integral
+    /// arguments into float parameters (see reflect.call_any).
     function call(self, args: map<string, unknown>) -> string {
         if let rh: (map<string, unknown>) -> string throws unknown = self.raw_handler {
             return rh(args);
         }
-        if let h: baml.AnyFunction = self.handler {
+        if let h: reflect.AnyFunction = self.handler {
             let value = reflect.call_any(h, args) catch (e) {
                 let bad: reflect.InvalidArgumentError => {
                     throw baml.errors.InvalidArgument { message: `invalid arguments for ${self.name}: ${bad.to_string()}` }
@@ -39,9 +43,9 @@ class Tool {
     }
 }
 
-// The explicit constructor. `tools: [f]` normalizes through this.
+/// The explicit constructor. `tools: [f]` normalizes through this.
 function tool(
-    handler: baml.AnyFunction,
+    handler: reflect.AnyFunction,
     name: string? = null,
     description: string? = null,
     on_error: ErrorMode? = null,
@@ -65,10 +69,10 @@ function tool(
     }
 }
 
-// The constructor for tools whose schema does not derive from a BAML
-// signature: the caller supplies the JSON Schema and a handler over the raw
-// argument map. This is how dynamic tool sources (MCP servers) become
-// ordinary tools.
+/// The constructor for tools whose schema does not derive from a BAML
+/// signature: the caller supplies the JSON Schema and a handler over the raw
+/// argument map. This is how dynamic tool sources (MCP servers) become
+/// ordinary tools.
 function raw_tool(
     name: string,
     description: string,
@@ -92,7 +96,7 @@ function raw_tool(
 class Toolbox {
     entries: Tool[],
 
-    // Rejects duplicate names, so a toolbox is well-formed on construction.
+    /// Rejects duplicate names, so a toolbox is well-formed on construction.
     function new(tools: Tool[]) -> Toolbox {
         let names: string[] = [];
         for (let t in tools) {

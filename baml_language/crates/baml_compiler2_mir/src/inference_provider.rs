@@ -71,6 +71,14 @@ pub(crate) enum MemberResolution<'db> {
     InterfaceConcreteMethod {
         impl_loc: ImplLoc<'db>,
         func_loc: FunctionLoc<'db>,
+        /// The callee's OWNER frame, carried from resolution: the impl's
+        /// generic bindings (declaration order) for an override,
+        /// `[Self = receiver, iface args..]` for an adopted default. The
+        /// call site emits these ahead of the method's own type args per the
+        /// `[owner ++ own]` frame invariant — never re-derived by name.
+        frame_type_args: Vec<Tir2Ty>,
+        /// `true` when `func_loc` is the interface's default body.
+        from_interface_default: bool,
     },
     /// A VIRTUAL interface-field access through the realized declaring view.
     InterfaceVirtualField {
@@ -84,15 +92,15 @@ pub(crate) enum MemberResolution<'db> {
     /// no HIR location.
     External(std::sync::Arc<ExternalCallable>),
     ExternalField {
-        class: baml_type::QualifiedTypeName,
+        class: baml_type::DeclName,
         field: Name,
     },
     ExternalVariant {
-        enum_name: baml_type::QualifiedTypeName,
+        enum_name: baml_type::DeclName,
         variant: Name,
     },
     ExternalInterfaceVirtualField {
-        interface_name: baml_type::QualifiedTypeName,
+        interface_name: baml_type::DeclName,
         interface: Tir2Ty,
         field_index: u32,
         field: Name,
@@ -103,48 +111,42 @@ pub(crate) enum MemberResolution<'db> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct CallPlan {
     pub(crate) bindings: Vec<ParamBinding>,
+    /// The value slots the call was checked against, without a bound receiver.
+    pub(crate) argument_layout: baml_type::CallLayout,
     /// Full solved owner + callable generic frame, in declared order.
     pub(crate) type_args: Vec<Tir2Ty>,
     pub(crate) own_offset: usize,
     pub(crate) explicit: bool,
     pub(crate) slots: Vec<CallTypeArgPlan>,
-    pub(crate) deferred_checks: Vec<RuntimeCheck>,
     pub(crate) target: Option<ExternalCallTarget>,
     /// Hidden call metadata which is not part of the callee's parameter list.
     pub(crate) side_channels: CallSideChannels,
 }
 
+/// One written generic slot as MIR consumes it. Only the WRITTEN shape
+/// survives the conversion: inference's solved `ty` decides the call's
+/// instantiation before MIR runs, and lowering emits from `emission_ty`
+/// alone.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum CallTypeArgPlan {
-    Static {
-        ty: Tir2Ty,
-        emission_ty: Tir2Ty,
-    },
-    Runtime {
-        operand: AstExprId,
-        occurrence_ty: Tir2Ty,
-        parameter: baml_type::ParamTy,
-    },
+pub(crate) struct CallTypeArgPlan {
+    pub(crate) emission_ty: Tir2Ty,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum RuntimeCheck {
-    Argument {
-        arg: AstExprId,
-        expected: Tir2Ty,
-    },
-    Bound {
-        argument: Tir2Ty,
-        bound: baml_type::Interface,
-    },
-}
-
+/// One lexical `type T = …` binding: the rigid parameter MIR reserves a
+/// frame slot for, and where its runtime type comes from.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScopedTypeBinding {
     pub(crate) name: Name,
     pub(crate) parameter: baml_type::ParamTy,
-    pub(crate) operand: AstExprId,
-    pub(crate) occurrence_ty: Tir2Ty,
+    pub(crate) source: ScopedTypeSource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ScopedTypeSource {
+    /// `unreflect(expr)`: the operand's `reflect.Type` value.
+    Runtime(AstExprId),
+    /// A static type, loaded as a template in the enclosing frame.
+    Static(Tir2Ty),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -172,15 +174,6 @@ pub(crate) enum ParamBinding {
         param_index: usize,
         param_name: Name,
     },
-}
-
-/// A function value accepted at a runtime-incompatible parameter shape - the
-/// adapter MIR emits (source shape from the value, target from the slot).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FunctionCoercion {
-    pub(crate) source_params: Vec<baml_type::FunctionParamTy>,
-    pub(crate) target_params: Vec<baml_type::FunctionParamTy>,
-    pub(crate) target_return: Tir2Ty,
 }
 
 /// The one table store behind the `tir_*` accessors: converted ONCE at
@@ -236,8 +229,6 @@ pub(crate) struct ConvertedTables<'db> {
     path_member_resolutions: FxHashMap<AstExprId, Vec<MemberResolution<'db>>>,
     call_plans: FxHashMap<AstExprId, CallPlan>,
     type_bindings: FxHashMap<AstStmtId, ScopedTypeBinding>,
-    runtime_checks: Vec<RuntimeCheck>,
-    function_coercions: FxHashMap<AstExprId, FunctionCoercion>,
     /// Condition expressions the checker marked for truthiness coercion
     /// (`Adjust::Truthy`, B-1563): lowering wraps the operand in the
     /// truthy test so the branch itself stays strict-bool.
@@ -298,13 +289,6 @@ impl<'db> ConvertedTables<'db> {
     pub(crate) fn type_binding(&self, stmt: AstStmtId) -> Option<&ScopedTypeBinding> {
         self.type_bindings.get(&stmt)
     }
-    #[allow(dead_code)]
-    pub(crate) fn runtime_checks(&self) -> &[RuntimeCheck] {
-        &self.runtime_checks
-    }
-    pub(crate) fn function_coercion(&self, expr: AstExprId) -> Option<&FunctionCoercion> {
-        self.function_coercions.get(&expr)
-    }
     pub(crate) fn truthy_condition(&self, expr: AstExprId) -> bool {
         self.truthy_conditions.contains(&expr)
     }
@@ -315,10 +299,7 @@ impl<'db> ConvertedTables<'db> {
 
 /// Materializes one `InferenceResult` into TIR-shaped tables: interned
 /// types to the plain family, the resolution enum variant-for-variant,
-/// the path ladder into TIR's three keyings, and adjustments into
-/// `FunctionCoercion` (source shape from `type_of_expr`, target from the
-/// adjustment - the redundancy TIR stored, reconstructed at the
-/// boundary).
+/// the path ladder into TIR's three keyings, and truthiness adjustments.
 fn convert<'db>(result: &hir_infer::InferenceResult<'db>) -> ConvertedTables<'db> {
     let mut out = ConvertedTables::default();
     for (&expr, ty) in &result.type_of_expr {
@@ -330,21 +311,21 @@ fn convert<'db>(result: &hir_infer::InferenceResult<'db>) -> ConvertedTables<'db
         if result.desugared_callees.contains(&expr) {
             continue;
         }
-        out.expr_types.insert(expr, ty.to_plain());
+        out.expr_types.insert(expr, ty.clone());
     }
     for (&pat, ty) in &result.type_of_pat {
-        out.pat_types.insert(pat, ty.to_plain());
+        out.pat_types.insert(pat, ty.clone());
     }
     for (&expr, resolution) in &result.member_resolutions {
         out.resolutions.insert(expr, convert_resolution(resolution));
     }
     for (&expr, path) in &result.path_resolutions {
         if let Some(root) = path.segments.first() {
-            out.path_root_types.insert(expr, root.ty.to_plain());
+            out.path_root_types.insert(expr, root.ty.clone());
         }
         for (index, segment) in path.segments.iter().enumerate() {
             out.path_segment_types
-                .insert((expr, index), segment.ty.to_plain());
+                .insert((expr, index), segment.ty.clone());
         }
         // TIR's vec holds one entry per MEMBER segment (the suffix after
         // the root); a ladder with an unresolved member records no vec -
@@ -361,6 +342,7 @@ fn convert<'db>(result: &hir_infer::InferenceResult<'db>) -> ConvertedTables<'db
         out.call_plans.insert(
             call,
             CallPlan {
+                argument_layout: plan.argument_layout.clone(),
                 bindings: plan
                     .bindings
                     .iter()
@@ -380,38 +362,15 @@ fn convert<'db>(result: &hir_infer::InferenceResult<'db>) -> ConvertedTables<'db
                         },
                     })
                     .collect(),
-                type_args: plan
-                    .type_args
-                    .iter()
-                    .map(baml_type::interned::Ty::to_plain)
-                    .collect(),
+                type_args: plan.type_args.iter().map(baml_type::Ty::clone).collect(),
                 own_offset: plan.own_offset,
                 explicit: plan.explicit,
                 slots: plan
                     .slots
                     .iter()
-                    .map(|slot| match slot {
-                        hir_infer::CallTypeArgPlan::Static { ty, emission_ty } => {
-                            CallTypeArgPlan::Static {
-                                ty: ty.to_plain(),
-                                emission_ty: emission_ty.to_plain(),
-                            }
-                        }
-                        hir_infer::CallTypeArgPlan::Runtime {
-                            operand,
-                            occurrence_ty,
-                            parameter,
-                        } => CallTypeArgPlan::Runtime {
-                            operand: *operand,
-                            occurrence_ty: occurrence_ty.to_plain(),
-                            parameter: parameter.clone(),
-                        },
+                    .map(|slot| CallTypeArgPlan {
+                        emission_ty: slot.emission_ty.clone(),
                     })
-                    .collect(),
-                deferred_checks: plan
-                    .deferred_checks
-                    .iter()
-                    .map(convert_runtime_check)
                     .collect(),
                 target: plan.target.clone(),
                 side_channels: CallSideChannels {
@@ -423,60 +382,15 @@ fn convert<'db>(result: &hir_infer::InferenceResult<'db>) -> ConvertedTables<'db
     out.type_bindings = result
         .type_bindings
         .iter()
-        .map(|(&stmt, binding)| {
-            (
-                stmt,
-                ScopedTypeBinding {
-                    name: binding.name.clone(),
-                    parameter: binding.parameter.clone(),
-                    operand: binding.operand,
-                    occurrence_ty: binding.occurrence_ty.to_plain(),
-                },
-            )
-        })
-        .collect();
-    out.runtime_checks = result
-        .runtime_checks
-        .iter()
-        .map(convert_runtime_check)
+        .map(|(&stmt, binding)| (stmt, convert_scoped_type_binding(binding)))
         .collect();
     for (&expr, adjustments) in &result.expr_adjustments {
         for adjustment in adjustments {
             match adjustment.kind {
                 hir_infer::Adjust::Truthy => {
                     out.truthy_conditions.insert(expr);
-                    continue;
                 }
-                hir_infer::Adjust::FunctionAdapter => {}
             }
-            let (
-                Some(Tir2Ty::Function {
-                    params: source_params,
-                    ..
-                }),
-                Tir2Ty::Function {
-                    params: target_params,
-                    ret: target_return,
-                    ..
-                },
-            ) = (
-                result
-                    .type_of_expr
-                    .get(&expr)
-                    .map(baml_type::interned::Ty::to_plain),
-                adjustment.target.to_plain(),
-            )
-            else {
-                continue;
-            };
-            out.function_coercions.insert(
-                expr,
-                FunctionCoercion {
-                    source_params,
-                    target_params,
-                    target_return: *target_return,
-                },
-            );
         }
     }
     out.exhaustiveness = MatchExhaustiveness::NonExhaustiveSet(
@@ -485,19 +399,13 @@ fn convert<'db>(result: &hir_infer::InferenceResult<'db>) -> ConvertedTables<'db
     out
 }
 
-fn convert_runtime_check(check: &hir_infer::RuntimeCheck) -> RuntimeCheck {
-    match check {
-        hir_infer::RuntimeCheck::Argument { arg, expected } => RuntimeCheck::Argument {
-            arg: *arg,
-            expected: expected.to_plain(),
-        },
-        hir_infer::RuntimeCheck::Bound { argument, bound } => RuntimeCheck::Bound {
-            argument: argument.to_plain(),
-            bound: bound
-                .existential()
-                .to_plain()
-                .as_interface()
-                .expect("an interned interface reference materializes as an interface"),
+fn convert_scoped_type_binding(binding: &hir_infer::ScopedTypeBinding) -> ScopedTypeBinding {
+    ScopedTypeBinding {
+        name: binding.name.clone(),
+        parameter: binding.parameter.clone(),
+        source: match &binding.source {
+            hir_infer::ScopedTypeSource::Runtime(operand) => ScopedTypeSource::Runtime(*operand),
+            hir_infer::ScopedTypeSource::Static(ty) => ScopedTypeSource::Static(ty.clone()),
         },
     }
 }
@@ -529,12 +437,17 @@ fn convert_resolution<'db>(resolution: &hir_infer::MemberResolution<'db>) -> Mem
                 method: method.clone(),
             }
         }
-        hir_infer::MemberResolution::InterfaceConcreteMethod { impl_block, func } => {
-            MemberResolution::InterfaceConcreteMethod {
-                impl_loc: *impl_block,
-                func_loc: *func,
-            }
-        }
+        hir_infer::MemberResolution::InterfaceConcreteMethod {
+            impl_block,
+            func,
+            frame_type_args,
+            from_interface_default,
+        } => MemberResolution::InterfaceConcreteMethod {
+            impl_loc: *impl_block,
+            func_loc: *func,
+            frame_type_args: frame_type_args.clone(),
+            from_interface_default: *from_interface_default,
+        },
         hir_infer::MemberResolution::InterfaceVirtualField {
             interface,
             view,
@@ -542,7 +455,7 @@ fn convert_resolution<'db>(resolution: &hir_infer::MemberResolution<'db>) -> Mem
             field,
         } => MemberResolution::InterfaceVirtualField {
             iface_loc: *interface,
-            interface: view.to_plain(),
+            interface: view.clone(),
             field_index: *field_index,
             field: field.clone(),
         },
@@ -568,7 +481,7 @@ fn convert_resolution<'db>(resolution: &hir_infer::MemberResolution<'db>) -> Mem
             field,
         } => MemberResolution::ExternalInterfaceVirtualField {
             interface_name: interface.clone(),
-            interface: view.to_plain(),
+            interface: view.clone(),
             field_index: *field_index,
             field: field.clone(),
         },

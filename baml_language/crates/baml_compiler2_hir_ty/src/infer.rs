@@ -24,14 +24,13 @@ pub mod unify;
 
 use std::{cell::RefCell, path::PathBuf, sync::Arc};
 
-use baml_compiler_diagnostics::runtime_type::RuntimeTypeEscape;
 use baml_compiler2_ast::{
     Expr, ExprBody, ExprId, ObjectExprField, PatId, Pattern, PropertySyntax, Stmt, StmtId,
-    traverse::BodyNode,
+    TypeBindingValue, traverse::BodyNode,
 };
 use baml_compiler2_hir::{
     body::BodyOwnerId,
-    body_type_refs::{BodyTypeArgRef, BodyTypeRefs},
+    body_type_refs::{BodyTypeRefId, BodyTypeRefs},
     contributions::Definition,
     scope::FileScopeId,
     semantic_index::{
@@ -39,78 +38,72 @@ use baml_compiler2_hir::{
         PathResolution,
     },
 };
+/// Re-exported for the sibling modules that ask whether a parameter is a
+/// block-scoped binding; the bit itself is defined with `ParamTy`.
+pub(crate) use baml_type::SCOPED_PARAM_BIT;
 use baml_type::{
-    Freshness, Literal, TyAttr,
-    interned::{InterfaceRef, Ty, TyKind},
-    normalize::{canonical_union_interned, equivalent_interned, is_subtype_interned},
+    Freshness, Int63, Literal, TyAttr,
+    interned::{ClosedTy, InferInterface, InferTy, Ty},
+    normalize::canonical_union_interned,
 };
 use rustc_hash::FxHashMap;
 
 use crate::{
+    diagnostics::ScopedTypeEscapeKind,
     facts::Facts,
     infer::unify::InferenceTable,
     lower::{
         LowerCtx, function_generic_frame, function_signature, lower_ctx_for_file, substitute_params,
     },
+    render::Spell,
 };
 
 /// The unit-type identification (ruling: interim until tuples): `void`
 /// and `null` both denote the single-value unit.
 fn is_unit(ty: &Ty) -> bool {
-    matches!(ty.kind(), TyKind::Void { .. } | TyKind::Null { .. })
+    matches!(ty.kind(), InferTy::Void { .. } | InferTy::Null { .. })
 }
 
-/// The function type at a callback root: `ty` itself, or the sole non-null
-/// member of an optional callback — `((v: int) -> int)?` lowers to
-/// `(...) | null`.
-///
-/// This mirrors the elaboration road in `baml_compiler2_hir::signature`,
-/// which opens exactly those two shapes to a synthetic effect param. It is
-/// also the shape a lambda argument can inhabit: a lambda literal is never
-/// `null`, so the function arm is the only expectation it can satisfy.
-fn callback_root_fn(ty: &Ty) -> Option<&Ty> {
+/// Whether an object slot initialized to `null` satisfies this type. Weak
+/// aliases and solved inference variables must be resolved by the caller
+/// before asking; an unconstrained type parameter is deliberately false
+/// because it is not guaranteed to admit `null` for every instantiation.
+fn type_admits_null(ty: &Ty) -> bool {
     match ty.kind() {
-        TyKind::Function { .. } => Some(ty),
-        TyKind::Union(members, _) => {
-            let mut callback = None;
-            for member in members {
-                match member.kind() {
-                    TyKind::Null { .. } => {}
-                    TyKind::Function { .. } if callback.is_none() => callback = Some(member),
-                    _ => return None,
-                }
-            }
-            callback
-        }
-        _ => None,
+        InferTy::Null { .. } => true,
+        InferTy::Union(members, _) => members.iter().any(type_admits_null),
+        _ => false,
     }
 }
 
-/// The implicit `baml.spawn.SpawnParams<V, E>` a spawn's `with` chain
+/// The implicit `baml.spawn.Params<V, E>` a spawn's `with` chain
 /// threads (BEP-034).
-fn spawn_params_ty(value: Ty, error: Ty) -> Ty {
-    Ty::intern(TyKind::Class(
-        baml_type::TypeName::new(
-            baml_type::Name::new("baml"),
+fn spawn_params_ty(lang: baml_base::LangRoots, value: Ty, error: Ty) -> Ty {
+    let Some(baml) = lang.get(baml_base::LangPackage::Baml) else {
+        return Ty::error();
+    };
+    Ty::intern(InferTy::Class(
+        baml_type::DeclName::in_root(
+            baml,
             vec![baml_type::Name::new("spawn")],
-            baml_type::Name::new("SpawnParams"),
+            baml_type::Name::new("Params"),
         ),
         Box::new([value, error]),
         TyAttr::default(),
     ))
 }
 
-fn is_spawn_params_qtn(qtn: &baml_type::TypeName) -> bool {
-    qtn.package().as_str() == "baml"
+fn is_spawn_params_qtn(lang: baml_base::LangRoots, qtn: &baml_type::DeclName) -> bool {
+    lang.is(baml_base::LangPackage::Baml, qtn.root())
         && qtn.namespace().len() == 1
         && qtn.namespace()[0].as_str() == "spawn"
-        && qtn.name().as_str() == "SpawnParams"
+        && qtn.name().as_str() == "Params"
 }
 
 /// Negate a numeric literal into the negative literal TYPE (ruling 2:
 /// `-1` is a type, TS parity). Freshness carries through. `None` skips
 /// the fold: non-numeric literals, and an int result outside BAML's i63
-/// value range (`-INT_MIN` = 2^62) - the unfolded dispatch result stands
+/// value range (`-int.min_value()` = 2^62) - the unfolded dispatch result stands
 /// and the VM raises the catchable overflow, identical to the
 /// through-a-variable path (TIR's `fold_int` rule).
 /// Where a type-qualified reference's OWN generic args come from -
@@ -122,21 +115,21 @@ enum OwnArgs {
     Fresh,
 }
 
-/// BAML's int value range: i63 (the VM tags the low bit). One
-/// crate-level pair, mirroring TIR's layout and the
-/// `baml_type::MAX_BIGINT_BITS` precedent; a folded result outside it
-/// defers to the runtime overflow.
-const INT_MIN: i64 = -(1 << 62);
-const INT_MAX: i64 = (1 << 62) - 1;
+/// The written halves of a fully-qualified item reference's qualifier — the
+/// lowered `Self` type and the realized interface the determination road
+/// proved for it. Always both present or both absent: a spelling either
+/// writes the qualifier (`(Base as I).item`) or leaves the whole subject to
+/// inference (`I.item`), never half of each.
+struct WrittenQualifier<'a> {
+    qself: Ty,
+    realized: &'a baml_type::Interface,
+}
 
 fn negate_literal(lit: &Literal, freshness: Freshness) -> Option<Ty> {
     let negated = match lit {
         Literal::Int(n) => {
-            let v = n.checked_neg()?;
-            if !(INT_MIN..=INT_MAX).contains(&v) {
-                return None;
-            }
-            Literal::Int(v)
+            let v = Int63::new(n.checked_neg()?)?;
+            Literal::Int(v.get())
         }
         Literal::Bigint(n) => Literal::Bigint(-n.clone()),
         // The float's WRITTEN digits are preserved exactly: negation is a
@@ -147,7 +140,7 @@ fn negate_literal(lit: &Literal, freshness: Freshness) -> Option<Ty> {
         }),
         Literal::String(_) | Literal::Bool(_) => return None,
     };
-    Some(Ty::intern(TyKind::Literal(
+    Some(Ty::intern(InferTy::Literal(
         negated,
         freshness,
         TyAttr::default(),
@@ -167,7 +160,8 @@ fn negate_literal(lit: &Literal, freshness: Freshness) -> Option<Ty> {
 /// same catchable error the through-a-variable path gets.
 fn const_fold_binary(op: baml_compiler2_ast::BinaryOp, lhs: &Ty, rhs: &Ty) -> Option<Ty> {
     use baml_compiler2_ast::BinaryOp;
-    let (TyKind::Literal(a, a_fresh, _), TyKind::Literal(b, b_fresh, _)) = (lhs.kind(), rhs.kind())
+    let (InferTy::Literal(a, a_fresh, _), InferTy::Literal(b, b_fresh, _)) =
+        (lhs.kind(), rhs.kind())
     else {
         return None;
     };
@@ -175,13 +169,9 @@ fn const_fold_binary(op: baml_compiler2_ast::BinaryOp, lhs: &Ty, rhs: &Ty) -> Op
         (Freshness::Regular, Freshness::Regular) => Freshness::Regular,
         _ => Freshness::Fresh,
     };
-    let lit = |value: Literal| Ty::intern(TyKind::Literal(value, freshness, TyAttr::default()));
+    let lit = |value: Literal| Ty::intern(InferTy::Literal(value, freshness, TyAttr::default()));
     let boolean = |value: bool| Some(lit(Literal::Bool(value)));
-    let int = |value: i64| {
-        (INT_MIN..=INT_MAX)
-            .contains(&value)
-            .then(|| lit(Literal::Int(value)))
-    };
+    let int = |value: i64| Int63::new(value).map(|value| lit(Literal::Int(value.get())));
     match (a, b) {
         (Literal::Int(a), Literal::Int(b)) => {
             let (a, b) = (*a, *b);
@@ -194,10 +184,11 @@ fn const_fold_binary(op: baml_compiler2_ast::BinaryOp, lhs: &Ty, rhs: &Ty) -> Op
                 BinaryOp::BitAnd => Some(lit(Literal::Int(a & b))),
                 BinaryOp::BitOr => Some(lit(Literal::Int(a | b))),
                 BinaryOp::BitXor => Some(lit(Literal::Int(a ^ b))),
-                // Shifts range-check the RESULT too (`1 << 62` escapes
-                // i63); bad counts defer to the runtime throw.
-                BinaryOp::Shl => int(a.checked_shl(u32::try_from(b).ok()?)?),
-                BinaryOp::Shr => int(a.checked_shr(u32::try_from(b).ok()?)?),
+                // The same semantic value used by the VM defines folding.
+                // Negative counts remain unfolded so runtime dispatch raises
+                // the typed `NegativeBitShift` panic.
+                BinaryOp::Shl => Some(lit(Literal::Int(Int63::new(a)?.shift_left(b).ok()?.get()))),
+                BinaryOp::Shr => Some(lit(Literal::Int(Int63::new(a)?.shift_right(b).ok()?.get()))),
                 BinaryOp::Eq => boolean(a == b),
                 BinaryOp::Ne => boolean(a != b),
                 BinaryOp::Lt => boolean(a < b),
@@ -261,6 +252,13 @@ fn const_fold_binary(op: baml_compiler2_ast::BinaryOp, lhs: &Ty, rhs: &Ty) -> Op
             let a: f64 = a_text.parse().ok()?;
             let b: f64 = b_text.parse().ok()?;
             let float = |value: f64| Some(lit(Literal::Float(format_float(value)?)));
+            // The comparisons below are plain IEEE, not BAML's total float
+            // order (`bex_vm_types::float_order`, which the runtime opcodes
+            // use). The two agree on every finite value — they differ only on
+            // NaN — and a float LITERAL is always finite: source has no NaN
+            // spelling and `format_float` refuses to fold a non-finite result.
+            // A NaN-valued literal type would break that, so it would have to
+            // route these six through the total order instead.
             match op {
                 BinaryOp::Add => float(a + b),
                 BinaryOp::Sub => float(a - b),
@@ -329,12 +327,12 @@ fn format_float(value: f64) -> Option<String> {
 fn syntactic_union(members: &[Ty]) -> Ty {
     fn push(flat: &mut Vec<Ty>, ty: &Ty) {
         match ty.kind() {
-            TyKind::Union(inner, _) => {
+            InferTy::Union(inner, _) => {
                 for member in inner {
                     push(flat, member);
                 }
             }
-            TyKind::Never { .. } => {}
+            InferTy::Never { .. } => {}
             _ => {
                 if !flat.contains(ty) {
                     flat.push(ty.clone());
@@ -353,22 +351,6 @@ fn syntactic_union(members: &[Ty]) -> Ty {
     }
 }
 
-/// TIR's `function_params_runtime_compatible`, verbatim: same arity,
-/// same modes, and OPTIONAL parameters keep their names (named at the
-/// call site and in the runtime's defaulted-slot filling); required
-/// parameters may rename freely.
-fn function_params_runtime_compatible(
-    source: &[baml_type::interned::FunctionParam],
-    target: &[baml_type::interned::FunctionParam],
-) -> bool {
-    source.len() == target.len()
-        && source.iter().zip(target).all(|(source, target)| {
-            source.mode == target.mode
-                && (source.mode == baml_type::FunctionParamMode::Required
-                    || source.name == target.name)
-        })
-}
-
 /// Reduction budget for the finalize-time projection pass: bounds a
 /// reduction CHAIN (`(A as I).X` -> `(B as J).Y` -> ...), the same
 /// discipline as the canonical walk's fuel. Any real chain is far
@@ -384,7 +366,7 @@ const PROJECTION_FINALIZE_FUEL: u32 = 32;
 /// because virtual interface dispatch adds modes Rust encodes elsewhere,
 /// and splitting would lose the mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemberResolution<'db> {
+pub enum MemberResolution<'db, T = baml_type::Ty> {
     /// A class field access (`p.name`).
     Field {
         class: baml_compiler2_hir::loc::ClassLoc<'db>,
@@ -423,13 +405,19 @@ pub enum MemberResolution<'db> {
     InterfaceConcreteMethod {
         impl_block: baml_compiler2_hir::loc::ImplLoc<'db>,
         func: baml_compiler2_hir::loc::FunctionLoc<'db>,
+        /// The callee's OWNER frame, carried from resolution (see
+        /// `MemberDeclarer::ImplMethod::frame_type_args`): impl generic
+        /// bindings for an override, `[Self, iface args..]` for a default.
+        frame_type_args: Vec<T>,
+        /// `true` when `func` is the interface's default body.
+        from_interface_default: bool,
     },
     /// A VIRTUAL interface-field access: read through the realized
     /// declaring-interface view (`view`, the runtime resolver's key)
     /// at `field_index` in that interface's own declared field list.
     InterfaceVirtualField {
         interface: baml_compiler2_hir::loc::InterfaceLoc<'db>,
-        view: Ty,
+        view: T,
         field_index: u32,
         field: baml_type::Name,
     },
@@ -438,18 +426,18 @@ pub enum MemberResolution<'db> {
     External(std::sync::Arc<crate::callable::ExternalCallable>),
     /// A field on a source-less class.
     ExternalField {
-        class: baml_type::QualifiedTypeName,
+        class: baml_type::DeclName,
         field: baml_type::Name,
     },
     /// A variant on a source-less enum.
     ExternalVariant {
-        enum_name: baml_type::QualifiedTypeName,
+        enum_name: baml_type::DeclName,
         variant: baml_type::Name,
     },
     /// A virtual field on a source-less interface.
     ExternalInterfaceVirtualField {
-        interface: baml_type::QualifiedTypeName,
-        view: Ty,
+        interface: baml_type::DeclName,
+        view: T,
         field_index: u32,
         field: baml_type::Name,
     },
@@ -463,18 +451,18 @@ pub enum MemberResolution<'db> {
 /// (statics, variants, free items) resolve as a whole and record only a
 /// `MemberResolution`; this table is for paths whose ROOT is a value.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedPath<'db> {
+pub struct ResolvedPath<'db, T = baml_type::Ty> {
     /// One entry per written segment: entry 0 is the root (a local,
     /// parameter, or template param - no member resolution), entry
     /// `i > 0` the member access the `i`-th segment performs.
-    pub segments: Vec<ResolvedPathSegment<'db>>,
+    pub segments: Vec<ResolvedPathSegment<'db, T>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedPathSegment<'db> {
+pub struct ResolvedPathSegment<'db, T = baml_type::Ty> {
     /// The value's type AFTER this segment.
-    pub ty: Ty,
-    pub resolution: Option<MemberResolution<'db>>,
+    pub ty: T,
+    pub resolution: Option<MemberResolution<'db, T>>,
 }
 
 /// A recorded coercion step at an expression, consumed structurally by
@@ -484,20 +472,15 @@ pub struct ResolvedPathSegment<'db> {
 /// the target shape is here - TIR's bespoke `FunctionCoercion` struct
 /// carried both redundantly.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Adjustment {
+pub struct Adjustment<T = baml_type::Ty> {
     pub kind: Adjust,
     /// The post-adjustment type (the expectation the value was adapted
     /// to).
-    pub target: Ty,
+    pub target: T,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Adjust {
-    /// The optional-parameter adapter: a function value satisfies its
-    /// expectation by SUBTYPING but not by RUNTIME SHAPE (arity, mode,
-    /// or optional-parameter names drift), so lowering synthesizes an
-    /// adapter closure (TIR's `function_coercion_for` rule).
-    FunctionAdapter,
     /// A condition position holding a non-`bool` value (B-1563): lowering
     /// synthesizes the truthiness test (`null`/`false`/zero/empty are
     /// falsy) so the branch itself stays strict-bool.
@@ -510,17 +493,21 @@ pub enum Adjust {
 /// no analog (no named/default arguments); the prior art is Swift's
 /// Sema-recorded argument matching consumed by `SILGen`. Keyed by the CALL
 /// expression.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct CallPlan {
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallPlan<T = baml_type::Ty> {
     /// Parameter-ordered bindings over the callee's parameter list MINUS
     /// any bound receiver slot (the list written arguments match).
     /// Required parameters with no argument get no entry (the arity
     /// diagnostic is S17's).
     pub bindings: Vec<ParamBinding>,
+    /// The value slots the arguments were matched against (a bound receiver
+    /// excluded): the shape the call site pushes, which dispatch maps onto
+    /// the executing callee's own parameter list.
+    pub argument_layout: baml_type::CallLayout,
     /// The callee's solved generic instantiation in declared De Bruijn
     /// order (owner frame prefix + own suffix). Recorded raw at the
     /// instantiation site; ground after writeback.
-    pub type_args: Vec<Ty>,
+    pub type_args: Vec<T>,
     /// How many leading `type_args` are the OWNER frame's (receiver
     /// class args for bound methods, the interface frame for virtual
     /// calls). The runtime call convention threads only the suffix as
@@ -534,14 +521,9 @@ pub struct CallPlan {
     /// recording on `!explicit_args_used`), and a plan entry would
     /// double-emit the operands.
     pub explicit: bool,
-    /// Every WRITTEN type-argument slot, in source order. Unlike
-    /// `type_args`, this preserves whether the value was a static type or a
-    /// runtime `unreflect(expr)` carrier.
-    pub slots: Vec<CallTypeArgPlan>,
-    /// Checks whose declared shape mentions at least one runtime slot. They
-    /// are intentionally not discharged by the static solver; MIR emits the
-    /// equivalent runtime gate from this ledger.
-    pub deferred_checks: Vec<RuntimeCheck>,
+    /// Every WRITTEN type-argument slot, in source order, with the written
+    /// shape MIR emits alongside the solved type.
+    pub slots: Vec<CallTypeArgPlan<T>>,
     /// The trailing `$id = ...` side-channel argument (TIR's
     /// `CallSideChannels`, flattened until a second channel exists).
     pub runtime_id: Option<ExprId>,
@@ -551,41 +533,50 @@ pub struct CallPlan {
     pub target: Option<crate::callable::ExternalCallTarget>,
 }
 
+/// Hand-written: the derive would bound `T: Default`, which neither type
+/// vocabulary provides (or needs — no field holds a bare `T`).
+impl<T> Default for CallPlan<T> {
+    fn default() -> Self {
+        CallPlan {
+            bindings: Vec::new(),
+            argument_layout: baml_type::CallLayout::default(),
+            type_args: Vec::new(),
+            own_offset: 0,
+            explicit: false,
+            slots: Vec::new(),
+            runtime_id: None,
+            target: None,
+        }
+    }
+}
+
 /// One written generic slot after its sole lowering pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CallTypeArgPlan {
-    Static {
-        /// Solved canonical type used by inference, equality, and digests.
-        ty: Ty,
-        /// Written type shape used only when MIR emits `LoadType`. It is
-        /// resolved without union set-algebra so coercion try-order survives.
-        emission_ty: Ty,
-    },
-    Runtime {
-        operand: ExprId,
-        occurrence_ty: Ty,
-        parameter: baml_type::ParamTy,
-    },
+pub struct CallTypeArgPlan<T = baml_type::Ty> {
+    /// Solved canonical type used by inference, equality, and digests.
+    pub ty: T,
+    /// Written type shape used only when MIR emits `LoadType`. It is
+    /// resolved without union set-algebra so coercion try-order survives.
+    pub emission_ty: T,
 }
 
-/// A static check deferred precisely because its declared shape depends on a
-/// runtime generic slot. Types remain symbolic over those runtime parameters;
-/// all other call parameters have already been substituted.
+/// One lexical `type T = …` binding: a rigid parameter whose identity is the
+/// binding statement, bound in the enclosing frame from `source` when the
+/// statement runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeCheck {
-    Argument { arg: ExprId, expected: Ty },
-    Bound { argument: Ty, bound: InterfaceRef },
-}
-
-/// One lexical `type T = unreflect(value)` binding. The parameter is rigid and
-/// statement-identity-based; `occurrence_ty` is the static replacement used
-/// when the binding leaves its block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScopedTypeBinding {
+pub struct ScopedTypeBinding<T = baml_type::Ty> {
     pub name: baml_type::Name,
     pub parameter: baml_type::ParamTy,
-    pub operand: ExprId,
-    pub occurrence_ty: Ty,
+    pub source: ScopedTypeSource<T>,
+}
+
+/// Where a scoped binding's runtime type comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedTypeSource<T = baml_type::Ty> {
+    /// `unreflect(expr)`: the `reflect.Type` value the operand evaluates to.
+    Runtime(ExprId),
+    /// A static type, loaded as a template in the enclosing frame.
+    Static(T),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,10 +592,12 @@ pub enum ParamBinding {
 }
 
 /// Inference side tables for one body owner, keyed by arena ids, mirroring
-/// rust-analyzer's `InferenceResult`. Types are the hash-consed
-/// `baml_type::interned` representation (this crate's native vocabulary);
-/// they are materialized to plain `baml_type::Ty` only at consumer
-/// boundaries, after resolve-all guarantees no inference variables remain.
+/// rust-analyzer's `InferenceResult`. Generic over the type vocabulary: the
+/// public artifact (the default `T = baml_type::Ty`) is PLAIN-NATIVE —
+/// `finish` disposes of every inference variable and materializes through
+/// the one seam (`materialize_ty`), so no interned handle escapes
+/// inference. The engine itself records in the working instantiation
+/// ([`WorkingResult`], `T =` interned `Ty`), its native vocabulary.
 /// Which BEP-049 SS10 rule a tagged-template tag broke.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TaggedTagIssue {
@@ -613,11 +606,77 @@ enum TaggedTagIssue {
     BadBodyParam,
 }
 
-/// Where a written `_` hole sits: an expression's turbofish, or a
-/// body-position type annotation's ref.
+/// What the lowering→inference ingestion does with a written `_` hole.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IngestHoles {
+    /// An annotation-position hole: legal, anchored for unsolved reporting.
+    Anchored(HoleAnchor),
+    /// An expression-position hole: unconditionally diagnosed (E0147),
+    /// instantiated only for recovery.
+    ExprPosition(ExprId),
+}
+
+/// Where a written `_` hole sits: a body-position type annotation's ref.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HoleAnchor {
-    TypeRef(baml_compiler2_hir::type_ref::TypeRefId),
+    TypeRef(BodyTypeRefId),
+}
+
+/// Where an inference variable came from and the user-facing type that
+/// contains it. Writeback uses this to report unsolved variables before
+/// replacing them with the error sentinel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InferVarOrigin {
+    TypeMustBeKnown {
+        location: crate::diagnostics::DiagnosticLocation,
+        containing_type: Ty,
+    },
+    LambdaParameter {
+        lambda: ExprId,
+        parameter_index: usize,
+        name: baml_type::Name,
+    },
+}
+
+/// Everything a speculative probe may append to, captured as one value.
+///
+/// A probe relates types to learn whether they COULD relate and must leave
+/// no trace of the attempt. The table's snapshot covers the union-find and
+/// the bound ledger; this covers the accumulators the relation writes
+/// through on the way - `sub` reports scoped escapes and registers
+/// obligations, resolution defers pairs it cannot decide yet, and checking
+/// stashes provisional re-checks. One value so a new accumulator is
+/// restored in exactly one place rather than at each probe site.
+///
+/// `type_mismatches` is a keyed, first-writer-wins map rather than a
+/// journal, so it cannot be truncated; nothing on a probe road writes it
+/// (its only writer is the checking road, which a probe does not take) and
+/// the rollback asserts as much.
+struct ProbeCheckpoint {
+    table: unify::Snapshot,
+    deferred_subs: usize,
+    obligations: usize,
+    pending_diags: usize,
+    anchorless_escapes: usize,
+    provisional_checks: usize,
+    infer_var_origins: usize,
+    type_mismatches: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReturnFrame {
+    expected: Option<Ty>,
+    candidates: Vec<Ty>,
+    /// Depth of the scoped-binding stack when the frame opened. A binding at
+    /// or past it belongs to this frame and closes before the frame's value
+    /// is published, so a `return` typed by one is an escape.
+    scoped_bindings_floor: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ThrowsChannel {
+    expected: Option<Ty>,
+    contributions: Vec<(ExprId, Ty)>,
 }
 
 /// S17 pending diagnostic (engine-internal): arena-anchored, payload
@@ -653,7 +712,7 @@ enum PendingDiag<'db> {
     /// A body annotation failing the written-type well-formedness
     /// judgment (generic-argument bounds).
     AnnotWf {
-        type_ref: baml_compiler2_hir::type_ref::TypeRefId,
+        type_ref: BodyTypeRefId,
         error: crate::diagnostics::TirTypeError,
     },
     /// A tagged-template tag failing BEP-049 SS10's contract.
@@ -680,7 +739,7 @@ enum PendingDiag<'db> {
         expr: ExprId,
         base: Ty,
         member: baml_type::Name,
-        sources: Vec<baml_type::interned::InterfaceRef>,
+        sources: Vec<baml_type::interned::InferInterface>,
         is_field: bool,
     },
     /// An interface FIELD reached on a concrete receiver: reachable only
@@ -689,16 +748,39 @@ enum PendingDiag<'db> {
         expr: ExprId,
         base: Ty,
         member: baml_type::Name,
-        interface: baml_type::interned::InterfaceRef,
+        interface: baml_type::interned::InferInterface,
     },
     /// A method declared with `Self` outside the receiver position,
     /// called through an existential/union receiver (Rust's `dyn`
     /// object-safety split).
     SelfRestrictedMember {
         expr: ExprId,
-        interface: baml_type::interned::InterfaceRef,
+        interface: baml_type::interned::InferInterface,
         member: baml_type::Name,
         position: crate::diagnostics::SelfCallPosition,
+    },
+    /// A `self`-less interface method reached through a VALUE receiver.
+    SelflessInstanceMember {
+        expr: ExprId,
+        interface_name: Option<baml_type::Name>,
+        member: baml_type::Name,
+    },
+    /// An item projection's `Self` slot, judged once inference resolves it:
+    /// erased (existential/union) `Self` is object-safety-gated for receiver
+    /// methods and rejected for `self`-less ones. Pushed for EVERY item
+    /// projection; a concrete or typevar slot passes silently.
+    ItemProjectionSelfSlot {
+        expr: ExprId,
+        var: Ty,
+        interface: baml_type::interned::InferInterface,
+        member: baml_type::Name,
+        takes_self: bool,
+        /// Whether the reference is a VALUE (uncalled). A receiver method
+        /// with an erased `Self` dispatches fine when CALLED (the receiver
+        /// value carries the concrete type), but a reified value has no
+        /// resolution moment — there is no thunk carrier yet, so it is
+        /// rejected.
+        value_position: bool,
     },
     /// A member on a union receiver with no interface shared by every
     /// arm declaring it.
@@ -713,7 +795,7 @@ enum PendingDiag<'db> {
     BoundedArgNotConcrete {
         expr: ExprId,
         arg: Ty,
-        bound: baml_type::interned::InterfaceRef,
+        bound: baml_type::interned::InferInterface,
     },
     /// A constructor entry naming an implemented interface's FIELD; the
     /// backing class field is the constructor's key.
@@ -722,13 +804,16 @@ enum PendingDiag<'db> {
         name: baml_type::Name,
         class_field: baml_type::Name,
     },
-    /// `.as<T>` with a non-interface target.
-    UpcastTargetNotInterface {
+    /// A written interface qualifier that is not an interface at all:
+    /// `.as<T>`, or `(Base as T).item`.
+    QualifierNotInterface {
         expr: ExprId,
         target: Ty,
     },
-    /// `.as<I>` where the value's type does not implement `I`.
-    UpcastNotImplemented {
+    /// A written interface qualifier the subject does not implement:
+    /// `x.as<I>` where `x`'s type does not, or `(Base as I).item` where
+    /// `Base` does not.
+    QualifierNotImplemented {
         expr: ExprId,
         value: Ty,
         interface: Ty,
@@ -741,6 +826,21 @@ enum PendingDiag<'db> {
         expected: usize,
         got: usize,
     },
+    GenericFunctionValueNotSpecialized {
+        expr: ExprId,
+        name: baml_type::Name,
+        reference: String,
+        inference_evidence: Vec<Ty>,
+        specialization_args: Option<Vec<Ty>>,
+        unconditional: bool,
+        had_expected_type: bool,
+        generic_params: Vec<baml_type::Name>,
+        binding_name: Option<baml_type::Name>,
+        function_shape: Option<String>,
+        annotation_ty: Option<Ty>,
+        specialization_example_is_safe: bool,
+        specialization_syntax_available: bool,
+    },
     ComputedGenericArgumentRequiresUnreflect {
         expr: ExprId,
         name: baml_type::Name,
@@ -749,27 +849,23 @@ enum PendingDiag<'db> {
         expr: ExprId,
         path: baml_type::Name,
     },
-    RuntimeTypeArgumentOnStreamingCall {
-        expr: ExprId,
-        callee: baml_type::Name,
-    },
-    RuntimeTypeArgumentOnIndirectCall {
-        expr: ExprId,
-    },
-    /// An inline `unreflect(carrier)` slot whose rigid parameter survives into
-    /// `enclosing`'s published type — as its value or as its error.
-    RuntimeTypeMustBeNamed {
-        carrier: ExprId,
-        enclosing: ExprId,
-        escape: RuntimeTypeEscape,
+    /// A value typed by a block-scoped `type T = …` binding would be
+    /// observable outside its block: the block's value (anchored at the
+    /// tail), or a thrown type an inferred clause would publish (anchored
+    /// at the throw). `value` is the escaping type, `name` the binding's.
+    ScopedTypeEscapesBlock {
+        at: ExprId,
+        name: baml_type::Name,
+        value: Ty,
+        kind: crate::diagnostics::ScopedTypeEscapeKind,
     },
     CannotConstructReflectionKind {
         expr: ExprId,
-        class_name: baml_type::QualifiedTypeName,
+        class_name: baml_type::DeclName,
     },
     CannotConstructBuiltinCompanion {
         expr: ExprId,
-        class_name: baml_type::QualifiedTypeName,
+        class_name: baml_type::DeclName,
         companion: baml_type::type_kind::BuiltinCompanion,
     },
     NotCallable {
@@ -836,10 +932,21 @@ enum PendingDiag<'db> {
         expected_input: Ty,
         got: Ty,
     },
-    /// E0097: declared throws members the body can never throw (warning).
+    /// E0097: declared throws members the body can never throw.
     ExtraneousThrows {
         at: ExprId,
         extra_types: Vec<String>,
+    },
+    /// E0097: an `unknown`-containing contract without an escaping `unknown`.
+    ImpreciseUnknownThrows {
+        at: ExprId,
+        /// What the function actually throws, as ONE type; `None` when it
+        /// throws nothing.
+        inferred: Option<baml_type::Ty>,
+        /// Some inferred member is a scoped thrown type's relaxation: the
+        /// clause is required (removing it is E0172), only its spelling is
+        /// wrong.
+        needs_declaration: bool,
     },
     /// Control flow that would escape a `defer` body (BEP-042): `return`
     /// always; `break`/`continue` unless a loop opened INSIDE the defer.
@@ -847,6 +954,12 @@ enum PendingDiag<'db> {
         stmt: Option<StmtId>,
         expr: Option<ExprId>,
         keyword: &'static str,
+    },
+    ReturnTypeMismatch {
+        stmt: Option<StmtId>,
+        expr: Option<ExprId>,
+        expected: Ty,
+        actual: Ty,
     },
     /// An untyped-object property shorthand naming no in-scope value -
     /// the specialized spelling of unresolved-name, with near-matches.
@@ -884,10 +997,17 @@ enum PendingDiag<'db> {
     UnknownObjectField {
         object: ExprId,
         value: ExprId,
-        class_name: baml_type::QualifiedTypeName,
+        class_name: baml_type::DeclName,
         declared: Vec<baml_type::Name>,
         name: baml_type::Name,
         shorthand: bool,
+    },
+    /// A constructor without a spread omitted fields whose resolved types do
+    /// not admit `null`.
+    MissingRequiredObjectFields {
+        object: ExprId,
+        class_name: baml_type::DeclName,
+        field_names: Vec<baml_type::Name>,
     },
     /// The call-site `$id` side channel's three rules: the value must be
     /// `boundary.LocalId`, at most one `$id` per call, and it must be the
@@ -926,12 +1046,15 @@ enum PendingDiag<'db> {
         rhs: Option<Ty>,
     },
     BodyAnnot {
-        type_ref: baml_compiler2_hir::type_ref::TypeRefId,
+        type_ref: BodyTypeRefId,
         kind: crate::lower::LoweringDiagKind,
     },
     InterpolatedMaybeNull {
         expr: ExprId,
         ty: Ty,
+    },
+    BareOutputFormatReference {
+        expr: ExprId,
     },
     /// B-1563 truthiness: a NON-literal condition whose static type
     /// decides the branch (`if (some_fn)`, `if (instance)`) - a likely
@@ -968,7 +1091,7 @@ enum PendingDiag<'db> {
     },
     UnknownPatternField {
         pat: PatId,
-        class_name: baml_type::QualifiedTypeName,
+        class_name: baml_type::DeclName,
         field_name: baml_type::Name,
         declared: Vec<baml_type::Name>,
     },
@@ -988,17 +1111,17 @@ enum PendingDiag<'db> {
 /// Grows one map per slice; consumers must treat a missing entry as "not
 /// inferred", never as an error.
 #[derive(Debug, Clone, PartialEq)]
-pub struct InferenceResult<'db> {
-    pub type_of_expr: FxHashMap<ExprId, Ty>,
-    pub type_of_pat: FxHashMap<PatId, Ty>,
+pub struct InferenceResult<'db, T = baml_type::Ty> {
+    pub type_of_expr: FxHashMap<ExprId, T>,
+    pub type_of_pat: FxHashMap<PatId, T>,
     /// The owner's effect: the declared clause when written, else the
     /// canonical union of the body's throw sites and callee throws
     /// (`never` when nothing throws) - S12.
-    pub throws: Ty,
+    pub throws: T,
     /// Definite check failures, keyed by the checked expression:
     /// `(expected, actual)`. Recorded always (rust-analyzer's discipline);
     /// rendered as diagnostics in S17.
-    pub type_mismatches: FxHashMap<ExprId, (Ty, Ty)>,
+    pub type_mismatches: FxHashMap<ExprId, (T, T)>,
     /// Match expressions whose unguarded arms do not cover the scrutinee.
     /// The expression types as Error; S17 renders E0062 with witnesses.
     pub non_exhaustive_matches: rustc_hash::FxHashSet<ExprId>,
@@ -1010,27 +1133,22 @@ pub struct InferenceResult<'db> {
     /// by the accessing expression (a call's entry sits on the CALLEE
     /// expr, TIR's keying). S16: MIR consumes this instead of re-running
     /// resolution.
-    pub member_resolutions: FxHashMap<ExprId, MemberResolution<'db>>,
+    pub member_resolutions: FxHashMap<ExprId, MemberResolution<'db, T>>,
     /// Value-rooted multi-segment paths' per-segment ladders. S16: MIR's
     /// field-chain-vs-method decisions read the ladder instead of
     /// re-resolving.
-    pub path_resolutions: FxHashMap<ExprId, ResolvedPath<'db>>,
+    pub path_resolutions: FxHashMap<ExprId, ResolvedPath<'db, T>>,
     /// Per-call argument matching and solved instantiations, keyed by the
     /// CALL expression. S16: MIR's argument emission and `LoadType`
     /// operands read this instead of re-planning.
-    pub call_plans: FxHashMap<ExprId, CallPlan>,
-    /// Durable lexical runtime-type bindings, keyed by the statement that
+    pub call_plans: FxHashMap<ExprId, CallPlan<T>>,
+    /// Durable lexical `type T = …` bindings, keyed by the statement that
     /// evaluates and installs them. MIR consumes this identity instead of
     /// rebuilding a synthetic parameter from syntax.
-    pub type_bindings: FxHashMap<StmtId, ScopedTypeBinding>,
-    /// Checks whose expected shape depends on a lexical runtime-type binding.
-    /// Static inference records the actual expression type but cannot decide
-    /// the relation until the binding's operand has produced a runtime type;
-    /// MIR emits that gate from this ledger.
-    pub runtime_checks: Vec<RuntimeCheck>,
+    pub type_bindings: FxHashMap<StmtId, ScopedTypeBinding<T>>,
     /// Coercion steps per expression (r-a's `expr_adjustments` shape).
-    /// S16: MIR synthesizes the recorded adapters instead of re-deciding.
-    pub expr_adjustments: FxHashMap<ExprId, Box<[Adjustment]>>,
+    /// S16: MIR synthesizes the recorded coercions instead of re-deciding.
+    pub expr_adjustments: FxHashMap<ExprId, Box<[Adjustment<T>]>>,
     /// Callee expressions the walk resolved through a LANGUAGE-SUGAR
     /// tier (`to_string`/`to_json`/`from_json` lang-item desugars).
     /// Recorded as POSITIVE knowledge; TIR's convention leaves these
@@ -1040,12 +1158,20 @@ pub struct InferenceResult<'db> {
     pub desugared_callees: rustc_hash::FxHashSet<ExprId>,
 }
 
-impl Default for InferenceResult<'_> {
-    fn default() -> Self {
+/// The working instantiation: the engine records in its native interned
+/// vocabulary; `finish` finalizes in place and then materializes into the
+/// public plain `InferenceResult` through the `materialize_ty` seam.
+pub(crate) type WorkingResult<'db> = InferenceResult<'db, Ty>;
+
+impl<T> InferenceResult<'_, T> {
+    /// The empty result at the given effect seed — shared by the per-
+    /// vocabulary `Default`s, whose only difference is which `never` they
+    /// can spell.
+    fn empty(throws: T) -> Self {
         InferenceResult {
             type_of_expr: FxHashMap::default(),
             type_of_pat: FxHashMap::default(),
-            throws: Ty::never(),
+            throws,
             type_mismatches: FxHashMap::default(),
             non_exhaustive_matches: rustc_hash::FxHashSet::default(),
             diagnostics: Vec::new(),
@@ -1053,10 +1179,21 @@ impl Default for InferenceResult<'_> {
             path_resolutions: FxHashMap::default(),
             call_plans: FxHashMap::default(),
             type_bindings: FxHashMap::default(),
-            runtime_checks: Vec::new(),
             expr_adjustments: FxHashMap::default(),
             desugared_callees: rustc_hash::FxHashSet::default(),
         }
+    }
+}
+
+impl Default for InferenceResult<'_> {
+    fn default() -> Self {
+        InferenceResult::empty(baml_type::Ty::never())
+    }
+}
+
+impl Default for WorkingResult<'_> {
+    fn default() -> Self {
+        InferenceResult::empty(Ty::never())
     }
 }
 
@@ -1152,7 +1289,7 @@ fn infer_let_body_cycle_initial<'db>(
     if let baml_compiler2_hir::body::LetBody::Expr(body) = body.as_ref()
         && let Some(root) = body.root_expr
     {
-        result.type_of_expr.insert(root, Ty::error());
+        result.type_of_expr.insert(root, baml_type::Ty::error());
         result.diagnostics.push(TirDiagnostic {
             error: TirTypeError::CannotInferType,
             severity: DiagnosticSeverity::Error,
@@ -1199,6 +1336,22 @@ fn infer_parameter_defaults<'db>(
     function: baml_compiler2_hir::loc::FunctionLoc<'db>,
 ) -> InferenceResult<'db> {
     infer_body_impl(db, BodyOwnerId::ParameterDefaults(function))
+}
+
+/// The bounds the owner declared — the param env a body owner's inference
+/// runs in (each rigid type variable's declared bound conjunction), in the
+/// declaration side's own plain vocabulary (the lowering ctx and the fact
+/// oracle take it directly).
+pub(crate) fn owner_declared_bounds<'db>(
+    db: &'db dyn baml_compiler2_ppir::Db,
+    owner: BodyOwnerId<'db>,
+) -> FxHashMap<baml_type::ParamTy, Vec<baml_type::Interface>> {
+    match owner {
+        BodyOwnerId::Function(function) | BodyOwnerId::ParameterDefaults(function) => {
+            crate::lower::function_generic_bounds(db, function)
+        }
+        BodyOwnerId::Let(_) => FxHashMap::default(),
+    }
 }
 
 /// Infers types for one body owner (function or top-level let), keyed by
@@ -1249,9 +1402,9 @@ fn infer_body_impl<'db>(
                 signature
                     .params
                     .iter()
-                    .map(|param| param.ty.clone())
+                    .map(|param| crate::impls::interned_ty(&param.ty))
                     .collect(),
-                Some(signature.ret.clone()),
+                Some(crate::impls::interned_ty(&signature.ret)),
                 // The owner checks its throw sites against the RAW written
                 // clause (holes preserved - a partial clause opens the
                 // contract), never the caller-facing surface, which for a
@@ -1270,7 +1423,7 @@ fn infer_body_impl<'db>(
                 signature
                     .params
                     .iter()
-                    .map(|param| param.ty.clone())
+                    .map(|param| crate::impls::interned_ty(&param.ty))
                     .collect(),
                 None,
                 None,
@@ -1278,27 +1431,24 @@ fn infer_body_impl<'db>(
         }
         BodyOwnerId::Let(_) => (Vec::new(), Vec::new(), None, None),
     };
-    let bounds = match owner {
-        BodyOwnerId::Function(function) | BodyOwnerId::ParameterDefaults(function) => {
-            crate::lower::function_generic_bounds(db, function)
-        }
-        BodyOwnerId::Let(_) => FxHashMap::default(),
-    };
     let concrete_self = match owner {
         BodyOwnerId::Function(function) | BodyOwnerId::ParameterDefaults(function) => {
             // BODY-position `Self` is a PLAIN-class-method error (the
             // ratified rule: signatures resolve it, bodies do not);
-            // implements-block bodies (Self substitutes to the subject),
-            // interface default bodies (frame slot 0), and free-impl
-            // bodies keep theirs.
+            // implements-block bodies (`Self` substitutes to the subject,
+            // and they are Impl-owned — in-class and out-of-body alike)
+            // and interface default bodies (frame slot 0) keep theirs.
             match baml_compiler2_ppir::item_data::method_owner(db, function) {
-                Some(baml_compiler2_ppir::item_data::MethodOwner::Class(_))
-                    if baml_compiler2_ppir::item_data::method_interface_target(db, function)
-                        .is_none() =>
-                {
+                Some(baml_compiler2_ppir::item_data::MethodOwner::Class(_)) => {
+                    debug_assert!(
+                        baml_compiler2_ppir::item_data::method_interface_target(db, function)
+                            .is_none(),
+                        "interface targets are recorded on impl-block methods, which are \
+                         Impl-owned",
+                    );
                     None
                 }
-                _ => crate::lower::owner_self_ty(db, function, &frame),
+                _ => crate::lower::owner_self_ty(db, function),
             }
         }
         BodyOwnerId::Let(_) => None,
@@ -1311,33 +1461,11 @@ fn infer_body_impl<'db>(
     };
     let lower = lower_ctx_for_file(db, owner.file(db))
         .with_frame(frame)
-        .with_bounds(bounds.clone())
+        .with_bounds(owner_declared_bounds(db, owner))
         .with_self_ty(concrete_self)
-        .with_impl_target(impl_target)
-        .with_diagnostics();
+        .with_impl_target(impl_target);
     let type_refs = baml_compiler2_ppir::body_type_refs(db, owner);
-    let plain_bounds = bounds
-        .into_iter()
-        .map(|(param, bounds)| {
-            (
-                param,
-                bounds
-                    .into_iter()
-                    .map(|bound| {
-                        baml_type::Interface::new(
-                            bound.name.clone(),
-                            bound.generics.iter().map(Ty::to_plain).collect(),
-                            bound
-                                .associated_types
-                                .iter()
-                                .map(|(name, ty)| (name.clone(), ty.to_plain()))
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
+    let plain_bounds = owner_declared_bounds(db, owner);
     // Split the declared clause into its named part and openness (spec
     // rule 3: `throws T | _` names T and opens the remainder to
     // inference); nested holes in named members stay ruling-4 errors.
@@ -1345,21 +1473,24 @@ fn infer_body_impl<'db>(
         match declared_throws_ref.map(|(store, throws)| lower.lower_type_ref(store, throws)) {
             Some(raw) => {
                 let (named, open) = crate::lower::throws_clause_parts(&raw);
-                (Some(named), open)
+                (Some(Ty::from_plain(&named)), open)
             }
             None => (None, false),
         };
     let mut ctx = InferenceContext::new(
         db,
         index,
+        owner.file(db),
         owner_scope,
         lower,
         param_tys,
         return_ty,
         type_refs,
         plain_bounds,
-        stable_body_owner_identity(db, owner),
     );
+    if !declared_throws_open {
+        ctx.throws_channels[0].expected.clone_from(&declared_throws);
+    }
     ctx.declared_throws = declared_throws;
     ctx.declared_throws_open = declared_throws_open;
     ctx.body_owner_id = Some(owner);
@@ -1370,7 +1501,6 @@ fn infer_body_impl<'db>(
         BodyOwnerId::Let(_) => None,
     };
     ctx.body_owner_id = Some(owner);
-    ctx.owner_file = Some(owner.file(db));
     ctx.defaults_owner = matches!(owner, BodyOwnerId::ParameterDefaults(_));
     if let BodyOwnerId::ParameterDefaults(function) = owner {
         // The defaults arena has no single root: each parameter's default
@@ -1397,34 +1527,6 @@ fn infer_body_impl<'db>(
         ctx.infer_expr_body(expr_body);
     }
     ctx.finish()
-}
-
-/// Architecture-stable owner key for lexical synthetic parameters. This is
-/// deliberately derived from source identity rather than Salsa intern IDs.
-fn stable_body_owner_identity(db: &dyn baml_compiler2_ppir::Db, owner: BodyOwnerId<'_>) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    let mut write = |bytes: &[u8]| {
-        for byte in bytes {
-            hash ^= u32::from(*byte);
-            hash = hash.wrapping_mul(0x0100_0193);
-        }
-    };
-    write(owner.file(db).path(db).to_string_lossy().as_bytes());
-    match owner {
-        BodyOwnerId::Function(function) => {
-            write(&[0]);
-            write(&function.id(db).as_u32().to_le_bytes());
-        }
-        BodyOwnerId::Let(let_binding) => {
-            write(&[1]);
-            write(&let_binding.id(db).as_u32().to_le_bytes());
-        }
-        BodyOwnerId::ParameterDefaults(function) => {
-            write(&[2]);
-            write(&function.id(db).as_u32().to_le_bytes());
-        }
-    }
-    hash
 }
 
 /// Which bounded-var classes a finish-fixpoint round may commit: the
@@ -1475,6 +1577,15 @@ impl Diverges {
 enum Expectation {
     None,
     HasType(Ty),
+    /// The value is not observed: a statement expression, a loop or
+    /// `defer` body, the tail of a `-> void` body. It constrains nothing,
+    /// and nothing typed by a block-scoped `type T = …` binding can leave
+    /// a block through it.
+    Discarded,
+    /// The context is an error-recovery sentinel, already diagnosed: the
+    /// value is checked against nothing and reports nothing of its own,
+    /// so a single mistake in a signature does not cascade into the body.
+    Erroneous,
 }
 
 impl Expectation {
@@ -1483,8 +1594,8 @@ impl Expectation {
     /// sentinel - e.g. the `throws Error` placeholder inside a function
     /// type until S12 - must not discard the useful structure around it.
     fn has_type(ty: Ty) -> Expectation {
-        if matches!(ty.kind(), TyKind::Error { .. }) {
-            Expectation::None
+        if matches!(ty.kind(), InferTy::Error { .. }) {
+            Expectation::Erroneous
         } else {
             Expectation::HasType(ty)
         }
@@ -1493,7 +1604,7 @@ impl Expectation {
     fn only_has_type(&self) -> Option<&Ty> {
         match self {
             Expectation::HasType(ty) => Some(ty),
-            Expectation::None => None,
+            Expectation::None | Expectation::Discarded | Expectation::Erroneous => None,
         }
     }
 
@@ -1504,13 +1615,15 @@ impl Expectation {
         match self {
             Expectation::HasType(ty) => {
                 let resolved = table.shallow_resolve(ty);
-                if matches!(resolved.kind(), TyKind::Infer { .. }) {
+                if matches!(resolved.kind(), InferTy::InferVar { .. }) {
                     Expectation::None
                 } else {
                     Expectation::HasType(resolved)
                 }
             }
             Expectation::None => Expectation::None,
+            Expectation::Discarded => Expectation::Discarded,
+            Expectation::Erroneous => Expectation::Erroneous,
         }
     }
 }
@@ -1547,10 +1660,7 @@ struct InferenceContext<'db> {
     /// Active lexical runtime type names, innermost last. The declaration
     /// lowering context remains immutable; body-owned type lowering forks it
     /// with these rigid parameters.
-    scoped_type_bindings: Vec<ScopedTypeBinding>,
-    /// Stable hash of the body owner, combined with `StmtId` for scoped rigid
-    /// parameter identity.
-    body_owner_identity: u32,
+    scoped_type_bindings: Vec<ScopedTypeBinding<Ty>>,
     /// Full owner identity for the Session top-level-let value tier. Keeping
     /// this lets a malformed self-reference fail closed instead of recursively
     /// asking Salsa for the inference result currently being built.
@@ -1561,8 +1671,9 @@ struct InferenceContext<'db> {
     /// Every type annotation written in this body, pre-lowered to span-free
     /// `TypeRef`s (the rust-analyzer bodies-own-their-type-refs shape).
     type_refs: Arc<BodyTypeRefs>,
-    /// The owner's declared return type, the body root's expectation.
-    return_ty: Option<Ty>,
+    /// One return context per callable, with the current callable last.
+    /// The bottom frame belongs to the body owner; lambdas push their own.
+    return_frames: Vec<ReturnFrame>,
     /// The owner's DECLARED throws clause's NAMED part, when written: the
     /// contract every throw site and callee effect is checked against.
     /// `None` means the effect is inferred instead (from the channel
@@ -1575,7 +1686,7 @@ struct InferenceContext<'db> {
     /// The effect-channel stack: contributions from `throw` sites and
     /// callee throws accumulate into the top. The bottom entry is the
     /// owner's channel; lambdas and `catch` bases push their own.
-    throws_channels: Vec<Vec<(ExprId, Ty)>>,
+    throws_channels: Vec<ThrowsChannel>,
     /// S17 pending diagnostics: anchored on arena ids, interned payloads;
     /// finalized into `InferenceResult::diagnostics` (plain types) at
     /// finish - r-a's `InferenceDiagnostic` discipline.
@@ -1585,12 +1696,18 @@ struct InferenceContext<'db> {
     /// finalize reports E0147 `CannotInferType` there (rustc's E0282
     /// discipline) instead of leaking a bare `Infer` into lowering.
     hole_vars: Vec<(baml_type::interned::InferVar, HoleAnchor)>,
+    /// User-source origins for ordinary inference variables that require a
+    /// concrete solution. The order vector makes diagnostic selection stable
+    /// when several source variables unify into one unresolved class.
+    infer_var_origins: FxHashMap<baml_type::interned::InferVar, InferVarOrigin>,
+    infer_var_origin_order: Vec<baml_type::interned::InferVar>,
+    diagnosed_infer_vars: rustc_hash::FxHashSet<baml_type::interned::InferVar>,
     /// One lowering per written body annotation (rust-analyzer's
     /// discipline): the let rule, the pattern walk, and the backfill all
     /// read the SAME lowered type - and so the same instantiated hole
-    /// vars - for one `TypeRefId`. Without this, a `_` hole instantiates
+    /// vars - for one `BodyTypeRefId`. Without this, a `_` hole instantiates
     /// once per consumer and only the demand-connected copy solves.
-    annotation_cache: FxHashMap<baml_compiler2_hir::type_ref::TypeRefId, Ty>,
+    annotation_cache: FxHashMap<BodyTypeRefId, Ty>,
     /// Per-body memoization of ground canonical forms. Inference-bearing types
     /// bypass it because their meaning changes as the table solves variables.
     canonical_cache: baml_type::normalize::InternedCanonicalCache,
@@ -1598,6 +1715,11 @@ struct InferenceContext<'db> {
     /// discipline): a failed lookup reports only when no fallback tier
     /// remains - probes increment, the committed frame reports.
     member_probe_depth: u32,
+    /// Nonzero while an optional-call callee is inferred as an ordinary
+    /// expression. Its arguments still provide specialization evidence after
+    /// the callee has been typed, so a generic value diagnostic must remain
+    /// conditional until the whole call has been checked.
+    optional_call_callee_depth: u32,
     /// Depth of pattern lowering where the dead-pattern overlap check
     /// probes SILENTLY: or-pattern alternatives (one alt that can't
     /// match is fine - rustc's rule - only the whole `|` chain failing
@@ -1629,6 +1751,16 @@ struct InferenceContext<'db> {
     /// `ObligationCause`: obligations born inside a structural `sub`
     /// recursion anchor their eventual diagnostic here.
     obligation_anchor: Option<ExprId>,
+    /// Escapes refused with no anchor to report at (a relation reached from
+    /// a pattern walk or a bound replay): each waits for the block that
+    /// binds its parameter to close and is reported at that block's tail.
+    anchorless_escapes: Vec<(baml_type::ParamTy, Ty)>,
+    /// Classes an escape refusal filled with `Error` after reporting. A
+    /// later "cannot infer" report about one of them would be a cascade of
+    /// the refusal, so it is suppressed - keyed on the refusal itself rather
+    /// than on "the class holds an `Error`", which any other road could also
+    /// produce without having said anything.
+    refused_escape_vars: rustc_hash::FxHashSet<baml_type::interned::InferVar>,
     /// The function whose body this run infers, when the owner IS a
     /// function - the resolver for owner-scoped receivers (`default`
     /// inside an `implements` block, like `self`).
@@ -1668,7 +1800,9 @@ struct InferenceContext<'db> {
     diverges: Diverges,
     /// The body's file, for package-scoped lookups (the overlap oracle's
     /// alias map enumerates the owning package plus its dependency closure).
-    owner_file: Option<baml_base::SourceFile>,
+    /// The file whose body this context infers; its package is the viewer
+    /// every visibility question is asked from.
+    owner_file: baml_base::SourceFile,
     /// The pattern-reachability oracle's pre-folded alias map, built once
     /// The enclosing scope's PLAIN bound env for the written-type
     /// well-formedness judgment on body annotations, built lazily like
@@ -1677,20 +1811,12 @@ struct InferenceContext<'db> {
         std::cell::OnceCell<rustc_hash::FxHashMap<baml_type::ParamTy, Vec<baml_type::Interface>>>,
     /// per inference on first use (TIR's `normalized_overlap_aliases`).
     overlap_aliases:
-        std::cell::OnceCell<std::collections::HashMap<baml_type::QualifiedTypeName, baml_type::Ty>>,
-    /// Original parameter templates for argument checks that mention a
-    /// runtime generic. This is inference-only staging: `check_call_args`
-    /// consumes it into durable `CallPlan::deferred_checks`, so defaults and
-    /// sibling bodies cannot observe it.
-    runtime_dependent_call_params: FxHashMap<ExprId, FxHashMap<usize, Ty>>,
-    /// Carriers already reported as escaping their call (E0168), so a callee
-    /// road walked twice reports once.
-    reported_runtime_escapes: rustc_hash::FxHashSet<ExprId>,
-    /// Inline `unreflect(...)` carriers whose call publishes the parameter in
-    /// its RESULT — the bare `-> T` included. The `?.` check consults this at
-    /// the chain boundary, where the callee's signature is no longer reachable.
-    runtime_slots_named_by_result: rustc_hash::FxHashSet<ExprId>,
-    result: InferenceResult<'db>,
+        std::cell::OnceCell<std::collections::HashMap<baml_type::DeclName, baml_type::Ty>>,
+    /// A binding's runtime operand can be reached by more than one inference
+    /// road (for example the claim and body passes over a catch arm). Its
+    /// expression effects and diagnostics must still be inferred once.
+    validated_runtime_operands: rustc_hash::FxHashSet<ExprId>,
+    result: WorkingResult<'db>,
 }
 
 impl<'db> InferenceContext<'db> {
@@ -1698,13 +1824,13 @@ impl<'db> InferenceContext<'db> {
     fn new(
         db: &'db dyn baml_compiler2_ppir::Db,
         index: &'db FileSemanticIndex<'db>,
+        owner_file: baml_base::SourceFile,
         owner_scope: Option<FileScopeId>,
         lower: LowerCtx<'db>,
         param_tys: Vec<Ty>,
         return_ty: Option<Ty>,
         type_refs: Arc<BodyTypeRefs>,
         bounds: FxHashMap<baml_type::ParamTy, Vec<baml_type::Interface>>,
-        body_owner_identity: u32,
     ) -> InferenceContext<'db> {
         InferenceContext {
             db,
@@ -1716,19 +1842,29 @@ impl<'db> InferenceContext<'db> {
             flow: FxHashMap::default(),
             lower,
             scoped_type_bindings: Vec::new(),
-            body_owner_identity,
             body_owner_id: None,
             param_tys,
             type_refs,
-            return_ty,
+            return_frames: return_ty
+                .into_iter()
+                .map(|expected| ReturnFrame {
+                    expected: Some(expected),
+                    candidates: Vec::new(),
+                    scoped_bindings_floor: 0,
+                })
+                .collect(),
             declared_throws: None,
             declared_throws_open: false,
-            throws_channels: vec![Vec::new()],
+            throws_channels: vec![ThrowsChannel::default()],
             pending_diags: Vec::new(),
             hole_vars: Vec::new(),
+            infer_var_origins: FxHashMap::default(),
+            infer_var_origin_order: Vec::new(),
+            diagnosed_infer_vars: rustc_hash::FxHashSet::default(),
             annotation_cache: FxHashMap::default(),
             canonical_cache: baml_type::normalize::InternedCanonicalCache::default(),
             member_probe_depth: 0,
+            optional_call_callee_depth: 0,
             or_probe_depth: 0,
             rest_reject_depth: 0,
             template_params: Vec::new(),
@@ -1736,6 +1872,8 @@ impl<'db> InferenceContext<'db> {
             deferred_subs: Vec::new(),
             obligations: Vec::new(),
             obligation_anchor: None,
+            anchorless_escapes: Vec::new(),
+            refused_escape_vars: rustc_hash::FxHashSet::default(),
             body_owner: None,
             defaults_owner: false,
             chain_nullable: Vec::new(),
@@ -1746,13 +1884,11 @@ impl<'db> InferenceContext<'db> {
             provisional_checks: Vec::new(),
             pending_truthy_conditions: Vec::new(),
             diverges: Diverges::Maybe,
-            owner_file: None,
+            owner_file,
             overlap_aliases: std::cell::OnceCell::new(),
             wf_scope_env: std::cell::OnceCell::new(),
-            runtime_dependent_call_params: FxHashMap::default(),
-            reported_runtime_escapes: rustc_hash::FxHashSet::default(),
-            runtime_slots_named_by_result: rustc_hash::FxHashSet::default(),
-            result: InferenceResult::default(),
+            validated_runtime_operands: rustc_hash::FxHashSet::default(),
+            result: WorkingResult::default(),
         }
     }
 
@@ -1774,18 +1910,25 @@ impl<'db> InferenceContext<'db> {
         self.register_property_shorthands(body);
         self.body_root = body.root_expr;
         if let Some(root) = body.root_expr {
-            match self.return_ty.clone() {
+            match self
+                .return_frames
+                .last()
+                .and_then(|frame| frame.expected.clone())
+            {
                 // A void function DISCARDS its body's tail value (TIR's
                 // statement semantics; `defer { .. }; log.push(..)` as
                 // the last line of a `-> void` fn is fine) - the body
                 // still walks fully, it just isn't checked against unit.
                 Some(return_ty) if is_unit(&return_ty) => {
-                    self.infer_expr(body, root, &Expectation::None);
+                    self.infer_expr(body, root, &Expectation::Discarded);
                 }
                 Some(return_ty) if !return_ty.has_error() => {
                     self.check_expr(body, root, &return_ty);
                 }
-                _ => {
+                Some(_) => {
+                    self.infer_expr(body, root, &Expectation::Erroneous);
+                }
+                None => {
                     self.infer_expr(body, root, &Expectation::None);
                 }
             }
@@ -1850,46 +1993,13 @@ impl<'db> InferenceContext<'db> {
     /// `Sub(actual, expected)`, discharged eagerly. Definite failures are
     /// recorded against the checked expression, never dropped.
     fn check_expr(&mut self, body: &ExprBody, expr: ExprId, expected: &Ty) -> Ty {
-        // A lexical `type T = unreflect(value)` is rigid for identity and
-        // name resolution, but its actual runtime shape is unavailable to
-        // static inference. Preserve the check structurally for MIR instead
-        // of either accepting it blindly or diagnosing every concrete value
-        // against the opaque parameter. The expression still infers without
-        // an expectation so its own diagnostics/effects and actual type are
-        // retained.
-        let depends_on_scoped_type = self
-            .scoped_type_bindings
-            .iter()
-            .any(|binding| ty_mentions_param(expected, &binding.parameter));
-        if depends_on_scoped_type {
-            let ty = self.infer_expr(body, expr, &Expectation::None);
-            // Erasing only the dynamic leaves a static skeleton: `list<T>`
-            // still rejects an `int`, while a `list<int>` advances to the
-            // runtime gate for its element relation. This is the same
-            // dependent-only discipline used by call-site runtime slots.
-            let static_expected =
-                self.scoped_type_bindings
-                    .iter()
-                    .fold(expected.clone(), |expected, binding| {
-                        replace_rigid_param(&expected, &binding.parameter, &binding.occurrence_ty)
-                    });
-            let saved_anchor = self.obligation_anchor.replace(expr);
-            let fits_static_shape = self.sub(&ty, &static_expected);
-            self.obligation_anchor = saved_anchor;
-            if fits_static_shape {
-                self.result.runtime_checks.push(RuntimeCheck::Argument {
-                    arg: expr,
-                    expected: expected.clone(),
-                });
-                self.record_function_adapter(expr, &ty, expected);
-            } else {
-                self.result
-                    .type_mismatches
-                    .insert(expr, (expected.clone(), ty.clone()));
-            }
-            return ty;
-        }
-        let ty = self.infer_expr(body, expr, &Expectation::has_type(expected.clone()));
+        let ty = self.infer_expr_with_hint(body, expr, Some(expected));
+        self.check_inferred(expr, ty, expected)
+    }
+
+    /// The checking half of [`Self::check_expr`]: relate an already inferred
+    /// `ty` to `expected` at `expr`, recording the mismatch or the adapter.
+    fn check_inferred(&mut self, expr: ExprId, ty: Ty, expected: &Ty) -> Ty {
         let saved_anchor = self.obligation_anchor.replace(expr);
         let fits = self.sub(&ty, expected);
         self.obligation_anchor = saved_anchor;
@@ -1907,40 +2017,128 @@ impl<'db> InferenceContext<'db> {
                 self.provisional_checks
                     .push((expr, expected.clone(), ty.clone()));
             }
-            self.record_function_adapter(expr, &ty, expected);
         }
         ty
     }
 
-    /// rustc/r-a record coercions as per-expression adjustments consumed
-    /// structurally at MIR lowering; every checked position funnels
-    /// through `check_expr`, so this one probe covers TIR's five
-    /// recording sites. Fires only on an ACCEPTED check whose value and
-    /// expectation are both function-shaped but runtime-incompatible
-    /// (TIR's `function_coercion_for`): lowering must synthesize an
-    /// adapter closure. Read-only on inference state (no var forcing -
-    /// alias expansion only), so recording cannot perturb typing.
-    fn record_function_adapter(&mut self, expr: ExprId, got: &Ty, expected: &Ty) {
-        let got = self.table.resolve_completely(got);
-        let got = self.expand_alias_ty(&got);
-        let TyKind::Function { params: source, .. } = got.kind() else {
-            return;
+    /// Supply value context without checking the outer relation. Return values
+    /// use `check_expr`; thrown values need effect diagnostics and panic filtering
+    /// instead, but share the same contextual inference.
+    fn infer_expr_with_hint(&mut self, body: &ExprBody, expr: ExprId, expected: Option<&Ty>) -> Ty {
+        let expectation = expected
+            .cloned()
+            .map_or(Expectation::None, Expectation::has_type);
+        self.infer_expr(body, expr, &expectation)
+    }
+
+    fn infer_throw(&mut self, body: &ExprBody, value: ExprId) {
+        let expected = self
+            .throws_channels
+            .last()
+            .and_then(|channel| channel.expected.clone());
+        let thrown = self.infer_expr_with_hint(body, value, expected.as_ref());
+        self.record_throw(value, &thrown);
+    }
+
+    fn infer_return(
+        &mut self,
+        body: &ExprBody,
+        value: Option<ExprId>,
+        stmt: Option<StmtId>,
+        expr: Option<ExprId>,
+    ) {
+        let (expected, floor) = match self.return_frames.last() {
+            Some(frame) => (frame.expected.clone(), frame.scoped_bindings_floor),
+            None => (None, 0),
         };
-        let target_fn = self.table.resolve_completely(expected);
-        let target_fn = self.expand_alias_ty(&target_fn);
-        let TyKind::Function { params: target, .. } = target_fn.kind() else {
-            return;
+        let actual = match value {
+            Some(value) => {
+                let context = expected.as_ref().filter(|expected| !expected.has_error());
+                let expectation = match (&expected, context) {
+                    (_, Some(context)) => Expectation::has_type(context.clone()),
+                    (Some(_), None) => Expectation::Erroneous,
+                    (None, None) => Expectation::None,
+                };
+                let ty = self.infer_expr(body, value, &expectation);
+                match self.frame_scoped_param(&ty, floor) {
+                    // A context already diagnosed suppresses the escape too.
+                    Some(_) if expected.as_ref().is_some_and(Ty::has_error) => ty,
+                    // A `return` leaves every block of its frame at once, so a
+                    // value typed by a binding the frame opened is judged
+                    // here, at the return, the way a declared `throws` judges
+                    // a throw: the binding is still in scope, so the closing
+                    // brace would never see it, and a frame candidate carries
+                    // no anchor to report at.
+                    Some(escaped) => {
+                        let context = context
+                            .map(|context| self.table.resolve_completely(context))
+                            .filter(|context| self.frame_scoped_param(context, floor).is_none());
+                        self.publish_scoped_value(value, &escaped, &ty, context)
+                    }
+                    None => match context {
+                        Some(context) => self.check_inferred(value, ty, context),
+                        None => ty,
+                    },
+                }
+            }
+            None => {
+                let actual = Ty::void();
+                if let Some(expected) = &expected
+                    && !expected.has_error()
+                {
+                    let fits = self.sub(&actual, expected);
+                    if expected.has_infer() || !fits {
+                        self.pending_diags.push(PendingDiag::ReturnTypeMismatch {
+                            stmt,
+                            expr,
+                            expected: expected.clone(),
+                            actual: actual.clone(),
+                        });
+                    }
+                }
+                actual
+            }
         };
-        if function_params_runtime_compatible(source, target) {
-            return;
+        if let Some(frame) = self.return_frames.last_mut() {
+            frame.candidates.push(actual);
         }
-        self.result.expr_adjustments.insert(
-            expr,
-            Box::new([Adjustment {
-                kind: Adjust::FunctionAdapter,
-                target: target_fn.clone(),
-            }]),
+    }
+
+    /// Opens a speculative probe: relate freely, then discard the whole
+    /// attempt with [`InferenceContext::rollback_probe`]. See
+    /// [`ProbeCheckpoint`].
+    fn probe(&mut self) -> ProbeCheckpoint {
+        ProbeCheckpoint {
+            table: self.table.snapshot(),
+            deferred_subs: self.deferred_subs.len(),
+            obligations: self.obligations.len(),
+            pending_diags: self.pending_diags.len(),
+            anchorless_escapes: self.anchorless_escapes.len(),
+            provisional_checks: self.provisional_checks.len(),
+            infer_var_origins: self.infer_var_origin_order.len(),
+            type_mismatches: self.result.type_mismatches.len(),
+        }
+    }
+
+    /// Discards everything a probe did, in the order the state depends on:
+    /// the accumulators first (they name variables), then the table, whose
+    /// rollback frees those variables' keys for reuse.
+    fn rollback_probe(&mut self, probe: ProbeCheckpoint) {
+        self.deferred_subs.truncate(probe.deferred_subs);
+        self.obligations.truncate(probe.obligations);
+        self.pending_diags.truncate(probe.pending_diags);
+        self.anchorless_escapes.truncate(probe.anchorless_escapes);
+        self.provisional_checks.truncate(probe.provisional_checks);
+        for var in self.infer_var_origin_order.drain(probe.infer_var_origins..) {
+            self.infer_var_origins.remove(&var);
+        }
+        debug_assert_eq!(
+            self.result.type_mismatches.len(),
+            probe.type_mismatches,
+            "a probe must not record a type mismatch: the attempt is discarded, \
+             and the map is keyed rather than journalled, so the entry would outlive it"
         );
+        self.table.rollback_to(probe.table);
     }
 
     fn infer_expr(&mut self, body: &ExprBody, expr: ExprId, expected: &Expectation) -> Ty {
@@ -1953,7 +2151,7 @@ impl<'db> InferenceContext<'db> {
                 // placeholder so a failed compile can't carry the bad value
                 // forward - TIR's rule verbatim.
                 let lit = if let Literal::Int(v) = lit
-                    && !(INT_MIN..=INT_MAX).contains(v)
+                    && Int63::new(*v).is_none()
                 {
                     self.pending_diags
                         .push(PendingDiag::IntLiteralOutOfRange { expr, value: *v });
@@ -1961,7 +2159,7 @@ impl<'db> InferenceContext<'db> {
                 } else {
                     lit
                 };
-                Ty::intern(TyKind::Literal(
+                Ty::intern(InferTy::Literal(
                     lit.clone(),
                     Freshness::Fresh,
                     TyAttr::default(),
@@ -1971,10 +2169,10 @@ impl<'db> InferenceContext<'db> {
             // A byte-string literal (`b"..."`) IS a `uint8array` value -
             // its own expr kind, not a `Literal` (no literal TYPE per
             // byte-string; TIR agrees).
-            Expr::ByteStringLiteral(_) => Ty::intern(TyKind::Uint8Array {
+            Expr::ByteStringLiteral(_) => Ty::intern(InferTy::Uint8Array {
                 attr: TyAttr::default(),
             }),
-            Expr::Path(segments) => self.resolve_value_path(expr, segments),
+            Expr::Path(segments) => self.resolve_value_path(body, expr, segments, expected),
             Expr::Index { base, index } => self.infer_index(body, expr, *base, *index, false),
             Expr::Spawn {
                 name,
@@ -2048,7 +2246,7 @@ impl<'db> InferenceContext<'db> {
                     }
                     None => Ty::void(),
                 };
-                self.finish_scoped_type_bindings(type_scope, ty)
+                self.finish_scoped_type_bindings(type_scope, expr, *tail_expr, ty, expected)
             }
             Expr::If {
                 condition,
@@ -2147,6 +2345,13 @@ impl<'db> InferenceContext<'db> {
                     }
                 }
             }
+            Expr::QualifiedPath { member, .. } => {
+                // A fully-qualified item reference used as a VALUE. Its own
+                // generic suffix is fresh: only a call site can spell a
+                // turbofish, exactly as for the two path spellings.
+                let member = member.clone();
+                self.qualified_path_value(expr, &member, OwnArgs::Fresh, Some(expr))
+            }
             Expr::Upcast { base, .. } => {
                 // Rust's qualified trait path (`<X as Parent<i32>>`,
                 // r-a's trait-object coercion): the value viewed through
@@ -2159,31 +2364,28 @@ impl<'db> InferenceContext<'db> {
                 // instantiations). Interface views only (TIR's rule);
                 // the non-interface diagnostic is S17's.
                 let base_ty = self.infer_expr(body, *base, &Expectation::None);
-                let target = self
-                    .type_refs
-                    .upcast_targets
-                    .get(&expr)
-                    .copied()
-                    .map(|target_ref| {
-                        let lowered = self.lower_scoped_type_ref_at(
-                            &self.type_refs.store,
+                let target =
+                    if let Some(target_ref) = self.type_refs.upcast_targets.get(&expr).copied() {
+                        let (lowered, diagnostics) = self.lower_body_type_ref_at(
                             target_ref,
                             crate::lower::TypePosition::Existential,
+                            crate::lower::HolePolicy::Allowed,
                         );
+                        self.queue_body_lowering_diagnostics(diagnostics);
                         self.reject_expr_position_holes(&lowered, expr)
-                    })
-                    .unwrap_or_else(Ty::error);
+                    } else {
+                        Ty::error()
+                    };
                 // The interface-view gate is a STRUCTURE demand: an
                 // alias naming an interface answers as the interface.
                 let target = self.expand_alias_ty(&target);
                 if target.has_error() {
                     Ty::error()
-                } else if !matches!(target.kind(), TyKind::Interface(..)) {
-                    self.pending_diags
-                        .push(PendingDiag::UpcastTargetNotInterface {
-                            expr,
-                            target: target.clone(),
-                        });
+                } else if !matches!(target.kind(), InferTy::Interface(..)) {
+                    self.pending_diags.push(PendingDiag::QualifierNotInterface {
+                        expr,
+                        target: target.clone(),
+                    });
                     Ty::error()
                 } else {
                     let saved_anchor = self.obligation_anchor.replace(expr);
@@ -2193,11 +2395,12 @@ impl<'db> InferenceContext<'db> {
                         // BEP-044's dedicated form: the value's type does
                         // not implement the requested interface - clearer
                         // than the generic mismatch.
-                        self.pending_diags.push(PendingDiag::UpcastNotImplemented {
-                            expr,
-                            value: base_ty,
-                            interface: target.clone(),
-                        });
+                        self.pending_diags
+                            .push(PendingDiag::QualifierNotImplemented {
+                                expr,
+                                value: base_ty,
+                                interface: target.clone(),
+                            });
                     }
                     target
                 }
@@ -2250,7 +2453,7 @@ impl<'db> InferenceContext<'db> {
                     // when the tag validated; an unresolved tag already
                     // reported UnresolvedName and stays quiet here.
                     let (result, frame) = match resolved.kind() {
-                        TyKind::Function { params, ret, .. } => {
+                        InferTy::Function { params, ret, .. } => {
                             let func = match self.result.member_resolutions.get(tag) {
                                 Some(MemberResolution::Free { func }) => Some(*func),
                                 _ => None,
@@ -2263,11 +2466,11 @@ impl<'db> InferenceContext<'db> {
                                 param.name.as_ref().is_some_and(|n| n.as_str() == "body")
                                     && matches!(
                                         param.ty.kind(),
-                                        TyKind::Function { ret: body_ret, .. }
+                                        InferTy::Function { ret: body_ret, .. }
                                             if matches!(
                                                 body_ret.kind(),
-                                                TyKind::Class(qtn, _, _)
-                                                    if qtn.is_builtin_root_type("TaggedString")
+                                                InferTy::Class(qtn, _, _)
+                                                    if qtn.is_lang_root_type(self.lang(), baml_base::LangPackage::Baml, "TaggedString")
                                             )
                                     )
                             });
@@ -2290,7 +2493,7 @@ impl<'db> InferenceContext<'db> {
                             } else {
                                 let mut frame = FxHashMap::default();
                                 if let Some(first) = params.first()
-                                    && let TyKind::Function {
+                                    && let InferTy::Function {
                                         params: body_params,
                                         ..
                                     } = first.ty.kind()
@@ -2325,7 +2528,7 @@ impl<'db> InferenceContext<'db> {
                     // Entering it here would key every lookup into a
                     // namespace nothing was registered under.
                     self.template_params.push(frame);
-                    self.throws_channels.push(Vec::new());
+                    self.throws_channels.push(ThrowsChannel::default());
                     let saved_diverges = std::mem::replace(&mut self.diverges, Diverges::Maybe);
                     self.infer_expr(body, *flatten, &Expectation::None);
                     self.diverges = saved_diverges;
@@ -2351,8 +2554,8 @@ impl<'db> InferenceContext<'db> {
                     }
                     None if elements.is_empty() => {
                         // `[]`: a list over a fresh element variable - the
-                        // honest replacement for the EvolvingList sentinel.
-                        Ty::list(self.table.new_establishment_var_ty())
+                        // honest replacement for TIR's evolving-list sentinel.
+                        self.untyped_empty_container_ty(expr, Ty::list)
                     }
                     None => {
                         let joined: Vec<Ty> = elements
@@ -2397,7 +2600,7 @@ impl<'db> InferenceContext<'db> {
                         self.check_expr(body, entry.key, &key_ty);
                         self.check_expr(body, entry.value, &value_ty);
                     }
-                    Ty::intern(TyKind::Map {
+                    Ty::intern(InferTy::Map {
                         key: key_ty,
                         value: value_ty,
                         attr: TyAttr::default(),
@@ -2408,10 +2611,12 @@ impl<'db> InferenceContext<'db> {
                     // `checked_map_key`), so a key var has exactly one
                     // legal solution and leaving it open lets `m[0] = 1`
                     // silently solve `?K := int`.
-                    Ty::intern(TyKind::Map {
-                        key: Ty::string(),
-                        value: self.table.new_establishment_var_ty(),
-                        attr: TyAttr::default(),
+                    self.untyped_empty_container_ty(expr, |value| {
+                        Ty::intern(InferTy::Map {
+                            key: Ty::string(),
+                            value,
+                            attr: TyAttr::default(),
+                        })
                     })
                 } else {
                     let (keys, values): (Vec<Ty>, Vec<Ty>) = entries
@@ -2422,7 +2627,7 @@ impl<'db> InferenceContext<'db> {
                             (self.widen_fresh(&key_ty), self.widen_fresh(&value_ty))
                         })
                         .unzip();
-                    Ty::intern(TyKind::Map {
+                    Ty::intern(InferTy::Map {
                         key: self.union_of(&keys),
                         value: self.union_of(&values),
                         attr: TyAttr::default(),
@@ -2437,22 +2642,12 @@ impl<'db> InferenceContext<'db> {
                         keyword: "return",
                     });
                 }
-                if let Some(value) = value {
-                    match self.return_ty.clone() {
-                        Some(return_ty) if !return_ty.has_error() => {
-                            self.check_expr(body, *value, &return_ty);
-                        }
-                        _ => {
-                            self.infer_expr(body, *value, &Expectation::None);
-                        }
-                    }
-                }
+                self.infer_return(body, *value, None, Some(expr));
                 self.diverges = Diverges::Always;
                 Ty::never()
             }
             Expr::Throw { value } => {
-                let thrown = self.infer_expr(body, *value, &Expectation::None);
-                self.record_throw(*value, &thrown);
+                self.infer_throw(body, *value);
                 self.diverges = Diverges::Always;
                 Ty::never()
             }
@@ -2461,51 +2656,10 @@ impl<'db> InferenceContext<'db> {
             Expr::Call { callee, args, .. } => self.infer_call(body, expr, *callee, args),
             Expr::Object {
                 type_name,
-                type_args,
                 fields,
                 spreads,
-            } => {
-                // `map { .. }` is a map literal in constructor clothing
-                // (identifier keys are string keys), never a class named
-                // `map` - same routing guard as the parser's object form.
-                if type_args.is_empty()
-                    && spreads.is_empty()
-                    && matches!(type_name.0.as_slice(), [seg] if seg.as_str() == "map")
-                {
-                    if let Some((key_ty, value_ty)) = self.expected_map_entry(expected) {
-                        for field in fields {
-                            self.check_expr(body, field.value, &value_ty);
-                        }
-                        Ty::intern(TyKind::Map {
-                            key: key_ty,
-                            value: value_ty,
-                            attr: TyAttr::default(),
-                        })
-                    } else if fields.is_empty() {
-                        Ty::intern(TyKind::Map {
-                            key: Ty::string(),
-                            value: self.table.new_establishment_var_ty(),
-                            attr: TyAttr::default(),
-                        })
-                    } else {
-                        let values: Vec<Ty> = fields
-                            .iter()
-                            .map(|field| {
-                                let value_ty =
-                                    self.infer_expr(body, field.value, &Expectation::None);
-                                self.widen_fresh(&value_ty)
-                            })
-                            .collect();
-                        Ty::intern(TyKind::Map {
-                            key: Ty::string(),
-                            value: self.union_of(&values),
-                            attr: TyAttr::default(),
-                        })
-                    }
-                } else {
-                    self.infer_object(body, expr, type_name, fields, spreads)
-                }
-            }
+                ..
+            } => self.infer_object(body, expr, type_name, fields, spreads),
             Expr::MemberAccess { base, member } => {
                 if self.check_runtime_id_member(body, expr, *base, member) {
                     return Ty::error();
@@ -2519,7 +2673,6 @@ impl<'db> InferenceContext<'db> {
                 let ty = self.infer_expr(body, *inner, &Expectation::None);
                 let nullable = self.chain_nullable.pop().expect("pushed above");
                 if nullable {
-                    self.report_chain_null_escape(body, *inner);
                     self.union_of(&[ty, Ty::null()])
                 } else {
                     ty
@@ -2535,15 +2688,14 @@ impl<'db> InferenceContext<'db> {
                 self.field_access(expr, &nonnull, member)
             }
             Expr::OptionalCall { callee, args } => {
-                self.validate_runtime_type_arg_operands(body, expr);
+                self.optional_call_callee_depth += 1;
                 let callee_ty = self.infer_expr(body, *callee, &Expectation::None);
+                self.optional_call_callee_depth -= 1;
                 self.report_mounted_reserved_call(expr, *callee);
                 self.check_needless_chain(body, expr, *callee, &callee_ty);
                 let nonnull = self.peel_chain_null(&callee_ty);
                 let args = args.clone();
-                let ret = self.check_call_args(body, expr, *callee, &nonnull, false, &args);
-                self.report_runtime_indirect_call(expr, *callee);
-                ret
+                self.check_call_args(body, expr, *callee, &nonnull, false, &args)
             }
             Expr::Lambda(def) => self.infer_lambda(body, expr, def, expected),
             Expr::Match {
@@ -2573,6 +2725,7 @@ impl<'db> InferenceContext<'db> {
                 Ty::error()
             }
         };
+        self.report_unspecialized_generic_method_value(body, expr, expected, &ty);
         self.result.type_of_expr.insert(expr, ty.clone());
         ty
     }
@@ -2580,10 +2733,10 @@ impl<'db> InferenceContext<'db> {
     fn infer_stmt(&mut self, body: &ExprBody, stmt: StmtId) {
         match &body.stmts[stmt] {
             Stmt::Expr(expr) => {
-                self.infer_expr(body, *expr, &Expectation::None);
+                self.infer_expr(body, *expr, &Expectation::Discarded);
             }
             Stmt::TypeBinding { name, value } => {
-                self.bind_scoped_runtime_type(body, stmt, name.clone(), *value);
+                self.bind_scoped_type(body, stmt, name.clone(), value);
             }
             Stmt::Let {
                 pattern,
@@ -2601,21 +2754,11 @@ impl<'db> InferenceContext<'db> {
                         keyword: "return",
                     });
                 }
-                if let Some(value) = value {
-                    match self.return_ty.clone() {
-                        Some(return_ty) if !return_ty.has_error() => {
-                            self.check_expr(body, *value, &return_ty);
-                        }
-                        _ => {
-                            self.infer_expr(body, *value, &Expectation::None);
-                        }
-                    }
-                }
+                self.infer_return(body, *value, Some(stmt), None);
                 self.diverges = Diverges::Always;
             }
             Stmt::Throw { value } => {
-                let thrown = self.infer_expr(body, *value, &Expectation::None);
-                self.record_throw(*value, &thrown);
+                self.infer_throw(body, *value);
                 self.diverges = Diverges::Always;
             }
             // Loop-local terminators: the path past them is dead; the loop
@@ -2643,7 +2786,7 @@ impl<'db> InferenceContext<'db> {
                 // control flow is rejected (loop-aware - a loop opened
                 // inside the defer may break/continue freely).
                 self.defer_loop_floors.push(self.loop_depth);
-                self.infer_expr(body, *defer_body, &Expectation::None);
+                self.infer_expr(body, *defer_body, &Expectation::Discarded);
                 self.defer_loop_floors.pop();
             }
             Stmt::Assign { target, value } => {
@@ -2672,7 +2815,7 @@ impl<'db> InferenceContext<'db> {
                 self.apply_facts(&facts.when_true);
                 let saved = self.diverges;
                 self.loop_depth += 1;
-                self.infer_expr(body, *loop_body, &Expectation::None);
+                self.infer_expr(body, *loop_body, &Expectation::Discarded);
                 self.loop_depth -= 1;
                 if let Some(after) = after {
                     self.infer_stmt(body, *after);
@@ -2711,7 +2854,7 @@ impl<'db> InferenceContext<'db> {
                 }
                 let saved = self.diverges;
                 self.loop_depth += 1;
-                self.infer_expr(body, *loop_body, &Expectation::None);
+                self.infer_expr(body, *loop_body, &Expectation::Discarded);
                 self.loop_depth -= 1;
                 self.diverges = saved;
                 self.flow = entry_flow;
@@ -2730,7 +2873,7 @@ impl<'db> InferenceContext<'db> {
                 // List elements directly; everything else through the
                 // Iterator protocol (the `iter.Iterable` Item projection).
                 let element = match collection_ty.kind() {
-                    TyKind::List(element, _) => element.clone(),
+                    InferTy::List(element, _) => element.clone(),
                     _ => self.iteration_item(&collection_ty, *collection),
                 };
                 let outcome = self.lower_pattern(body, *binding, &element);
@@ -2747,7 +2890,7 @@ impl<'db> InferenceContext<'db> {
                 let entry_flow = self.flow.clone();
                 let saved = self.diverges;
                 self.loop_depth += 1;
-                self.infer_expr(body, *loop_body, &Expectation::None);
+                self.infer_expr(body, *loop_body, &Expectation::Discarded);
                 self.loop_depth -= 1;
                 self.diverges = saved;
                 self.flow = entry_flow;
@@ -2809,76 +2952,420 @@ impl<'db> InferenceContext<'db> {
         )
     }
 
-    fn bind_scoped_runtime_type(
+    /// `type T = …;`: mint the block-scoped rigid parameter and record where
+    /// its runtime type comes from. The right-hand side is evaluated (or
+    /// lowered) BEFORE the new name enters scope, so it cannot refer to
+    /// itself.
+    fn bind_scoped_type(
         &mut self,
         body: &ExprBody,
         stmt: StmtId,
         name: baml_type::Name,
-        operand: ExprId,
+        value: &TypeBindingValue,
     ) {
-        // The RHS is evaluated before the new name enters scope.
-        self.validate_runtime_type_operand(body, operand);
-        let mut identity = self.body_owner_identity;
-        for byte in stmt.into_raw().into_u32().to_le_bytes() {
-            identity ^= u32::from(byte);
-            identity = identity.wrapping_mul(0x0100_0193);
-        }
+        let source = match value {
+            TypeBindingValue::Runtime(operand) => {
+                self.validate_runtime_type_operand(body, *operand);
+                ScopedTypeSource::Runtime(*operand)
+            }
+            TypeBindingValue::Static(_) => {
+                let type_ref = self
+                    .type_refs
+                    .stmt_type_bindings
+                    .get(&stmt)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        unreachable!("every static type binding is collected as a body type ref")
+                    });
+                // A static template is a stored/structural position: a `_`
+                // inside it has nothing to infer from, and is diagnosed at
+                // the hole, where the span is (`HolePolicy::Forbidden`).
+                let (ty, diagnostics) = self.lower_body_type_ref_at(
+                    type_ref,
+                    crate::lower::TypePosition::Existential,
+                    crate::lower::HolePolicy::Forbidden(crate::lower::NoInferReason::TypeBinding),
+                );
+                self.queue_body_lowering_diagnostics(diagnostics);
+                ScopedTypeSource::Static(Ty::from_plain(&crate::lower::reject_holes(&ty)))
+            }
+        };
+        // The parameter's identity is its statement's index in the body:
+        // exact (two statements never share an index) and source-derived,
+        // so it is stable across runs. A scoped parameter never leaves its
+        // body, so no cross-body component is needed.
+        let index = stmt.into_raw().into_u32();
+        debug_assert_eq!(
+            index & SCOPED_PARAM_BIT,
+            0,
+            "a body's statement arena stays below the scoped-parameter bit"
+        );
         let binding = ScopedTypeBinding {
             name: name.clone(),
-            parameter: baml_type::ParamTy::new(0x8000_0000 | (identity & 0x7fff_ffff), name),
-            operand,
-            occurrence_ty: Ty::intern(TyKind::Unknown {
-                attr: TyAttr::default(),
-            }),
+            parameter: baml_type::ParamTy::new(SCOPED_PARAM_BIT | index, name),
+            source,
         };
         self.result.type_bindings.insert(stmt, binding.clone());
+        self.table.bind_scoped_param(&binding.parameter);
         self.scoped_type_bindings.push(binding);
     }
 
-    /// Erase every binding introduced by this block from values that can flow
-    /// out, then restore the lexical overlay checkpoint. Interior expression
-    /// and pattern tables intentionally retain the rigid identity for MIR.
-    fn finish_scoped_type_bindings(&mut self, checkpoint: usize, mut block_ty: Ty) -> Ty {
-        for binding in self.scoped_type_bindings[checkpoint..].iter().rev() {
-            block_ty = replace_rigid_param(&block_ty, &binding.parameter, &binding.occurrence_ty);
-            for ty in self.flow.values_mut() {
-                *ty = replace_rigid_param(ty, &binding.parameter, &binding.occurrence_ty);
-            }
-            // The effect channel leaves the block exactly as the value does.
-            // An undeclared `throws` is assembled from these contributions at
-            // finalize, so a rigid parameter left in one becomes part of the
-            // OWNER's published effect — a type naming a parameter that stops
-            // existing at the closing brace, which reaches lowering with no
-            // type argument to bind it to.
-            for channel in &mut self.throws_channels {
-                for (_, contribution) in channel.iter_mut() {
-                    *contribution = replace_rigid_param(
-                        contribution,
-                        &binding.parameter,
-                        &binding.occurrence_ty,
-                    );
-                }
-            }
-            // A contract violation stashed inside the block quotes the effect
-            // it saw. `extra` is a COPY of a contribution — compiler-derived,
-            // and quoted in a report about what the enclosing function may
-            // throw — so it is erased for the same reason the contribution is.
-            //
-            // `declared` deliberately is NOT. It is the clause an author WROTE
-            // at that site: only a lambda's own clause can name a block-scoped
-            // binding, its violation is anchored inside that block, and the
-            // line one row above the caret reads `throws Boom<Out>`. Erasing
-            // it would print `Boom<unknown>` next to the user's own `Out` —
-            // `a_lambda_clause_inside_the_block_is_quoted_as_written` pins
-            // both halves of that asymmetry.
-            for pending in &mut self.pending_diags {
-                if let PendingDiag::ThrowsViolation { extra, .. } = pending {
-                    *extra = replace_rigid_param(extra, &binding.parameter, &binding.occurrence_ty);
-                }
+    /// Close the `type T = …` bindings this block introduced. Nothing typed
+    /// by a closed binding may be observable afterwards: the binding
+    /// re-executes on every pass through its block and may bind `T` to a
+    /// different type each time, so a `T`-typed value that outlived the
+    /// block could enter a container whose element type it no longer
+    /// satisfies. Hence:
+    /// - the block's VALUE leaves only through an expected type that
+    ///   mentions no closed binding and admits it (`-> unknown`,
+    ///   `let v: unknown = { … }`), or not at all when the value is
+    ///   discarded; otherwise E0172 at the tail and the `Error` fill;
+    /// - flow narrowings typed by a closed binding end here (the binding
+    ///   reverts to its declared type);
+    /// - the effect channel is judged where it is consumed
+    ///   ([`Self::drop_escaping_effects`]): a declared clause already judged
+    ///   each contribution at its throw and publishes nothing.
+    ///
+    /// Interior expression and pattern tables keep the rigid identity: MIR
+    /// binds the frame slot from them.
+    fn finish_scoped_type_bindings(
+        &mut self,
+        checkpoint: usize,
+        block: ExprId,
+        tail: Option<ExprId>,
+        block_ty: Ty,
+        expected: &Expectation,
+    ) -> Ty {
+        if self.scoped_type_bindings.len() == checkpoint {
+            return block_ty;
+        }
+        let outer_universe = u32::try_from(checkpoint)
+            .unwrap_or_else(|_| unreachable!("a body's open scoped bindings fit in u32"));
+        let at = tail.unwrap_or(block);
+        let closing: Vec<baml_type::ParamTy> = self.scoped_type_bindings[checkpoint..]
+            .iter()
+            .map(|binding| binding.parameter.clone())
+            .collect();
+        self.generalize_closing_scope(outer_universe, &closing, at);
+        // After the leak check, not before: the check itself relates types and
+        // may refuse one on a road with no anchor, and this block's tail is the
+        // last place such a refusal can be reported against the binding it
+        // names.
+        for (param, value) in std::mem::take(&mut self.anchorless_escapes) {
+            if closing.contains(&param) {
+                self.report_scoped_type_escape(at, &param, &value, ScopedTypeEscapeKind::Inferred);
+            } else {
+                self.anchorless_escapes.push((param, value));
             }
         }
         self.scoped_type_bindings.truncate(checkpoint);
-        block_ty
+        self.table.close_scopes_to(outer_universe);
+        let narrowed: Vec<(BindingId, Ty)> = self
+            .flow
+            .iter()
+            .filter(|(_, ty)| ty.has_typevar() || ty.has_infer())
+            .map(|(binding, ty)| (*binding, ty.clone()))
+            .collect();
+        for (binding, ty) in narrowed {
+            if self.escaping_scoped_param(&ty).is_some() {
+                self.flow.remove(&binding);
+            }
+        }
+        let Some(escaped) = self.escaping_scoped_param(&block_ty) else {
+            return block_ty;
+        };
+        match expected {
+            // Nobody reads the value, so its slot takes the top type: no
+            // reader can observe the binding through it.
+            //
+            // The top type rather than `void`, which would be a claim: the
+            // block DID produce a value of some type, and MIR still lowers the
+            // expression that made it. `unknown` says "something, and nobody
+            // is looking", which is what a discarded position means; `void`
+            // would say the expression yields nothing and put every later
+            // reader of this slot's type at odds with the code. Nothing is
+            // erased by it either - the interior tables keep the rigid type,
+            // and this fills only the discarded slot.
+            Expectation::Discarded => Ty::intern(InferTy::Unknown {
+                attr: TyAttr::default(),
+            }),
+            Expectation::HasType(context) => {
+                let context = self.table.resolve_completely(context);
+                let context = self
+                    .escaping_scoped_param(&context)
+                    .is_none()
+                    .then_some(context);
+                self.publish_scoped_value(at, &escaped, &block_ty, context)
+            }
+            Expectation::None => self.publish_scoped_value(at, &escaped, &block_ty, None),
+            // The context is already diagnosed; a second report here would
+            // only cascade.
+            Expectation::Erroneous => Ty::error(),
+        }
+    }
+
+    /// A value typed by a binding that is closing leaves only through a
+    /// context that admits it and is ground — an open one would SOLVE to the
+    /// escaping type — and that the caller has vetted as free of the closing
+    /// binding; the value then takes the context's type. Otherwise E0172 at
+    /// `at` and the `Error` fill. Shared by a block's tail and a `return`.
+    fn publish_scoped_value(
+        &mut self,
+        at: ExprId,
+        escaped: &baml_type::ParamTy,
+        value: &Ty,
+        context: Option<Ty>,
+    ) -> Ty {
+        if let Some(context) = context
+            && !context.has_infer()
+        {
+            let saved_anchor = self.obligation_anchor.replace(at);
+            let fits = self.sub(value, &context);
+            self.obligation_anchor = saved_anchor;
+            if fits {
+                return context;
+            }
+        }
+        self.report_scoped_type_escape(at, escaped, value, ScopedTypeEscapeKind::Value)
+    }
+
+    /// The first binding `ty` mentions (through solved variables) that the
+    /// return frame with `floor` opened — at or past `floor` in the binding
+    /// stack — and so closes before the frame publishes its value.
+    fn frame_scoped_param(&mut self, ty: &Ty, floor: usize) -> Option<baml_type::ParamTy> {
+        debug_assert!(floor <= self.scoped_type_bindings.len());
+        let ty = self.table.resolve_completely(ty);
+        let mut escaped = None;
+        scoped_params_in(&ty, &mut |param| {
+            if escaped.is_none()
+                && self.scoped_type_bindings[floor..]
+                    .iter()
+                    .any(|binding| &binding.parameter == param)
+            {
+                escaped = Some(param.clone());
+            }
+        });
+        escaped
+    }
+
+    /// rustc's leak check at a scope exit. A variable minted inside the
+    /// block outlives it (as the block's value, in an outer binding's
+    /// bounds, in a deferred obligation), so once the block's parameters
+    /// die it may not be solved to one of them. A variable whose bounds
+    /// already mention a closing parameter IS a value of that parameter and
+    /// is solved now, while the parameter is still open, so the block's
+    /// value check sees it; every other open variable the block minted
+    /// moves out to the enclosing universe. Then every open class is
+    /// judged once more: a bound naming a parameter the class may not take
+    /// (deposited while the class was still inner, or carried into an
+    /// outer class by a deposit, a union, or an assignment, and decided
+    /// only now) is an escape, reported at the bound's own deposit and
+    /// filled with `Error`. This is the same universe rule the deposit
+    /// applies eagerly, applied at the last moment the bound's anchor is
+    /// still the right place to report.
+    fn generalize_closing_scope(
+        &mut self,
+        outer_universe: u32,
+        closing: &[baml_type::ParamTy],
+        at: ExprId,
+    ) {
+        loop {
+            let mut progressed = false;
+            for var in self.table.unsolved_vars_deeper_than(outer_universe) {
+                let bounds = self.table.var_bounds(var);
+                let decides_a_closing_param = bounds
+                    .lowers
+                    .iter()
+                    .chain(bounds.uppers.iter())
+                    .any(|bound| self.closing_param_in(&bound.ty, closing).is_some());
+                if decides_a_closing_param && self.try_solve_bounded_var(var, &bounds) {
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        for var in self.table.unsolved_vars_deeper_than(outer_universe) {
+            self.table.demote_to(var, outer_universe);
+        }
+        for (var, bounds) in self.table.unsolved_bounded_vars() {
+            let escaped = bounds
+                .lowers
+                .iter()
+                .chain(bounds.uppers.iter())
+                .find_map(|bound| {
+                    self.table
+                        .escaping_scoped_param(var, &bound.ty)
+                        .map(|param| (param, bound.clone()))
+                });
+            let Some((param, bound)) = escaped else {
+                continue;
+            };
+            let value = self.table.resolve_completely(&bound.ty);
+            self.report_scoped_type_escape(
+                bound.anchor.unwrap_or(at),
+                &param,
+                &value,
+                ScopedTypeEscapeKind::Inferred,
+            );
+            self.refuse_with_error_fill(var);
+        }
+    }
+
+    /// The first parameter of `closing` that `ty` mentions through solved
+    /// variables.
+    fn closing_param_in(
+        &mut self,
+        ty: &Ty,
+        closing: &[baml_type::ParamTy],
+    ) -> Option<baml_type::ParamTy> {
+        let ty = self.table.resolve_completely(ty);
+        let mut found = None;
+        scoped_params_in(&ty, &mut |param| {
+            if found.is_none() && closing.contains(param) {
+                found = Some(param.clone());
+            }
+        });
+        found
+    }
+
+    /// The first block-scoped parameter `ty` mentions (through solved
+    /// variables) whose binding is no longer in scope.
+    fn escaping_scoped_param(&mut self, ty: &Ty) -> Option<baml_type::ParamTy> {
+        let ty = self.table.resolve_completely(ty);
+        let mut escaped = None;
+        scoped_params_in(&ty, &mut |param| {
+            if escaped.is_none()
+                && !self
+                    .scoped_type_bindings
+                    .iter()
+                    .any(|binding| &binding.parameter == param)
+            {
+                escaped = Some(param.clone());
+            }
+        });
+        escaped
+    }
+
+    /// Fills a class an escape refusal just reported on, and records that the
+    /// report happened: a later "cannot infer" about the same class would be a
+    /// cascade of this one.
+    fn refuse_with_error_fill(&mut self, var: baml_type::interned::InferVar) {
+        self.refused_escape_vars.insert(var);
+        self.table.solve(var, Ty::error());
+    }
+
+    fn report_scoped_type_escape(
+        &mut self,
+        at: ExprId,
+        param: &baml_type::ParamTy,
+        value: &Ty,
+        kind: ScopedTypeEscapeKind,
+    ) -> Ty {
+        self.pending_diags
+            .push(PendingDiag::ScopedTypeEscapesBlock {
+                at,
+                name: param.name().clone(),
+                value: value.clone(),
+                kind,
+            });
+        Ty::error()
+    }
+
+    /// The effect channel's escape rule: whoever consumes a channel
+    /// PUBLISHES its contributions - an inferred owner or lambda clause as
+    /// its surface, a `catch` as its arms' bindings - so a contribution
+    /// typed by a scoped binding whose block has closed is reported at its
+    /// throw (E0172) and dropped.
+    ///
+    /// `declared` is the clause's own NAMED half, which only a PARTIAL
+    /// clause (`throws X | _`) brings here: a closed clause judged every
+    /// contribution at the throw and publishes nothing, and an omitted one
+    /// names nothing. A name the author wrote that already admits the
+    /// contribution says everything a caller needs, so the surface carries
+    /// the name and the contribution needs no entry of its own - it is not
+    /// an escape. That is the same verdict, by the same relation, that a
+    /// closed clause reaches at the throw; an open clause can only reach it
+    /// here, where its named half is known. Deciding by the relation rather
+    /// than by the contribution's nearest relaxation is equivalent and
+    /// needs no relaxation: the relaxation is the LEAST supertype free of
+    /// the binding, so it fits a binding-free name exactly when the
+    /// contribution itself does.
+    fn drop_escaping_effects(
+        &mut self,
+        channel: Vec<(ExprId, Ty)>,
+        declared: Option<&Ty>,
+    ) -> Vec<(ExprId, Ty)> {
+        let mut kept = Vec::with_capacity(channel.len());
+        for (at, contribution) in channel {
+            let Some(param) = self.escaping_scoped_param(&contribution) else {
+                kept.push((at, contribution));
+                continue;
+            };
+            if let Some(declared) = declared
+                && self.declared_name_publishes(&contribution, declared)
+            {
+                continue;
+            }
+            self.report_scoped_type_escape(
+                at,
+                &param,
+                &contribution,
+                ScopedTypeEscapeKind::Thrown { relaxation: None },
+            );
+            // Only the members that NAME the binding are unpublishable. A
+            // `throw` of `string | T` still tells the caller a `string` can
+            // come out, and dropping the whole contribution would lose that
+            // fact from an inferred clause and from a `catch`'s arm set, where
+            // a missing fact changes arm reachability rather than just wording.
+            let members = match self.table.resolve_completely(&contribution).kind() {
+                InferTy::Union(members, _) => members.to_vec(),
+                _ => continue,
+            };
+            let publishable: Vec<Ty> = members
+                .into_iter()
+                .filter(|member| self.escaping_scoped_param(member).is_none())
+                .collect();
+            if !publishable.is_empty() {
+                let publishable = self.union_of(&publishable);
+                kept.push((at, publishable));
+            }
+        }
+        kept
+    }
+
+    /// Whether the names a clause WROTE already admit `contribution`, so a
+    /// caller reading the surface learns nothing more from the contribution
+    /// itself.
+    ///
+    /// A clause's open remainder is not a name: `_` is instantiated as an
+    /// effect variable that the body's own contributions fill, so it is
+    /// stripped before the question is asked - otherwise every clause would
+    /// "admit" everything through its own hole. What is left must be ground,
+    /// or the answer is not provable and the contribution is treated as
+    /// escaping (the conservative direction: the author can always widen the
+    /// name they wrote).
+    fn declared_name_publishes(&mut self, contribution: &Ty, declared: &Ty) -> bool {
+        let contribution = self.table.resolve_completely(contribution);
+        if contribution.has_infer() {
+            return false;
+        }
+        let declared = self.table.resolve_completely(declared);
+        let named = match declared.kind() {
+            InferTy::Union(members, _) => {
+                let named: Vec<Ty> = members
+                    .iter()
+                    .filter(|member| !member.has_infer())
+                    .cloned()
+                    .collect();
+                if named.is_empty() {
+                    return false;
+                }
+                self.union_of(&named)
+            }
+            _ => declared,
+        };
+        !named.has_infer() && !named.has_error() && self.cached_subtype(&contribution, &named)
     }
 
     fn scoped_type_params(&self) -> Vec<baml_type::ParamTy> {
@@ -2896,21 +3383,55 @@ impl<'db> InferenceContext<'db> {
             .map(|binding| &binding.parameter)
     }
 
+    /// Lower a body-owned type reference through the lexical `type T = …`
+    /// overlay, so a scoped name resolves to its rigid parameter.
     fn lower_scoped_type_ref_at(
-        &self,
+        &mut self,
         store: &baml_compiler2_hir::type_ref::TypeRefStore,
         type_ref: baml_compiler2_hir::type_ref::TypeRefId,
         position: crate::lower::TypePosition,
-    ) -> Ty {
-        self.lower.lower_type_ref_with_overlay(
+        holes: crate::lower::HolePolicy,
+    ) -> (baml_type::LoweringTy, Vec<crate::lower::LoweringDiag>) {
+        self.lower.lower_type_ref_with_overlay_and_diagnostics(
             store,
             type_ref,
             position,
             &self.scoped_type_params(),
+            holes,
         )
     }
 
-    fn lower_scoped_type_path(&self, segments: &[baml_type::Name]) -> Ty {
+    fn queue_body_lowering_diagnostics(&mut self, diagnostics: Vec<crate::lower::LoweringDiag>) {
+        self.pending_diags
+            .extend(
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| PendingDiag::BodyAnnot {
+                        type_ref: self.type_refs.diagnostic_id(diagnostic.type_ref),
+                        kind: diagnostic.kind,
+                    }),
+            );
+    }
+
+    /// Lower a body type reference at `position`; `holes` says whether the
+    /// position has something to infer a `_` from (a `let` annotation does,
+    /// a `type T = …` right-hand side does not).
+    fn lower_body_type_ref_at(
+        &mut self,
+        type_ref: BodyTypeRefId,
+        position: crate::lower::TypePosition,
+        holes: crate::lower::HolePolicy,
+    ) -> (baml_type::LoweringTy, Vec<crate::lower::LoweringDiag>) {
+        let type_refs = Arc::clone(&self.type_refs);
+        self.lower_scoped_type_ref_at(
+            &type_refs.store,
+            type_refs.raw_id(type_ref),
+            position,
+            holes,
+        )
+    }
+
+    fn lower_scoped_type_path(&self, segments: &[baml_type::Name]) -> baml_type::LoweringTy {
         self.lower
             .lower_type_path_with_overlay(segments, &self.scoped_type_params())
     }
@@ -2960,7 +3481,7 @@ impl<'db> InferenceContext<'db> {
                             // (void == unit interim, but the WRITTEN void
                             // contract says "no result").
                             let resolved = self.table.resolve_completely(&init_ty);
-                            if matches!(resolved.kind(), TyKind::Void { .. }) {
+                            if matches!(resolved.kind(), InferTy::Void { .. }) {
                                 self.pending_diags
                                     .push(PendingDiag::VoidResultUsed { expr: init });
                             }
@@ -3059,7 +3580,10 @@ impl<'db> InferenceContext<'db> {
                     self.check_expr(body, value, declared)
                 }
                 (_, Some(place)) if !place.has_error() => self.check_expr(body, value, place),
-                _ => self.infer_expr(body, value, &Expectation::None),
+                (Some(_), _) | (_, Some(_)) => {
+                    self.infer_expr(body, value, &Expectation::Erroneous)
+                }
+                (None, None) => self.infer_expr(body, value, &Expectation::None),
             },
             Some(op) => {
                 // Compound assignment: `target op value` through the same
@@ -3158,7 +3682,7 @@ impl<'db> InferenceContext<'db> {
             let resolved = self.table.resolve_completely(&got);
             if branch_diverges != Diverges::Always
                 && !resolved.has_error()
-                && !matches!(resolved.kind(), TyKind::Never { .. })
+                && !matches!(resolved.kind(), InferTy::Never { .. })
             {
                 self.pending_diags.push(PendingDiag::LetElseMustDiverge {
                     expr: else_expr,
@@ -3176,6 +3700,21 @@ impl<'db> InferenceContext<'db> {
     fn sub(&mut self, actual: &Ty, expected: &Ty) -> bool {
         let mut actual = self.table.shallow_resolve(actual);
         let mut expected = self.table.shallow_resolve(expected);
+        // A function-type alias used as contextual type information must
+        // expose its parameter/return slots so they can determine a generic
+        // function value's instantiation (`let f: StringCallback = identity`).
+        // Keep the normalization shape-directed: expanding every alias here
+        // would erase nominal alias identity from unrelated diagnostics.
+        if matches!(actual.kind(), InferTy::Function { .. })
+            && matches!(expected.kind(), InferTy::TypeAlias(..))
+        {
+            expected = self.expand_alias_ty(&expected);
+        }
+        if matches!(actual.kind(), InferTy::TypeAlias(..))
+            && matches!(expected.kind(), InferTy::Function { .. })
+        {
+            actual = self.expand_alias_ty(&actual);
+        }
         // Normalize-then-relate (rustc's FnCtxt normalize-before-unify;
         // r-a's `normalize_projection_ty` during unification): a GROUND
         // projection the oracle can already determine reduces before the
@@ -3184,11 +3723,19 @@ impl<'db> InferenceContext<'db> {
         // reduction (the oracle speaks the plain algebra, whose
         // conversion erases inference vars); they relate as lazy
         // predicates through the deferred residue (`eq_piece`).
-        if actual.has_projection() && !actual.has_infer() {
-            actual = self.reduce_projections(&actual, PROJECTION_FINALIZE_FUEL);
+        if actual.has_projection()
+            && let Ok(closed) = ClosedTy::try_from(&actual)
+        {
+            actual = self
+                .reduce_projections(&closed, PROJECTION_FINALIZE_FUEL)
+                .into_ty();
         }
-        if expected.has_projection() && !expected.has_infer() {
-            expected = self.reduce_projections(&expected, PROJECTION_FINALIZE_FUEL);
+        if expected.has_projection()
+            && let Ok(closed) = ClosedTy::try_from(&expected)
+        {
+            expected = self
+                .reduce_projections(&closed, PROJECTION_FINALIZE_FUEL)
+                .into_ty();
         }
         if actual == expected || actual.has_error() || expected.has_error() {
             return true;
@@ -3206,8 +3753,8 @@ impl<'db> InferenceContext<'db> {
         // A bare inference variable still records its upper bound through
         // the Infer arm below (an `unknown` upper participates in bounds
         // resolution); only STRUCTURED actuals take the fast path.
-        if matches!(expected.kind(), TyKind::Unknown { .. })
-            && !matches!(actual.kind(), TyKind::Infer { .. })
+        if matches!(expected.kind(), InferTy::Unknown { .. })
+            && !matches!(actual.kind(), InferTy::InferVar { .. })
         {
             self.commit_establishments_to_unknown(&actual);
             return true;
@@ -3225,18 +3772,26 @@ impl<'db> InferenceContext<'db> {
             // A variable flowing into a context: upper bound. A value
             // flowing into a variable: lower bound. (Var-var records on
             // both sides; resolution sees through whichever solves first.)
-            (TyKind::Infer { var: Some(var), .. }, _) => {
-                self.table.add_upper_bound(*var, expected.clone());
-                if let TyKind::Infer {
-                    var: Some(other), ..
-                } = expected.kind()
-                {
-                    self.table.add_lower_bound(*other, actual.clone());
+            (InferTy::InferVar { var, .. }, _) => {
+                if self.reject_scoped_escape_into_var(*var, &expected) {
+                    return false;
+                }
+                let anchor = self.obligation_anchor;
+                self.table.add_upper_bound(*var, expected.clone(), anchor);
+                if let InferTy::InferVar { var: other, .. } = expected.kind() {
+                    if self.reject_scoped_escape_into_var(*other, &actual) {
+                        return false;
+                    }
+                    self.table.add_lower_bound(*other, actual.clone(), anchor);
                 }
                 true
             }
-            (_, TyKind::Infer { var: Some(var), .. }) => {
-                self.table.add_lower_bound(*var, actual.clone());
+            (_, InferTy::InferVar { var, .. }) => {
+                if self.reject_scoped_escape_into_var(*var, &actual) {
+                    return false;
+                }
+                let anchor = self.obligation_anchor;
+                self.table.add_lower_bound(*var, actual.clone(), anchor);
                 true
             }
             // A union flowing into a context decomposes universally:
@@ -3248,13 +3803,33 @@ impl<'db> InferenceContext<'db> {
             // catch arm's `?E[]` member gets `?E := int` from the return
             // check here). Ground unions skip this arm and keep the
             // single oracle verdict below.
-            (TyKind::Union(members, _), _) if actual.has_infer() => {
+            (InferTy::Union(members, _), _) if actual.has_infer() => {
                 let members: Vec<Ty> = members.to_vec();
                 let mut ok = true;
                 for member in members {
                     ok &= self.sub(&member, &expected);
                 }
                 ok
+            }
+            // A var-carrying value flowing into a GROUND union can use a
+            // single structurally compatible arm as context. This is the
+            // optional-callback case: a function can only inhabit the
+            // function arm of `Callback | null`, so that arm may determine
+            // its generic slots. Multiple compatible arms remain ambiguous
+            // and stay deferred (`Fn<int> | Fn<string>` must not guess).
+            (_, InferTy::Union(members, _)) if actual.has_infer() && !expected.has_infer() => {
+                let targets: Vec<Ty> = members
+                    .iter()
+                    .map(|member| self.expand_alias_ty(member))
+                    .filter(|member| same_head_constructor(&actual, member))
+                    .collect();
+                if let [target] = targets.as_slice() {
+                    let target = target.clone();
+                    return self.sub(&actual, &target);
+                }
+                self.deferred_subs
+                    .push((actual, expected, self.obligation_anchor));
+                true
             }
             // A var-carrying union TARGET: TypeScript's
             // `inferToMultipleTypes`, the union-position inference rule
@@ -3272,16 +3847,15 @@ impl<'db> InferenceContext<'db> {
             //   - defers. Forced answers only, the unique-candidate
             //   discipline; TS likewise refuses to partition a source
             //   across several naked variables.
-            (_, TyKind::Union(members, _)) if expected.has_infer() => {
+            (_, InferTy::Union(members, _)) if expected.has_infer() => {
                 let members: Vec<Ty> = members.to_vec();
                 let actual_members: Vec<Ty> = match actual.kind() {
-                    TyKind::Union(actual_members, _) => actual_members.to_vec(),
+                    InferTy::Union(actual_members, _) => actual_members.to_vec(),
                     _ => vec![actual.clone()],
                 };
-                let (naked, targets): (Vec<Ty>, Vec<Ty>) =
-                    members.into_iter().partition(|member| {
-                        matches!(member.kind(), TyKind::Infer { var: Some(_), .. })
-                    });
+                let (naked, targets): (Vec<Ty>, Vec<Ty>) = members
+                    .into_iter()
+                    .partition(|member| matches!(member.kind(), InferTy::InferVar { .. }));
                 let remainder: Vec<Ty> = actual_members
                     .into_iter()
                     .filter(|member| !targets.contains(member))
@@ -3321,7 +3895,7 @@ impl<'db> InferenceContext<'db> {
                 true
             }
             // Invariant constructors: Sub decays to Eq of the pieces.
-            (TyKind::Class(a_name, a_args, _), TyKind::Class(b_name, b_args, _))
+            (InferTy::Class(a_name, a_args, _), InferTy::Class(b_name, b_args, _))
                 if a_name == b_name && a_args.len() == b_args.len() =>
             {
                 let pairs: Vec<(Ty, Ty)> =
@@ -3332,15 +3906,15 @@ impl<'db> InferenceContext<'db> {
                 }
                 ok
             }
-            (TyKind::List(a, _), TyKind::List(b, _)) => {
+            (InferTy::List(a, _), InferTy::List(b, _)) => {
                 let (a, b) = (a.clone(), b.clone());
                 self.eq_piece(&a, &b)
             }
             (
-                TyKind::Map {
+                InferTy::Map {
                     key: ak, value: av, ..
                 },
-                TyKind::Map {
+                InferTy::Map {
                     key: bk, value: bv, ..
                 },
             ) => {
@@ -3349,7 +3923,7 @@ impl<'db> InferenceContext<'db> {
                 let value_ok = self.eq_piece(&av, &bv);
                 key_ok && value_ok
             }
-            (TyKind::Future(av, ae, _), TyKind::Future(bv, be, _)) => {
+            (InferTy::Future(av, ae, _), InferTy::Future(bv, be, _)) => {
                 let (av, ae, bv, be) = (av.clone(), ae.clone(), bv.clone(), be.clone());
                 let value_ok = self.eq_piece(&av, &bv);
                 let error_ok = self.eq_piece(&ae, &be);
@@ -3357,13 +3931,13 @@ impl<'db> InferenceContext<'db> {
             }
             // Function types: contravariant params, covariant ret/throws.
             (
-                TyKind::Function {
+                InferTy::Function {
                     params: a_params,
                     ret: a_ret,
                     throws: a_throws,
                     ..
                 },
-                TyKind::Function {
+                InferTy::Function {
                     params: b_params,
                     ret: b_ret,
                     throws: b_throws,
@@ -3385,7 +3959,7 @@ impl<'db> InferenceContext<'db> {
                 ok &= self.sub(&throws.0, &throws.1);
                 ok
             }
-            // `baml.AnyFunction` is compiler-derived for concrete function
+            // `reflect.AnyFunction` is compiler-derived for concrete function
             // values, rather than an ordinary impl obligation.  When a
             // generic consumer such as `reflect.call_any<R, E>` receives a
             // function value directly, carry its output channels into the
@@ -3394,13 +3968,18 @@ impl<'db> InferenceContext<'db> {
             // prove conformance, but it has no way to recover these pins and
             // leaves the call's type arguments as `Error`.
             (
-                TyKind::Function {
+                InferTy::Function {
                     ret: actual_ret,
                     throws: actual_throws,
                     ..
                 },
-                TyKind::Interface(name, _, expected_pins, _),
-            ) if name.is_builtin_root_type("AnyFunction") => {
+                InferTy::Interface(name, _, expected_pins, _),
+            ) if name.is_lang_root_type(
+                self.lang(),
+                baml_base::LangPackage::Reflect,
+                "AnyFunction",
+            ) =>
+            {
                 let mut ok = true;
                 for (pin, expected_pin) in expected_pins {
                     let Some(actual_pin) = (match pin.as_str() {
@@ -3431,15 +4010,18 @@ impl<'db> InferenceContext<'db> {
                     // through (the fill-at-reference default is the
                     // oracle's business).
                     if let (
-                        TyKind::Interface(a_name, a_args, a_pins, _),
-                        TyKind::Interface(b_name, b_args, b_pins, _),
+                        InferTy::Interface(a_name, a_args, a_pins, _),
+                        InferTy::Interface(b_name, b_args, b_pins, _),
                     ) = (actual.kind(), expected.kind())
                         && a_name == b_name
                         && a_args.len() == b_args.len()
-                        && (a_name.is_builtin_root_type("AnyFunction")
-                            || b_pins
-                                .iter()
-                                .all(|(pin, _)| a_pins.iter().any(|(a_pin, _)| a_pin == pin)))
+                        && (a_name.is_lang_root_type(
+                            self.lang(),
+                            baml_base::LangPackage::Reflect,
+                            "AnyFunction",
+                        ) || b_pins
+                            .iter()
+                            .all(|(pin, _)| a_pins.iter().any(|(a_pin, _)| a_pin == pin)))
                     {
                         let arg_pairs: Vec<(Ty, Ty)> =
                             a_args.iter().cloned().zip(b_args.iter().cloned()).collect();
@@ -3453,7 +4035,7 @@ impl<'db> InferenceContext<'db> {
                                 match a_pins.iter().find(|(a_pin, _)| a_pin == pin) {
                                     Some((_, a_ty)) => (a_ty.clone(), b_ty.clone()),
                                     None => (
-                                        Ty::intern(TyKind::Unknown {
+                                        Ty::intern(InferTy::Unknown {
                                             attr: TyAttr::default(),
                                         }),
                                         b_ty.clone(),
@@ -3475,21 +4057,21 @@ impl<'db> InferenceContext<'db> {
                     // ?R>` confirms through the `T[]` impl, pinning `?R
                     // := int`). Fulfillment handles ground goals, var
                     // goals via selection, and ambiguity by stalling.
-                    if let TyKind::Interface(name, args, pins, _) = expected.kind()
-                        && !matches!(actual.kind(), TyKind::Infer { .. })
+                    if let InferTy::Interface(name, args, pins, _) = expected.kind()
+                        && !matches!(actual.kind(), InferTy::InferVar { .. })
                         && let Some(anchor) = self.obligation_anchor
                     {
-                        let interface = baml_type::interned::InterfaceRef::new(
+                        let interface = baml_type::interned::InferInterface::new(
                             name.clone(),
-                            args.to_vec().into_boxed_slice(),
-                            pins.to_vec(),
+                            args.clone(),
+                            pins.clone(),
                         );
                         // A union is a subtype of an existential iff ALL
                         // members are (spec: Variance rule 2.1) - and
                         // only concrete types implement, so the goal
                         // decomposes per member before registration.
                         let goals: Vec<Ty> = match actual.kind() {
-                            TyKind::Union(members, _) => members.to_vec(),
+                            InferTy::Union(members, _) => members.to_vec(),
                             _ => vec![actual],
                         };
                         for goal in goals {
@@ -3518,11 +4100,15 @@ impl<'db> InferenceContext<'db> {
             return;
         }
         let resolved = self.table.shallow_resolve(ty);
-        if let TyKind::Infer { var: Some(var), .. } = resolved.kind() {
-            if self.table.is_establishment_var(*var) {
+        if let InferTy::InferVar { var, .. } = resolved.kind() {
+            if self
+                .table
+                .unsolved_policy(*var)
+                .is_some_and(unify::VarPolicy::absorbs_unknown)
+            {
                 self.table.solve(
                     *var,
-                    Ty::intern(TyKind::Unknown {
+                    Ty::intern(InferTy::Unknown {
                         attr: TyAttr::default(),
                     }),
                 );
@@ -3564,21 +4150,72 @@ impl<'db> InferenceContext<'db> {
             self.deferred_subs.push((b, a, self.obligation_anchor));
             return true;
         }
-        self.table.unify(&a, &b).is_ok()
+        match self.table.unify(&a, &b) {
+            Ok(()) => true,
+            Err(unify::UnifyError {
+                left,
+                right,
+                escaped: Some(param),
+            }) => {
+                // The variable side is `left` (the table's `bind` reports
+                // the variable first); it takes the `Error` fill so the
+                // failure does not cascade into an unresolved-type report.
+                if let Some(at) = self.obligation_anchor {
+                    self.report_scoped_type_escape(at, &param, &right, ScopedTypeEscapeKind::Value);
+                }
+                if let InferTy::InferVar { var, .. } = left.kind() {
+                    self.refuse_with_error_fill(*var);
+                }
+                false
+            }
+            Err(unify::UnifyError { escaped: None, .. }) => false,
+        }
+    }
+
+    /// rustc's universe check at a bound's deposit point: a variable minted
+    /// outside a block may not be solved to a type mentioning a binding the
+    /// block introduced (an outer `let xs = []` must not become `T[]`
+    /// through a `push` inside the block). Reported at the current anchor
+    /// (E0172); the variable takes the `Error` fill so the failure does not
+    /// cascade into an unresolved-type report.
+    fn reject_scoped_escape_into_var(
+        &mut self,
+        var: baml_type::interned::InferVar,
+        ty: &Ty,
+    ) -> bool {
+        let Some(param) = self.table.escaping_scoped_param(var, ty) else {
+            return false;
+        };
+        match self.obligation_anchor {
+            Some(at) => {
+                self.report_scoped_type_escape(at, &param, ty, ScopedTypeEscapeKind::Inferred);
+            }
+            // Reached from a road with no anchor (a pattern walk, a bound
+            // replay): the block that binds the parameter reports it when
+            // it closes rather than filling `Error` in silence.
+            None => self.anchorless_escapes.push((param, ty.clone())),
+        }
+        self.refuse_with_error_fill(var);
+        true
     }
 
     fn cached_equivalent(&self, a: &Ty, b: &Ty) -> bool {
-        if a.has_infer() || b.has_infer() {
-            return equivalent_interned(a, b, &self.facts);
+        use baml_type::interned::ClosedTy;
+        match (ClosedTy::try_from(a), ClosedTy::try_from(b)) {
+            (Ok(a), Ok(b)) => self.canonical_cache.equivalent(&a, &b, &self.facts),
+            // An OPEN operand: only shallow identity decides before
+            // resolution — fail closed (a mismatch recorded mid-flight is
+            // re-judged at finish on the finalized types).
+            _ => a == b,
         }
-        self.canonical_cache.equivalent(a, b, &self.facts)
     }
 
     fn cached_subtype(&self, sub: &Ty, sup: &Ty) -> bool {
-        if sub.has_infer() || sup.has_infer() {
-            return is_subtype_interned(sub, sup, &self.facts);
+        use baml_type::interned::ClosedTy;
+        match (ClosedTy::try_from(sub), ClosedTy::try_from(sup)) {
+            (Ok(sub), Ok(sup)) => self.canonical_cache.is_subtype(&sub, &sup, &self.facts),
+            _ => sub == sup,
         }
-        self.canonical_cache.is_subtype(sub, sup, &self.facts)
     }
 
     /// A PROVABLE subtype verdict: ground on both sides and confirmed by this
@@ -3589,15 +4226,23 @@ impl<'db> InferenceContext<'db> {
         if sub == sup {
             return true;
         }
-        if sub.has_infer() || sup.has_infer() || sub.has_error() || sup.has_error() {
+        if sub.has_error() || sup.has_error() {
             return false;
         }
+        let (Ok(sub), Ok(sup)) = (
+            baml_type::interned::ClosedTy::try_from(sub),
+            baml_type::interned::ClosedTy::try_from(sup),
+        ) else {
+            // Unresolved pairs are not provable — the conservative
+            // direction for coverage and claiming.
+            return false;
+        };
         // Rigid variables go to the oracle too: its typevar arms are already
         // conservative (`T <: T`, `T <: unknown`, `never <: T` prove; a rigid
         // against an unrelated concrete does not - which is exactly the B-633
         // rule). The corpus pins the case this matters for: a synthetic effect
         // var IS covered by `throws unknown`.
-        self.canonical_cache.is_subtype(sub, sup, &self.facts)
+        self.canonical_cache.is_subtype(&sub, &sup, &self.facts)
     }
 
     /// A union of members that may still contain inference variables. The
@@ -3606,10 +4251,14 @@ impl<'db> InferenceContext<'db> {
     /// join stays syntactic until resolution - the S13 finalize pass
     /// re-canonicalizes once every variable is solved or ruled an error.
     fn union_of(&mut self, members: &[Ty]) -> Ty {
-        if members.iter().any(Ty::has_infer) {
-            return syntactic_union(members);
+        let closed: Result<Vec<_>, _> = members
+            .iter()
+            .map(baml_type::interned::ClosedTy::try_from)
+            .collect();
+        match closed {
+            Ok(closed) => canonical_union_interned(&closed, &self.facts).into_ty(),
+            Err(baml_type::interned::OpenTy) => syntactic_union(members),
         }
-        canonical_union_interned(members, &self.facts)
     }
 
     /// The control-flow join: a canonical union that PRESERVES literal
@@ -3629,7 +4278,7 @@ impl<'db> InferenceContext<'db> {
         let mut fresh: Vec<Literal> = Vec::new();
         let mut regular: Vec<Literal> = Vec::new();
         let mut collect = |ty: &Ty| {
-            if let TyKind::Literal(lit, freshness, _) = ty.kind() {
+            if let InferTy::Literal(lit, freshness, _) = ty.kind() {
                 match freshness {
                     Freshness::Fresh => fresh.push(lit.clone()),
                     Freshness::Regular => regular.push(lit.clone()),
@@ -3638,7 +4287,7 @@ impl<'db> InferenceContext<'db> {
         };
         for member in members {
             match member.kind() {
-                TyKind::Union(inner, _) => inner.iter().for_each(&mut collect),
+                InferTy::Union(inner, _) => inner.iter().for_each(&mut collect),
                 _ => collect(member),
             }
         }
@@ -3648,16 +4297,20 @@ impl<'db> InferenceContext<'db> {
         }
         let remark = |ty: &Ty| -> Ty {
             match ty.kind() {
-                TyKind::Literal(lit, Freshness::Regular, attr)
+                InferTy::Literal(lit, Freshness::Regular, attr)
                     if fresh.contains(lit) && !regular.contains(lit) =>
                 {
-                    Ty::intern(TyKind::Literal(lit.clone(), Freshness::Fresh, attr.clone()))
+                    Ty::intern(InferTy::Literal(
+                        lit.clone(),
+                        Freshness::Fresh,
+                        attr.clone(),
+                    ))
                 }
                 _ => ty.clone(),
             }
         };
         match joined.kind() {
-            TyKind::Union(joined_members, attr) => Ty::intern(TyKind::Union(
+            InferTy::Union(joined_members, attr) => Ty::intern(InferTy::Union(
                 joined_members.iter().map(remark).collect(),
                 attr.clone(),
             )),
@@ -3665,15 +4318,32 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
+    fn join_return_candidates(&mut self, candidates: &[Ty]) -> Ty {
+        let mut candidates = candidates
+            .iter()
+            .filter(|candidate| !matches!(candidate.kind(), InferTy::Never { .. }));
+        let Some(first) = candidates.next() else {
+            return Ty::never();
+        };
+        let rest: Vec<_> = candidates.collect();
+        if rest.iter().all(|candidate| *candidate == first) {
+            return first.clone();
+        }
+        let mut members = Vec::with_capacity(rest.len() + 1);
+        members.push(first.clone());
+        members.extend(rest.into_iter().cloned());
+        self.join(&members)
+    }
+
     /// Fresh literals widen to their base primitive at binding sites and
     /// joins; a union of fresh literals widens member-wise and
     /// re-canonicalizes (`1 | 2` at a binding is `int`).
     fn widen_fresh(&mut self, ty: &Ty) -> Ty {
         match ty.kind() {
-            TyKind::Literal(_, Freshness::Fresh, _) => widen_fresh_literal(ty),
-            TyKind::Union(members, _)
+            InferTy::Literal(_, Freshness::Fresh, _) => widen_fresh_literal(ty),
+            InferTy::Union(members, _)
                 if members.iter().any(|member| {
-                    matches!(member.kind(), TyKind::Literal(_, Freshness::Fresh, _))
+                    matches!(member.kind(), InferTy::Literal(_, Freshness::Fresh, _))
                 }) =>
             {
                 let widened: Vec<Ty> = members.iter().map(widen_fresh_literal).collect();
@@ -3724,14 +4394,14 @@ impl<'db> InferenceContext<'db> {
                 if let Some(folded) = const_fold_binary(op, &lhs_ty, &rhs_ty) {
                     return folded;
                 }
-                if !lhs_ty.has_infer()
-                    && !rhs_ty.has_infer()
-                    && !lhs_ty.has_error()
+                if !lhs_ty.has_error()
                     && !rhs_ty.has_error()
+                    && let (Ok(lhs_closed), Ok(rhs_closed)) =
+                        (ClosedTy::try_from(&lhs_ty), ClosedTy::try_from(&rhs_ty))
                     && let Some(equal) = baml_type::normalize::TypeContext::constant_equality(
                         &self.facts,
-                        &lhs_ty.to_plain(),
-                        &rhs_ty.to_plain(),
+                        &lhs_closed.to_plain(),
+                        &rhs_closed.to_plain(),
                     )
                 {
                     if !equal {
@@ -3749,7 +4419,7 @@ impl<'db> InferenceContext<'db> {
                     } else {
                         !equal
                     };
-                    return Ty::intern(TyKind::Literal(
+                    return Ty::intern(InferTy::Literal(
                         Literal::Bool(value),
                         Freshness::Fresh,
                         TyAttr::default(),
@@ -3766,17 +4436,19 @@ impl<'db> InferenceContext<'db> {
                 // (literal -> base, variant -> enum) and must be the SAME
                 // type - subtyping is not enough - and that type must
                 // implement `baml.ops.Compare`. Open/error operands skip
-                // (cascades; a var may still solve either way).
+                // (cascades; a var may still solve either way) - but the
+                // `unknown` top type does NOT skip: it is a type the reader
+                // wrote, not a cascade, and it orders against nothing, so it
+                // reports here like any other non-comparable operand.
                 if !lhs_ty.has_infer()
                     && !rhs_ty.has_infer()
                     && !lhs_ty.has_error()
                     && !rhs_ty.has_error()
-                    && !matches!(lhs_ty.kind(), TyKind::Unknown { .. })
-                    && !matches!(rhs_ty.kind(), TyKind::Unknown { .. })
                 {
                     let widen = |this: &mut Self, ty: &Ty| -> baml_type::Ty {
                         use baml_base::Literal as Lit;
-                        let plain = this.expand_alias_ty(ty).to_plain();
+                        let expanded = this.expand_alias_ty(ty);
+                        let plain = this.materialize_ty(&expanded);
                         match plain {
                             baml_type::Ty::Literal(Lit::Int(_), _, attr) => {
                                 baml_type::Ty::Int { attr }
@@ -3814,26 +4486,27 @@ impl<'db> InferenceContext<'db> {
                         // bounded rigid realizing to one) implementing
                         // `baml.ops.Compare`; unions and existentials are
                         // not orderable even member-wise (TIR's rule).
-                        let compare_existential = baml_type::Ty::Interface(
-                            baml_type::QualifiedTypeName::new(
-                                baml_base::Name::new("baml"),
-                                vec![baml_base::Name::new("ops")],
-                                baml_base::Name::new("Compare"),
-                            ),
-                            Vec::new(),
-                            Vec::new(),
-                            baml_type::TyAttr::default(),
-                        );
-                        let comparable = !matches!(
-                            lhs_base,
-                            baml_type::Ty::Union(..)
-                                | baml_type::Ty::Interface(..)
-                                | baml_type::Ty::Unknown { .. }
-                        ) && baml_type::normalize::is_subtype(
-                            &lhs_base,
-                            &compare_existential,
-                            &self.facts,
-                        );
+                        let compare_existential = self
+                            .lang_decl(baml_base::LangPackage::Baml, &["ops"], "Compare")
+                            .map(|compare| {
+                                baml_type::Ty::Interface(
+                                    compare,
+                                    Box::new([]),
+                                    Box::new([]),
+                                    baml_type::TyAttr::default(),
+                                )
+                            });
+                        let comparable =
+                            !matches!(
+                                lhs_base,
+                                baml_type::Ty::Union(..) | baml_type::Ty::Interface(..)
+                            ) && compare_existential.is_some_and(|compare_existential| {
+                                baml_type::normalize::is_subtype(
+                                    &lhs_base,
+                                    &compare_existential,
+                                    &self.facts,
+                                )
+                            });
                         if !comparable {
                             self.pending_diags
                                 .push(PendingDiag::OrderingRequiresCompare {
@@ -3865,15 +4538,9 @@ impl<'db> InferenceContext<'db> {
                 if let Some(folded) = const_fold_binary(op, &lhs_ty, &rhs_ty) {
                     return folded;
                 }
-                let interface = match op {
-                    BinaryOp::Add => "Add",
-                    BinaryOp::Sub => "Subtract",
-                    BinaryOp::Mul => "Multiply",
-                    BinaryOp::Div => "Divide",
-                    BinaryOp::Mod => "Remainder",
-                    _ => unreachable!("outer match arm"),
-                };
-                self.operator_or_obligation(expr, interface, &lhs_ty, Some(&rhs_ty))
+                let dispatch = crate::ops::binary_operator(op)
+                    .unwrap_or_else(|| unreachable!("outer match arm covers dispatching ops"));
+                self.operator_or_obligation(expr, dispatch.interface, &lhs_ty, Some(&rhs_ty))
             }
             // Bitwise dispatches through the `baml.ops` interfaces like
             // every other operator (decision 3B); the stdlib grew them
@@ -3890,15 +4557,9 @@ impl<'db> InferenceContext<'db> {
                 if let Some(folded) = const_fold_binary(op, &lhs_ty, &rhs_ty) {
                     return folded;
                 }
-                let interface = match op {
-                    BinaryOp::BitAnd => "BitAnd",
-                    BinaryOp::BitOr => "BitOr",
-                    BinaryOp::BitXor => "BitXor",
-                    BinaryOp::Shl => "ShiftLeft",
-                    BinaryOp::Shr => "ShiftRight",
-                    _ => unreachable!("outer match arm"),
-                };
-                self.operator_or_obligation(expr, interface, &lhs_ty, Some(&rhs_ty))
+                let dispatch = crate::ops::binary_operator(op)
+                    .unwrap_or_else(|| unreachable!("outer match arm covers dispatching ops"));
+                self.operator_or_obligation(expr, dispatch.interface, &lhs_ty, Some(&rhs_ty))
             }
         }
     }
@@ -3909,8 +4570,8 @@ impl<'db> InferenceContext<'db> {
     /// channel (the S12 discipline) is the future's error side, read
     /// straight off the lambda's fn type. Fresh literals widen out of
     /// both slots. `with` transformers fold left-to-right over
-    /// `SpawnParams<T, E>`: each checks against
-    /// `(SpawnParams<cur>) -> SpawnParams<unknown, unknown>`, the
+    /// `Params<T, E>`: each checks against
+    /// `(Params<cur>) -> Params<unknown, unknown>`, the
     /// concrete input binding a generic transformer's params through
     /// ordinary unification (TIR needs a value-ref workaround here;
     /// inference variables make it unnecessary), and the transformer's
@@ -3928,14 +4589,14 @@ impl<'db> InferenceContext<'db> {
         let lambda_ty = self.infer_expr(body, spawn_body, &Expectation::None);
         let resolved = self.structurally_resolve(&lambda_ty);
         let (value, error) = match resolved.kind() {
-            TyKind::Function { ret, throws, .. } => (ret.clone(), throws.clone()),
+            InferTy::Function { ret, throws, .. } => (ret.clone(), throws.clone()),
             _ => (resolved.clone(), Ty::never()),
         };
         let mut cur_value = self.widen_fresh(&value);
         let mut cur_error = self.widen_fresh(&error);
         for &with_id in with_exprs {
             let unknown = || {
-                Ty::intern(TyKind::Unknown {
+                Ty::intern(InferTy::Unknown {
                     attr: TyAttr::default(),
                 })
             };
@@ -3946,31 +4607,35 @@ impl<'db> InferenceContext<'db> {
             // unification), but the verdict is the shape check - a full
             // subtype check against open `unknown` slots would trip the
             // class-invariance rule on perfectly good modifiers.
-            let expected = Ty::intern(TyKind::Function {
-                params: Box::new([baml_type::interned::FunctionParam {
+            let expected = Ty::intern(InferTy::Function {
+                params: Box::new([baml_type::interned::InferFunctionParamTy {
                     name: None,
-                    ty: spawn_params_ty(cur_value.clone(), cur_error.clone()),
+                    ty: spawn_params_ty(self.lang(), cur_value.clone(), cur_error.clone()),
                     mode: baml_type::FunctionParamMode::Required,
                 }]),
-                ret: spawn_params_ty(unknown(), unknown()),
+                ret: spawn_params_ty(self.lang(), unknown(), unknown()),
                 throws: unknown(),
                 attr: TyAttr::default(),
             });
             let got = self.infer_expr(body, with_id, &Expectation::has_type(expected.clone()));
             let got = self.structurally_resolve(&got);
             let link = match got.kind() {
-                TyKind::Function { params, ret, .. } => {
+                InferTy::Function { params, ret, .. } => {
                     let ret = ret.clone();
                     let ret = self.structurally_resolve(&ret);
                     match ret.kind() {
-                        TyKind::Class(qn, args, _)
-                            if is_spawn_params_qtn(qn) && args.len() == 2 =>
+                        InferTy::Class(qn, args, _)
+                            if is_spawn_params_qtn(self.lang(), qn) && args.len() == 2 =>
                         {
                             // The modifier must accept the chain's
                             // current link (solving its generics when
                             // still open).
                             if let Some(param) = params.first() {
-                                let chain = spawn_params_ty(cur_value.clone(), cur_error.clone());
+                                let chain = spawn_params_ty(
+                                    self.lang(),
+                                    cur_value.clone(),
+                                    cur_error.clone(),
+                                );
                                 let param_ty = param.ty.clone();
                                 if !self.sub(&chain, &param_ty) {
                                     // Full transformer types on both sides:
@@ -3984,7 +4649,7 @@ impl<'db> InferenceContext<'db> {
                             }
                             let ret = self.table.resolve_completely(&ret);
                             match ret.kind() {
-                                TyKind::Class(_, args, _) => {
+                                InferTy::Class(_, args, _) => {
                                     Some((args[0].clone(), args[1].clone()))
                                 }
                                 _ => None,
@@ -4010,13 +4675,17 @@ impl<'db> InferenceContext<'db> {
                         Expr::Path(_) | Expr::MemberAccess { .. }
                     );
                     let got_resolved = self.table.resolve_completely(&got);
-                    if (is_value_ref || matches!(got_resolved.kind(), TyKind::Function { .. }))
+                    if (is_value_ref || matches!(got_resolved.kind(), InferTy::Function { .. }))
                         && !got_resolved.has_error()
-                        && !matches!(got_resolved.kind(), TyKind::Unknown { .. })
+                        && !matches!(got_resolved.kind(), InferTy::Unknown { .. })
                     {
                         self.pending_diags.push(PendingDiag::SpawnWithBad {
                             at: with_id,
-                            expected_input: spawn_params_ty(cur_value.clone(), cur_error.clone()),
+                            expected_input: spawn_params_ty(
+                                self.lang(),
+                                cur_value.clone(),
+                                cur_error.clone(),
+                            ),
                             got: got_resolved,
                         });
                     } else {
@@ -4025,7 +4694,7 @@ impl<'db> InferenceContext<'db> {
                 }
             }
         }
-        Ty::intern(TyKind::Future(cur_value, cur_error, TyAttr::default()))
+        Ty::intern(InferTy::Future(cur_value, cur_error, TyAttr::default()))
     }
 
     /// `await e : T` for `e : Future<T, E>`; `E` joins the effect
@@ -4040,20 +4709,20 @@ impl<'db> InferenceContext<'db> {
         let fut = self.infer_expr(body, future, &Expectation::None);
         let resolved = self.structurally_resolve(&fut);
         match resolved.kind() {
-            TyKind::Future(value, error, _) => {
+            InferTy::Future(value, error, _) => {
                 let (value, error) = (value.clone(), error.clone());
                 self.record_throw(expr, &error);
                 value
             }
-            TyKind::Union(members, _)
+            InferTy::Union(members, _)
                 if !members.is_empty()
                     && members
                         .iter()
-                        .all(|member| matches!(member.kind(), TyKind::Future(..))) =>
+                        .all(|member| matches!(member.kind(), InferTy::Future(..))) =>
             {
                 let mut values = Vec::new();
                 for member in members {
-                    if let TyKind::Future(value, error, _) = member.kind() {
+                    if let InferTy::Future(value, error, _) = member.kind() {
                         values.push(value.clone());
                         let error = error.clone();
                         self.record_throw(expr, &error);
@@ -4061,11 +4730,11 @@ impl<'db> InferenceContext<'db> {
                 }
                 self.union_of(&values)
             }
-            TyKind::Never { .. } => resolved,
-            TyKind::Infer { .. } => {
+            InferTy::Never { .. } => resolved,
+            InferTy::InferVar { .. } => {
                 let value = self.table.new_var_ty();
-                let error = self.table.new_effect_var_ty();
-                let demanded = Ty::intern(TyKind::Future(
+                let error = self.table.new_var_ty_of(unify::VarPolicy::Effect);
+                let demanded = Ty::intern(InferTy::Future(
                     value.clone(),
                     error.clone(),
                     TyAttr::default(),
@@ -4077,11 +4746,11 @@ impl<'db> InferenceContext<'db> {
             _ if resolved.has_error() => resolved,
             _ => {
                 let unknown = || {
-                    Ty::intern(TyKind::Unknown {
+                    Ty::intern(InferTy::Unknown {
                         attr: TyAttr::default(),
                     })
                 };
-                let expected = Ty::intern(TyKind::Future(unknown(), unknown(), TyAttr::default()));
+                let expected = Ty::intern(InferTy::Future(unknown(), unknown(), TyAttr::default()));
                 self.result
                     .type_mismatches
                     .insert(expr, (expected, resolved));
@@ -4099,22 +4768,10 @@ impl<'db> InferenceContext<'db> {
         lhs: &Ty,
         rhs: &Ty,
     ) -> Ty {
-        use baml_compiler2_ast::AssignOp;
-        let interface = match op {
-            AssignOp::Add => "Add",
-            AssignOp::Sub => "Subtract",
-            AssignOp::Mul => "Multiply",
-            AssignOp::Div => "Divide",
-            AssignOp::Mod => "Remainder",
-            AssignOp::BitAnd => "BitAnd",
-            AssignOp::BitOr => "BitOr",
-            AssignOp::BitXor => "BitXor",
-            AssignOp::Shl => "ShiftLeft",
-            AssignOp::Shr => "ShiftRight",
-        };
         // The reporting road (an inapplicable compound operator is the
         // same E0004 the binary spelling gets), anchored at the value.
-        self.operator_or_obligation(at, interface, lhs, Some(rhs))
+        let dispatch = crate::ops::assign_operator(op);
+        self.operator_or_obligation(at, dispatch.interface, lhs, Some(rhs))
     }
 
     /// `base[idx]` dispatches through `baml.ops.Index` (the ruling:
@@ -4158,20 +4815,20 @@ impl<'db> InferenceContext<'db> {
             }
         };
         let element = match resolved_subject.kind() {
-            TyKind::List(element, _) => {
+            InferTy::List(element, _) => {
                 let element = element.clone();
                 let expectation = key_expectation(self, Ty::int());
                 self.check_expr(body, index, &expectation);
                 element
             }
-            TyKind::Map { key, value, .. } => {
+            InferTy::Map { key, value, .. } => {
                 let key = key.clone();
                 let value = value.clone();
                 let expectation = key_expectation(self, key);
                 self.check_expr(body, index, &expectation);
                 value
             }
-            TyKind::Uint8Array { .. } => {
+            InferTy::Uint8Array { .. } => {
                 let expectation = key_expectation(self, Ty::int());
                 self.check_expr(body, index, &expectation);
                 Ty::int()
@@ -4214,13 +4871,13 @@ impl<'db> InferenceContext<'db> {
                 // (TIR's `try_fold_unary`, extended to the non-bool
                 // literals truthiness admits), freshness preserved.
                 let resolved = self.table.resolve_completely(&ty);
-                if let TyKind::Literal(_, freshness, _) = resolved.kind() {
+                if let InferTy::Literal(_, freshness, _) = resolved.kind() {
                     let negated = match crate::infer::truthy::truthiness(&resolved) {
                         crate::infer::truthy::Truthiness::AlwaysTruthy => false,
                         crate::infer::truthy::Truthiness::AlwaysFalsy => true,
                         crate::infer::truthy::Truthiness::Runtime => return Ty::bool(),
                     };
-                    return Ty::intern(TyKind::Literal(
+                    return Ty::intern(InferTy::Literal(
                         Literal::Bool(negated),
                         *freshness,
                         TyAttr::default(),
@@ -4239,7 +4896,7 @@ impl<'db> InferenceContext<'db> {
                 // fold and keeps the dispatch result - the VM throws the
                 // same catchable IntegerOverflow either way.
                 let resolved = self.table.resolve_completely(&ty);
-                if let TyKind::Literal(lit, freshness, _) = resolved.kind()
+                if let InferTy::Literal(lit, freshness, _) = resolved.kind()
                     && !dispatched.has_error()
                     && let Some(folded) = negate_literal(lit, *freshness)
                 {
@@ -4283,7 +4940,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// A ground operator dispatch found NO impl for clean operands - the
-    /// committed E0004 (an error/unknown/var operand is a cascade and
+    /// committed E0004 (an error or inference-var operand is a cascade and
     /// stays silent, the same `tainted_by_errors` rule everywhere).
     pub(super) fn report_operator_failure(
         &mut self,
@@ -4292,13 +4949,19 @@ impl<'db> InferenceContext<'db> {
         lhs: &Ty,
         rhs: Option<&Ty>,
     ) {
-        // SHALLOW error/unknown screening (TIR's gate): a nested error slot
-        // (an incomplete existential's recovered pin) does not silence the
+        // SHALLOW error screening (TIR's gate): a nested error slot (an
+        // incomplete existential's recovered pin) does not silence the
         // operator report - the operand as written still has no impl, and
         // that is this diagnostic's claim.
-        let dirty = |ty: &Ty| {
-            matches!(ty.kind(), TyKind::Error { .. } | TyKind::Unknown { .. }) || ty.has_infer()
-        };
+        //
+        // The `unknown` top type is NOT screened: it is a type the reader
+        // wrote, not a cascade from an earlier failure, and it implements
+        // no operator - so `a + 1` on an `unknown` is a real E0004 rather
+        // than something to stay quiet about. Only the error sentinel and
+        // an unresolved inference var are cascades. (`dispatch_operator`
+        // still suppresses the RESULT to the sentinel for unknown - that is
+        // the ordinary diagnose-then-fill split, not a disagreement.)
+        let dirty = |ty: &Ty| matches!(ty.kind(), InferTy::Error { .. }) || ty.has_infer();
         if dirty(lhs) || rhs.is_some_and(dirty) {
             return;
         }
@@ -4329,24 +4992,24 @@ impl<'db> InferenceContext<'db> {
         let rhs = rhs_resolved.as_ref();
         let lhs = self.table.resolve_completely(lhs);
         let rhs = rhs.map(|ty| self.table.resolve_completely(ty));
-        if matches!(lhs.kind(), TyKind::Never { .. })
+        if matches!(lhs.kind(), InferTy::Never { .. })
             || rhs
                 .as_ref()
-                .is_some_and(|ty| matches!(ty.kind(), TyKind::Never { .. }))
+                .is_some_and(|ty| matches!(ty.kind(), InferTy::Never { .. }))
         {
             return Ty::never();
         }
         let undispatchable = |ty: &Ty| {
-            ty.has_error() || ty.has_infer() || matches!(ty.kind(), TyKind::Unknown { .. })
+            ty.has_error() || ty.has_infer() || matches!(ty.kind(), InferTy::Unknown { .. })
         };
         if undispatchable(&lhs) || rhs.as_ref().is_some_and(undispatchable) {
             return Ty::error();
         }
         let mut outputs = Vec::new();
-        for lhs_member in operand_members(&lhs) {
+        for lhs_member in operand_members(self.lang(), &lhs) {
             match &rhs {
                 Some(rhs) => {
-                    for rhs_member in operand_members(rhs) {
+                    for rhs_member in operand_members(self.lang(), rhs) {
                         match self.member_operator_output(interface, &lhs_member, Some(&rhs_member))
                         {
                             Some(output) => outputs.push(output),
@@ -4373,11 +5036,11 @@ impl<'db> InferenceContext<'db> {
         lhs: &Ty,
         rhs: Option<&Ty>,
     ) -> Option<Ty> {
-        if let TyKind::TypeVar(param, _) = lhs.kind() {
+        if let InferTy::TypeVar(param, _) = lhs.kind() {
             let bounds = baml_type::normalize::TypeContext::type_var_bound(&self.facts, param);
             let bound = bounds.iter().find(|bound| {
-                !bound.name.is_local()
-                    && bound.name.package().as_str() == "baml"
+                self.lang()
+                    .is(baml_base::LangPackage::Baml, bound.name.root())
                     && bound.name.namespace().len() == 1
                     && bound.name.namespace()[0].as_str() == "ops"
                     && bound.name.name().as_str() == interface
@@ -4408,9 +5071,9 @@ impl<'db> InferenceContext<'db> {
             {
                 return None;
             }
-            return Some(Ty::intern(TyKind::AssociatedTypeProjection {
+            return Some(Ty::intern(InferTy::AssociatedTypeProjection {
                 base: lhs.clone(),
-                interface: baml_type::interned::InterfaceRef::new(
+                interface: baml_type::interned::InferInterface::new(
                     bound.name.clone(),
                     bound.generics.iter().map(Ty::from_plain).collect(),
                     bound
@@ -4428,19 +5091,16 @@ impl<'db> InferenceContext<'db> {
         // int>` adds like the virtual `x.add(rhs)` call it desugars to.
         // The pin is the result; a recovered error pin surfaces as the
         // operator failure (the completeness check already named it).
-        if let TyKind::Interface(qtn, args, pins, _) = lhs.kind() {
-            let root = baml_type::interned::InterfaceRef::new(
-                qtn.clone(),
-                (args.to_vec()).into(),
-                pins.to_vec(),
-            );
+        if let InferTy::Interface(qtn, args, pins, _) = lhs.kind() {
+            let root =
+                baml_type::interned::InferInterface::new(qtn.clone(), args.clone(), pins.clone());
             let mut heads = vec![root.clone()];
             heads.extend(crate::impls::direct_requires_closure(
                 self.db, &root, lhs, 8,
             ));
             let head = heads.into_iter().find(|head| {
-                !head.name.is_local()
-                    && head.name.package().as_str() == "baml"
+                self.lang()
+                    .is(baml_base::LangPackage::Baml, head.name.root())
                     && head.name.namespace().len() == 1
                     && head.name.namespace()[0].as_str() == "ops"
                     && head.name.name().as_str() == interface
@@ -4479,11 +5139,11 @@ impl<'db> InferenceContext<'db> {
         // such match): an aliased nullable answers as its union.
         let resolved = self.structurally_resolve(ty);
         match resolved.kind() {
-            TyKind::Null { .. } => Ty::never(),
-            TyKind::Union(members, _) => {
+            InferTy::Null { .. } => Ty::never(),
+            InferTy::Union(members, _) => {
                 let non_null: Vec<Ty> = members
                     .iter()
-                    .filter(|member| !matches!(member.kind(), TyKind::Null { .. }))
+                    .filter(|member| !matches!(member.kind(), InferTy::Null { .. }))
                     .cloned()
                     .collect();
                 // Filtering never REWRITES the survivors (the
@@ -4503,7 +5163,7 @@ impl<'db> InferenceContext<'db> {
     fn null_coalesce(&mut self, inner: Ty, rhs: &Ty) -> Ty {
         let rhs = self.table.resolve_completely(rhs);
         let ground = |ty: &Ty| {
-            !ty.has_infer() && !ty.has_error() && !matches!(ty.kind(), TyKind::Never { .. })
+            !ty.has_infer() && !ty.has_error() && !matches!(ty.kind(), InferTy::Never { .. })
         };
         if ground(&inner) && ground(&rhs) {
             if self.cached_subtype(&rhs, &inner) {
@@ -4529,58 +5189,12 @@ impl<'db> InferenceContext<'db> {
         callee: ExprId,
         args: &[baml_compiler2_ast::CallArg],
     ) -> Ty {
-        self.validate_runtime_type_arg_operands(body, call);
         let (callee_fn_ty, bound_receiver) = self.infer_callee(body, call, callee);
         self.report_mounted_reserved_call(call, callee);
-        self.report_runtime_streaming_call(body, call, callee);
         self.seed_implicit_llm_schema(body, call, callee, args);
         let ret = self.check_call_args(body, call, callee, &callee_fn_ty, bound_receiver, args);
-        self.report_runtime_indirect_call(call, callee);
         self.default_uncontracted_session_eval(body, call, callee);
         ret
-    }
-
-    fn report_runtime_indirect_call(&mut self, call: ExprId, callee: ExprId) {
-        let Some(plan) = self.result.call_plans.get(&call) else {
-            return;
-        };
-        let requires_runtime_check = plan
-            .slots
-            .iter()
-            .any(|slot| matches!(slot, CallTypeArgPlan::Runtime { .. }))
-            || !plan.deferred_checks.is_empty()
-            || self.result.runtime_checks.iter().any(|check| match check {
-                RuntimeCheck::Argument { arg, .. } => plan.bindings.iter().any(|binding| {
-                    matches!(binding, ParamBinding::Provided { arg: provided, .. } if provided == arg)
-                }),
-                RuntimeCheck::Bound { .. } => !self.scoped_type_bindings.is_empty(),
-            });
-        if !requires_runtime_check {
-            return;
-        }
-
-        let resolution = self.result.member_resolutions.get(&callee).or_else(|| {
-            self.result
-                .path_resolutions
-                .get(&callee)
-                .and_then(|path| path.segments.last())
-                .and_then(|segment| segment.resolution.as_ref())
-        });
-        let direct_or_checked = matches!(
-            resolution,
-            Some(
-                MemberResolution::Free { .. }
-                    | MemberResolution::BoundMethod { .. }
-                    | MemberResolution::UnboundMethod { .. }
-                    | MemberResolution::InterfaceVirtualMethod { .. }
-                    | MemberResolution::InterfaceConcreteMethod { .. }
-                    | MemberResolution::External(_)
-            )
-        );
-        if !direct_or_checked {
-            self.pending_diags
-                .push(PendingDiag::RuntimeTypeArgumentOnIndirectCall { expr: call });
-        }
     }
 
     fn report_mounted_reserved_call(&mut self, call: ExprId, callee: ExprId) {
@@ -4589,10 +5203,10 @@ impl<'db> InferenceContext<'db> {
         else {
             return;
         };
-        let package = match &external.target {
-            crate::callable::ExternalCallTarget::Free { package, .. }
-            | crate::callable::ExternalCallTarget::Method { package, .. } => package,
-            crate::callable::ExternalCallTarget::Interface { interface, .. } => interface.package(),
+        let package_root = match &external.target {
+            crate::callable::ExternalCallTarget::Free { function } => function.root(),
+            crate::callable::ExternalCallTarget::Method { class, .. } => class.root(),
+            crate::callable::ExternalCallTarget::Interface { interface, .. } => interface.root(),
         };
         let trusted_callsite_lowering =
             matches!(
@@ -4601,89 +5215,54 @@ impl<'db> InferenceContext<'db> {
                     baml_compiler2_ast::BuiltinKind::Intrinsic
                         | baml_compiler2_ast::BuiltinKind::AwaitAny
                 )
-            ) && baml_compiler2_hir::package::is_precompiled_package(self.db, package);
+            ) && baml_compiler2_hir::package::is_precompiled_stdlib(self.db, package_root);
         if external.linkability == crate::callable::ExternalLinkability::ReservedBuiltin
             && !trusted_callsite_lowering
         {
             self.pending_diags
                 .push(PendingDiag::MountedPackageCallUnsupported {
                     expr: call,
-                    path: external_target_path(&external.target),
+                    path: external_target_path(&self.viewpoint(), &external.target),
                 });
-        }
-    }
-
-    fn validate_runtime_type_arg_operands(&mut self, body: &ExprBody, call: ExprId) {
-        let operands: Vec<_> = self
-            .type_refs
-            .expr_type_args
-            .get(&call)
-            .into_iter()
-            .flat_map(|slots| slots.iter())
-            .filter_map(|slot| match slot {
-                BodyTypeArgRef::Runtime { operand } => Some(*operand),
-                BodyTypeArgRef::Static(_) => None,
-            })
-            .collect();
-        for operand in operands {
-            self.validate_runtime_type_operand(body, operand);
         }
     }
 
     fn validate_runtime_type_operand(&mut self, body: &ExprBody, operand: ExprId) {
+        if !self.validated_runtime_operands.insert(operand) {
+            return;
+        }
         let got = self.infer_expr(body, operand, &Expectation::None);
-        let pending_type = matches!(got.kind(), TyKind::Class(name, _, _)
-            if name.package().as_str() == "baml"
+        let pending_type = matches!(got.kind(), InferTy::Class(name, _, _)
+            if self.lang().is(baml_base::LangPackage::Reflect, name.root())
                 && name.namespace().iter().map(baml_type::Name::as_str)
-                    .eq(["reflect", "class"])
+                    .eq(["class"])
                 && name.name().as_str() == "PendingType");
-        if pending_type
-            || got.has_error()
-            || got.has_infer()
-            || matches!(got.kind(), TyKind::Unknown { .. })
-        {
+        // A diagnosed operand stays quiet; a pending builder type is a
+        // known value the VM resolves (or refuses) at the boundary. Nothing
+        // else is exempt: an `unknown` must be narrowed to a type with
+        // `match` or `is` before it binds, since a value the checker has not
+        // typed may not be erased into the frame and fail at run time. An
+        // open operand deposits the contract as a bound and is re-judged
+        // here once it solves.
+        if pending_type || got.has_error() {
             return;
         }
-        let expected = Ty::intern(TyKind::Type {
-            attr: TyAttr::default(),
-        });
-        let saved_anchor = self.obligation_anchor.replace(operand);
-        let fits = self.sub(&got, &expected);
-        self.obligation_anchor = saved_anchor;
-        if !fits {
-            self.result.type_mismatches.insert(operand, (expected, got));
-        }
-    }
-
-    fn report_runtime_streaming_call(&mut self, body: &ExprBody, call: ExprId, callee: ExprId) {
-        let has_runtime = self
-            .type_refs
-            .expr_type_args
-            .get(&call)
-            .is_some_and(|slots| {
-                slots
-                    .iter()
-                    .any(|slot| matches!(slot, BodyTypeArgRef::Runtime { .. }))
-            });
-        if !has_runtime {
-            return;
-        }
-        let name = match &body.exprs[callee] {
-            Expr::Path(segments) => segments.last(),
-            Expr::MemberAccess { member, .. } | Expr::OptionalMemberAccess { member, .. } => {
-                Some(member)
-            }
-            _ => None,
-        };
-        if let Some(name) = name
-            && (name.as_str().ends_with("$stream") || name.as_str() == "__make_stream")
-        {
-            self.pending_diags
-                .push(PendingDiag::RuntimeTypeArgumentOnStreamingCall {
-                    expr: call,
-                    callee: name.clone(),
-                });
-        }
+        // The operand contract is `reflect.Type | reflect.TypeView`: a kind
+        // view is accepted and converts to the `type` value it wraps at the
+        // VM's type-operand boundary — the same explicit-computation-point
+        // model as `int + float`, never a subtyping edge.
+        let expected = Ty::intern(InferTy::Union(
+            Box::new([
+                Ty::intern(InferTy::Type {
+                    attr: TyAttr::default(),
+                }),
+                self.lang_interface_ty(baml_base::LangPackage::Reflect, &[], "TypeView"),
+            ]),
+            TyAttr::default(),
+        ));
+        // The ordinary checking road: a ground mismatch is recorded here, an
+        // open operand is re-judged at finish once its variable solves.
+        self.check_inferred(operand, got, &expected);
     }
 
     /// Seed the otherwise-unconstrained schema parameter of the three legacy
@@ -4720,7 +5299,7 @@ impl<'db> InferenceContext<'db> {
         };
         let package = baml_compiler2_hir::file_package::file_package(self.db, func.file(self.db));
         let data = baml_compiler2_ppir::item_data::function_data(self.db, func);
-        if package.package.as_str() != "baml"
+        if !self.lang().is(baml_base::LangPackage::Baml, package.root)
             || !package
                 .namespace_path
                 .iter()
@@ -4772,7 +5351,9 @@ impl<'db> InferenceContext<'db> {
             return;
         }
         let target_ret = function_signature(self.db, target).ret.clone();
-        if target_ret.has_error() || matches!(target_ret.kind(), TyKind::Unknown { .. }) {
+        if target_ret.as_lowering_ty().contains_error()
+            || matches!(target_ret, baml_type::Ty::Unknown { .. })
+        {
             return;
         }
         let Some(schema_arg) = self
@@ -4784,7 +5365,9 @@ impl<'db> InferenceContext<'db> {
         else {
             return;
         };
-        let _ = self.table.unify(&schema_arg, &target_ret);
+        let _ = self
+            .table
+            .unify(&schema_arg, &crate::impls::interned_ty(&target_ret));
     }
 
     fn default_uncontracted_session_eval(&mut self, body: &ExprBody, call: ExprId, callee: ExprId) {
@@ -4807,12 +5390,8 @@ impl<'db> InferenceContext<'db> {
             return;
         };
         let qtn = crate::lower::class_qualified_name(self.db, class);
-        if qtn.package().as_str() != "baml"
-            || !qtn
-                .namespace()
-                .iter()
-                .map(baml_type::Name::as_str)
-                .eq(["reflect"])
+        if !self.lang().is(baml_base::LangPackage::Reflect, qtn.root())
+            || !qtn.namespace().is_empty()
             || qtn.name().as_str() != "Session"
             || baml_compiler2_ppir::item_data::function_data(self.db, func)
                 .name
@@ -4844,7 +5423,7 @@ impl<'db> InferenceContext<'db> {
         if arg.has_infer() {
             let _ = self.table.unify(
                 &arg,
-                &Ty::intern(TyKind::Unknown {
+                &Ty::intern(InferTy::Unknown {
                     attr: TyAttr::default(),
                 }),
             );
@@ -4870,7 +5449,7 @@ impl<'db> InferenceContext<'db> {
         // by a function type forces here, exactly as a method
         // receiver would.
         let callee_fn_ty = &self.structurally_resolve(callee_fn_ty);
-        let TyKind::Function {
+        let InferTy::Function {
             params,
             ret,
             throws,
@@ -4884,7 +5463,7 @@ impl<'db> InferenceContext<'db> {
             // <unresolved>`) is still provably not callable, and that
             // finding stands on its own (E0006).
             let concrete_uncallable_union = || match callee_fn_ty.kind() {
-                TyKind::Union(members, _) => {
+                InferTy::Union(members, _) => {
                     let clean: Vec<Ty> = members
                         .iter()
                         .filter(|member| !member.has_error())
@@ -4895,17 +5474,18 @@ impl<'db> InferenceContext<'db> {
                             !member.has_infer()
                                 && !matches!(
                                     member.kind(),
-                                    TyKind::Function { .. } | TyKind::Unknown { .. }
+                                    InferTy::Function { .. } | InferTy::Unknown { .. }
                                 )
                         }))
                     .then(|| syntactic_union(&clean))
                 }
                 _ => None,
             };
-            if !callee_fn_ty.has_error()
-                && !callee_fn_ty.has_infer()
-                && !matches!(callee_fn_ty.kind(), TyKind::Unknown { .. })
-            {
+            // A value typed `unknown` is not callable, and saying so is
+            // this diagnostic's whole job - the top type is not a cascade.
+            // Only a genuine one (an errored callee, or one still carrying
+            // inference vars) stays quiet.
+            if !callee_fn_ty.has_error() && !callee_fn_ty.has_infer() {
                 self.pending_diags.push(PendingDiag::NotCallable {
                     expr: callee,
                     ty: callee_fn_ty.clone(),
@@ -4925,15 +5505,11 @@ impl<'db> InferenceContext<'db> {
         self.record_throw(callee, &callee_throws);
         // A bound method call: the receiver already fills the `self` slot,
         // so written arguments match against the remaining parameters.
-        let params: Vec<baml_type::interned::FunctionParam> = params
+        let params: Vec<baml_type::interned::InferFunctionParamTy> = params
             .iter()
             .skip(usize::from(bound_receiver))
             .cloned()
             .collect();
-        let runtime_dependent = self
-            .runtime_dependent_call_params
-            .remove(&call)
-            .unwrap_or_default();
         let ret = ret.clone();
         // The matching is decided ONCE, checked below and recorded as the
         // call plan's bindings: a LABELED argument selects its parameter
@@ -4978,21 +5554,6 @@ impl<'db> InferenceContext<'db> {
                     continue;
                 }
                 match matched[index] {
-                    Some(param_index) if runtime_dependent.contains_key(&param_index) => {
-                        // The value still participates in ordinary inference;
-                        // only its runtime-dependent expectation is deferred.
-                        self.infer_expr(body, arg.expr, &Expectation::None);
-                        let expected = runtime_dependent[&param_index].clone();
-                        self.result
-                            .call_plans
-                            .entry(call)
-                            .or_default()
-                            .deferred_checks
-                            .push(RuntimeCheck::Argument {
-                                arg: arg.expr,
-                                expected,
-                            });
-                    }
                     Some(param_index) => {
                         self.check_expr(body, arg.expr, &params[param_index].ty);
                     }
@@ -5025,15 +5586,8 @@ impl<'db> InferenceContext<'db> {
                         .get(&arg.expr)
                         .cloned()
                         .unwrap_or_else(|| self.infer_expr(body, arg.expr, &Expectation::None));
-                    let local_id = Ty::intern(TyKind::Class(
-                        baml_type::QualifiedTypeName::new(
-                            baml_type::Name::new(baml_builtins2::PACKAGE_BOUNDARY),
-                            vec![],
-                            baml_type::Name::new("LocalId"),
-                        ),
-                        Vec::new().into(),
-                        TyAttr::default(),
-                    ));
+                    let local_id =
+                        self.lang_class_ty(baml_base::LangPackage::Boundary, &[], "LocalId");
                     if !self.sub(&got, &local_id) {
                         self.pending_diags
                             .push(PendingDiag::RuntimeIdArgMismatch { at: arg.expr, got });
@@ -5179,6 +5733,8 @@ impl<'db> InferenceContext<'db> {
             })
             .collect();
         let plan = self.result.call_plans.entry(call).or_default();
+        plan.argument_layout =
+            baml_type::CallLayout::from_modes(params.iter().map(|p| (p.name.clone(), p.mode)));
         plan.bindings = bindings;
         plan.runtime_id = runtime_id;
         ret
@@ -5193,6 +5749,16 @@ impl<'db> InferenceContext<'db> {
     /// `method_resolution`; everything else is whatever the expression
     /// infers to.
     fn infer_callee(&mut self, body: &ExprBody, call: ExprId, callee: ExprId) -> (Ty, bool) {
+        // A FULLY-qualified direct call (`(Box as Sized).pick(a, b)`): the
+        // call site supplies the turbofish, and `self` stays the written
+        // first argument (no bound receiver), the UFCS shape.
+        if let Expr::QualifiedPath { member, .. } = &body.exprs[callee] {
+            let member = member.clone();
+            let fn_ty =
+                self.qualified_path_value(callee, &member, OwnArgs::Call(call), Some(callee));
+            self.result.type_of_expr.insert(callee, fn_ty.clone());
+            return (fn_ty, false);
+        }
         // An INTERFACE-qualified direct call
         // (`IqDescribable.describe(t)`): turbofish-aware instantiation
         // with bounds registered - `Self`'s implements-bound becomes an
@@ -5246,17 +5812,14 @@ impl<'db> InferenceContext<'db> {
                 let callee_name = baml_compiler2_ppir::item_data::function_data(self.db, function)
                     .name
                     .clone();
-                let bounds = crate::lower::function_generic_bounds(self.db, function);
-                let instantiation = self.instantiation_args_with_bounds(
+                let instantiation = self.instantiation_args_at(
                     call,
                     &signature.generic_params,
                     Some(&callee_name),
-                    &bounds,
                     crate::lower::TypePosition::Existential,
                 );
                 let instantiation = self.write_call_type_args(call, &instantiation, 0);
                 self.register_call_bounds(function, &instantiation, call);
-                self.record_runtime_dependent_arguments(call, signature, false);
                 let fn_ty = function_value_ty(signature, &instantiation);
                 self.result.type_of_expr.insert(callee, fn_ty.clone());
                 self.write_member_resolution(callee, MemberResolution::Free { func: function });
@@ -5267,22 +5830,17 @@ impl<'db> InferenceContext<'db> {
                     .external
                     .clone()
                     .expect("mounted free function carries an external descriptor");
-                let bounds = external_bounds_map(&external);
-                let instantiation = self.instantiation_args_with_bounds(
+                let instantiation = self.instantiation_args_at(
                     call,
                     &function.generic_params,
                     Some(&function.name),
-                    &bounds,
-                    external_type_position(&external.target),
+                    external_type_position(
+                        baml_compiler2_hir::package::lang_roots(self.db),
+                        &external.target,
+                    ),
                 );
                 let instantiation = self.write_call_type_args(call, &instantiation, 0);
                 self.register_external_call_bounds(&external, &instantiation, call);
-                self.record_external_runtime_dependent_arguments(
-                    call,
-                    &function,
-                    false,
-                    &instantiation,
-                );
                 self.result.call_plans.entry(call).or_default().target =
                     Some(external.target.clone());
                 let fn_ty = crate::method_resolution::instantiate_external_signature(
@@ -5416,61 +5974,6 @@ impl<'db> InferenceContext<'db> {
         (self.infer_expr(body, callee, &Expectation::None), false)
     }
 
-    fn heterogeneous_union_class_method_callee(
-        &self,
-        members: &[Ty],
-        member: &baml_type::Name,
-    ) -> Option<Ty> {
-        let mut has_interface_provider = false;
-        let mut joined: Option<Ty> = None;
-        for arm in members {
-            let TyKind::Class(qtn, _, _) = arm.kind() else {
-                return None;
-            };
-            if matches!(
-                crate::method_resolution::lookup_interface_member(
-                    self.db,
-                    &self.facts,
-                    arm,
-                    member,
-                ),
-                crate::method_resolution::InterfaceMemberLookup::Found(_)
-            ) {
-                has_interface_provider = true;
-            }
-            let Definition::Class(expected_class) = self.facts.definition_of(qtn)? else {
-                return None;
-            };
-            let candidate =
-                crate::method_resolution::lookup_method(self.db, &self.facts, arm, member)?;
-            let crate::method_resolution::MethodCandidateSource::Source { method, class } =
-                candidate.source
-            else {
-                return None;
-            };
-            if class != expected_class
-                || !baml_compiler2_ppir::item_data::class_data(self.db, class)
-                    .methods
-                    .contains(&method)
-            {
-                return None;
-            }
-            let signature = function_signature(self.db, method);
-            if signature.generic_params.len() != candidate.class_args.len() {
-                return None;
-            }
-            let ty = bind_receiver(function_value_ty(signature, &candidate.class_args));
-            if joined
-                .as_ref()
-                .is_some_and(|current| !self.cached_equivalent(current, &ty))
-            {
-                return None;
-            }
-            joined = Some(ty);
-        }
-        if has_interface_provider { joined } else { None }
-    }
-
     /// `receiver.member` in callee position: a method (instantiated - the
     /// receiver pins the class generics, the call site's turbofish or
     /// fresh variables fill the method's own; bound iff it takes `self`),
@@ -5484,7 +5987,7 @@ impl<'db> InferenceContext<'db> {
         member_expr: ExprId,
         receiver: &Ty,
         member: &baml_type::Name,
-    ) -> (Ty, bool, Option<MemberResolution<'db>>, bool) {
+    ) -> (Ty, bool, Option<MemberResolution<'db, Ty>>, bool) {
         let resolved = self.structurally_resolve(receiver);
         // Callee position on a UNION: the member resolves through the
         // single interface every arm shares (TIR's rule - the union as
@@ -5494,16 +5997,24 @@ impl<'db> InferenceContext<'db> {
         // union (`(int | null).to_string()` is `string.from<int | null>`);
         // a full miss then reports "no common interface" instead of the
         // bare "no member".
-        if let TyKind::Union(union_members, _) = resolved.kind() {
+        if let InferTy::Union(union_members, _) = resolved.kind() {
             let union_members = union_members.to_vec();
             match crate::method_resolution::lookup_union_member(
                 self.db,
+                self.viewer(),
                 &self.facts,
                 &resolved,
                 &union_members,
                 member,
             ) {
                 crate::method_resolution::UnionMemberLookup::Found(interface_member) => {
+                    // A union receiver is ERASED: a `self`-less member has
+                    // no value-derived dispatch key, exactly as through an
+                    // existential — same rejection as the value road's.
+                    if self.reject_selfless_instance_member(&interface_member, member, member_expr)
+                    {
+                        return (Ty::error(), false, None, false);
+                    }
                     let resolution = self.declarer_resolution(&interface_member.declarer, member);
                     let (ty, bound) = self.interface_member_callee(interface_member, call, true);
                     return (ty, bound, resolution, false);
@@ -5534,23 +6045,7 @@ impl<'db> InferenceContext<'db> {
                     }
                     return (Ty::error(), false, None, false);
                 }
-                crate::method_resolution::UnionMemberLookup::ClassFieldJoin(field_ty) => {
-                    // The agreed class field types the callee; boundness
-                    // is a plain value read (no receiver binding).
-                    return (field_ty, false, None, false);
-                }
-                crate::method_resolution::UnionMemberLookup::NoCommonInterface => {
-                    // One arm may provide an owned method through an
-                    // interface while another owns an equivalent inherent
-                    // method. MIR retains that heterogeneous case as a
-                    // guarded class-tag switch; class-only unions continue
-                    // to require a common interface.
-                    if let Some(ty) =
-                        self.heterogeneous_union_class_method_callee(&union_members, member)
-                    {
-                        return (ty, true, None, false);
-                    }
-                }
+                crate::method_resolution::UnionMemberLookup::NoCommonInterface => {}
             }
         }
         let candidate =
@@ -5561,6 +6056,7 @@ impl<'db> InferenceContext<'db> {
         if candidate.is_some()
             && let Some((sources, is_field)) = crate::method_resolution::concrete_member_ambiguity(
                 self.db,
+                self.viewer(),
                 &self.facts,
                 &resolved,
                 member,
@@ -5585,11 +6081,16 @@ impl<'db> InferenceContext<'db> {
             // ground registry fails safe on such types).
             match crate::method_resolution::lookup_interface_member(
                 self.db,
+                self.viewer(),
                 &self.facts,
                 &resolved,
                 member,
             ) {
                 crate::method_resolution::InterfaceMemberLookup::Found(interface_member) => {
+                    if self.reject_selfless_instance_member(&interface_member, member, member_expr)
+                    {
+                        return (Ty::error(), false, None, false);
+                    }
                     let resolution = self.declarer_resolution(&interface_member.declarer, member);
                     let (ty, bound) = self.interface_member_callee(interface_member, call, true);
                     return (ty, bound, resolution, false);
@@ -5622,7 +6123,7 @@ impl<'db> InferenceContext<'db> {
                             });
                     }
                     return (
-                        Ty::intern(TyKind::Unknown {
+                        Ty::intern(InferTy::Unknown {
                             attr: TyAttr::default(),
                         }),
                         false,
@@ -5693,7 +6194,7 @@ impl<'db> InferenceContext<'db> {
                 && !resolved.has_error()
                 && !resolved.has_infer()
             {
-                if matches!(resolved.kind(), TyKind::Union(..)) {
+                if matches!(resolved.kind(), InferTy::Union(..)) {
                     self.pending_diags
                         .push(PendingDiag::UnionNoCommonInterface {
                             expr: call,
@@ -5712,6 +6213,9 @@ impl<'db> InferenceContext<'db> {
         };
         match candidate.source {
             crate::method_resolution::MethodCandidateSource::Source { method, class } => {
+                if self.reject_selfless_inherent_method(method, member, member_expr) {
+                    return (Ty::error(), false, None, false);
+                }
                 let signature = function_signature(self.db, method);
                 let class_count = candidate.class_args.len();
                 let own_params = signature.generic_params[class_count..].to_vec();
@@ -5719,17 +6223,15 @@ impl<'db> InferenceContext<'db> {
                     .name
                     .clone();
                 let mut instantiation = candidate.class_args;
-                let bounds = crate::lower::function_generic_bounds(self.db, method);
                 let position = if self.is_reflect_package_get_function(class, method) {
                     crate::lower::TypePosition::ExtractionContract
                 } else {
                     crate::lower::TypePosition::Existential
                 };
-                instantiation.extend(self.instantiation_args_with_bounds(
+                instantiation.extend(self.instantiation_args_at(
                     call,
                     &own_params,
                     Some(&method_name),
-                    &bounds,
                     position,
                 ));
                 let instantiation = self.write_call_type_args(call, &instantiation, class_count);
@@ -5739,7 +6241,6 @@ impl<'db> InferenceContext<'db> {
                     .params
                     .first()
                     .is_some_and(|param| param.name.as_str() == "self");
-                self.record_runtime_dependent_arguments(call, signature, bound);
                 let resolution = if bound {
                     MemberResolution::BoundMethod {
                         class,
@@ -5759,23 +6260,18 @@ impl<'db> InferenceContext<'db> {
                     .clone()
                     .expect("mounted method carries an external descriptor");
                 let own_offset = candidate.class_args.len();
-                let bounds = external_bounds_map(&external);
                 let mut instantiation = candidate.class_args;
-                instantiation.extend(self.instantiation_args_with_bounds(
+                instantiation.extend(self.instantiation_args_at(
                     call,
                     &function.generic_params,
                     Some(&function.name),
-                    &bounds,
-                    external_type_position(&external.target),
+                    external_type_position(
+                        baml_compiler2_hir::package::lang_roots(self.db),
+                        &external.target,
+                    ),
                 ));
                 let instantiation = self.write_call_type_args(call, &instantiation, own_offset);
                 self.register_external_call_bounds(&external, &instantiation, call);
-                self.record_external_runtime_dependent_arguments(
-                    call,
-                    &function,
-                    external.takes_self,
-                    &instantiation,
-                );
                 self.result.call_plans.entry(call).or_default().target =
                     Some(external.target.clone());
                 (
@@ -5794,10 +6290,10 @@ impl<'db> InferenceContext<'db> {
     /// The `default` receiver's meaning inside an `implements` block:
     /// the block's target interface (its written args and associated
     /// bindings lowered in the owner's frame) plus the IMPLEMENTOR as
-    /// `Self` - the class's self type, or a free impl's for-target.
-    /// `None` anywhere else; the caller falls back to ordinary
+    /// `Self`, off the uniform [`impl_self_ty`](crate::lower::impl_self_ty)
+    /// surface. `None` anywhere else; the caller falls back to ordinary
     /// resolution.
-    fn default_receiver_target(&mut self) -> Option<(InterfaceRef, Ty)> {
+    fn default_receiver_target(&mut self) -> Option<(InferInterface, Ty)> {
         let function = self.body_owner?;
         let target =
             baml_compiler2_ppir::item_data::method_interface_target(self.db, function).as_ref()?;
@@ -5806,28 +6302,21 @@ impl<'db> InferenceContext<'db> {
             target.target,
             crate::lower::TypePosition::ConstraintHead,
         );
-        let TyKind::Interface(name, args, pins, _) = target_ty.kind() else {
+        let target_interned = crate::impls::interned_ty(&crate::lower::reject_holes(&target_ty));
+        let InferTy::Interface(name, args, pins, _) = target_interned.kind() else {
             return None;
         };
         let self_ty = match baml_compiler2_ppir::item_data::method_owner(self.db, function) {
-            Some(baml_compiler2_ppir::item_data::MethodOwner::Class(class)) => {
-                crate::lower::class_self_ty(self.db, class)
+            Some(baml_compiler2_ppir::item_data::MethodOwner::Impl(impl_loc)) => {
+                crate::impls::interned_ty(&crate::lower::impl_self_ty(self.db, impl_loc))
             }
-            Some(baml_compiler2_ppir::item_data::MethodOwner::FreeImpl(impl_loc)) => {
-                let data = baml_compiler2_ppir::item_data::impl_block_data(self.db, impl_loc);
-                match &data.subject {
-                    baml_compiler2_ppir::item_data::ImplSubjectData::Free {
-                        for_target, ..
-                    } => self.lower.lower_type_ref(&data.type_refs, *for_target),
-                    baml_compiler2_ppir::item_data::ImplSubjectData::InClass { class, .. } => {
-                        crate::lower::class_self_ty(self.db, *class)
-                    }
-                }
-            }
+            // A recorded interface target pairs with an Impl owner —
+            // class-owned methods never carry one, and interface default
+            // bodies have no target.
             _ => return None,
         };
         Some((
-            InterfaceRef::new(name.clone(), (args.to_vec()).into(), pins.to_vec()),
+            InferInterface::new(name.clone(), args.clone(), pins.clone()),
             self_ty,
         ))
     }
@@ -5882,7 +6371,11 @@ impl<'db> InferenceContext<'db> {
         call: ExprId,
         bind_self: bool,
     ) -> (Ty, bool) {
-        let bound = interface_member.is_method && bind_self;
+        // A `self`-LESS method binds no receiver whatever the spelling: the
+        // receiver named where to find the member, it is not an argument.
+        let bound = interface_member.is_method
+            && bind_self
+            && self.interface_member_takes_self(&interface_member);
         if let Some(pending) = interface_member.pending_own {
             match pending {
                 crate::method_resolution::PendingOwnGenerics::Source { method, prefix } => {
@@ -5894,17 +6387,14 @@ impl<'db> InferenceContext<'db> {
                             .name
                             .clone();
                     let mut instantiation = prefix;
-                    let bounds = crate::lower::function_generic_bounds(self.db, method);
-                    instantiation.extend(self.instantiation_args_with_bounds(
+                    instantiation.extend(self.instantiation_args_at(
                         call,
                         &own_params,
                         Some(&method_name),
-                        &bounds,
                         crate::lower::TypePosition::Existential,
                     ));
                     let instantiation = self.write_call_type_args(call, &instantiation, own_offset);
                     self.register_call_bounds(method, &instantiation, call);
-                    self.record_runtime_dependent_arguments(call, signature, bound);
                     return (function_value_ty(signature, &instantiation), bound);
                 }
                 crate::method_resolution::PendingOwnGenerics::External { function, prefix } => {
@@ -5913,23 +6403,15 @@ impl<'db> InferenceContext<'db> {
                         .clone()
                         .expect("mounted interface method has an external descriptor");
                     let own_offset = prefix.len();
-                    let bounds = external_bounds_map(&external);
                     let mut instantiation = prefix;
-                    instantiation.extend(self.instantiation_args_with_bounds(
+                    instantiation.extend(self.instantiation_args_at(
                         call,
                         &function.generic_params,
                         Some(&function.name),
-                        &bounds,
                         crate::lower::TypePosition::Existential,
                     ));
                     let instantiation = self.write_call_type_args(call, &instantiation, own_offset);
                     self.register_external_call_bounds(&external, &instantiation, call);
-                    self.record_external_runtime_dependent_arguments(
-                        call,
-                        &function,
-                        bound,
-                        &instantiation,
-                    );
                     self.result.call_plans.entry(call).or_default().target =
                         Some(external.target.clone());
                     return (
@@ -5995,7 +6477,10 @@ impl<'db> InferenceContext<'db> {
             let [param] = signature.params.as_slice() else {
                 return None;
             };
-            return Some((param.ty.clone(), signature.throws.clone()));
+            return Some((
+                crate::impls::interned_ty(&param.ty),
+                crate::impls::interned_ty(&signature.throws),
+            ));
         }
         let function = self.lower.resolve_exported_value(&segments)?;
         let [param] = function.params.as_slice() else {
@@ -6031,11 +6516,7 @@ impl<'db> InferenceContext<'db> {
             }
             return Some(function_value_ty(signature, &[target]));
         }
-        let qtn = baml_type::TypeName::new(
-            baml_type::Name::new("baml"),
-            Vec::new(),
-            baml_type::Name::new("String"),
-        );
+        let qtn = self.lang_decl(baml_base::LangPackage::Baml, &[], "String")?;
         let crate::package_interface::ExportedType::Class { methods, .. } =
             crate::package_interface::mounted_type_row(self.db, &qtn)?
         else {
@@ -6050,14 +6531,141 @@ impl<'db> InferenceContext<'db> {
             .then(|| crate::method_resolution::instantiate_external_signature(&function, &[target]))
     }
 
+    /// Generic methods follow the same realization rule as free functions:
+    /// a bare value needs either explicit type arguments or enough contextual
+    /// function type information to determine them. Direct method calls do not
+    /// reach this path (their call site owns inference), and `GenericApply`
+    /// already carries an explicit specialization.
+    fn report_unspecialized_generic_method_value(
+        &mut self,
+        body: &ExprBody,
+        expr: ExprId,
+        expected: &Expectation,
+        inferred: &Ty,
+    ) {
+        if matches!(body.exprs[expr], Expr::GenericApply { .. }) {
+            return;
+        }
+        let Some(resolution) = self.result.member_resolutions.get(&expr).cloned() else {
+            return;
+        };
+        let reference = body.display_expr(expr);
+        let had_context = expected.only_has_type().is_some() || self.optional_call_callee_depth > 0;
+        let source_method = match resolution {
+            MemberResolution::BoundMethod { func, .. }
+            | MemberResolution::InterfaceConcreteMethod { func, .. } => Some((func, true)),
+            MemberResolution::UnboundMethod { func, .. } => Some((func, false)),
+            MemberResolution::InterfaceVirtualMethod { interface, method } => {
+                baml_compiler2_ppir::item_data::interface_data(self.db, interface)
+                    .methods
+                    .iter()
+                    .copied()
+                    .find(|func| {
+                        baml_compiler2_ppir::item_data::function_data(self.db, *func).name == method
+                    })
+                    .map(|func| (func, true))
+            }
+            MemberResolution::External(external)
+                if !matches!(
+                    external.target,
+                    crate::callable::ExternalCallTarget::Free { .. }
+                ) =>
+            {
+                if external.user_generic_params().next().is_some() {
+                    let generic_params: Vec<_> = external
+                        .user_generic_params()
+                        .map(|(param, _)| param.name().clone())
+                        .collect();
+                    let specialization_example_is_safe = external
+                        .user_generic_params()
+                        .all(|(_, bounds)| bounds.is_empty());
+                    let specialization_syntax_available = matches!(body.exprs[expr], Expr::Path(_));
+                    self.pending_diags
+                        .push(PendingDiag::GenericFunctionValueNotSpecialized {
+                            expr,
+                            name: external.display_name().clone(),
+                            reference,
+                            inference_evidence: vec![inferred.clone()],
+                            specialization_args: None,
+                            unconditional: !had_context,
+                            had_expected_type: had_context,
+                            generic_params,
+                            binding_name: initializer_binding_name(body, expr),
+                            function_shape: None,
+                            annotation_ty: None,
+                            specialization_example_is_safe,
+                            specialization_syntax_available,
+                        });
+                }
+                return;
+            }
+            _ => None,
+        };
+        let Some((method, receiver_is_bound)) = source_method else {
+            return;
+        };
+        let data = baml_compiler2_ppir::item_data::function_data(self.db, method);
+        if data.generic_params.is_empty() {
+            return;
+        }
+        let signature = function_signature(self.db, method);
+        let user_params = function_user_generic_params(self.db, method, signature);
+        let generic_params = user_params
+            .iter()
+            .map(|param| param.name().clone())
+            .collect();
+        let specialization_example_is_safe = data
+            .generic_params
+            .iter()
+            .all(|param| param.bounds.is_empty());
+        let specialization_syntax_available = matches!(body.exprs[expr], Expr::Path(_));
+        let has_phantom_param = user_params
+            .iter()
+            .any(|param| !function_signature_mentions_param(signature, param));
+        self.pending_diags
+            .push(PendingDiag::GenericFunctionValueNotSpecialized {
+                expr,
+                name: data.name.clone(),
+                reference,
+                inference_evidence: vec![inferred.clone()],
+                specialization_args: None,
+                unconditional: !had_context || has_phantom_param,
+                had_expected_type: had_context,
+                generic_params,
+                binding_name: initializer_binding_name(body, expr),
+                function_shape: (!has_phantom_param)
+                    .then(|| {
+                        generic_function_value_shape(
+                            &self.viewpoint(),
+                            signature,
+                            user_params,
+                            receiver_is_bound,
+                            false,
+                        )
+                    })
+                    .flatten(),
+                annotation_ty: (specialization_example_is_safe && !has_phantom_param)
+                    .then(|| inferred.clone()),
+                specialization_example_is_safe,
+                specialization_syntax_available,
+            });
+    }
+
     /// The one home for value-position path typing (rust-analyzer's
     /// `infer/path.rs` shape): a local/parameter root followed by field
     /// accesses, or a package-level FUNCTION as a first-class value (`let c:
     /// (x: int) -> int throws never = inc;`), instantiated with fresh
-    /// variables per generic param - only a call site's turbofish can spell
-    /// arguments explicitly, and the expectation's bounds resolve them here.
+    /// variables per generic param. A contextual function type may resolve
+    /// those variables; without one, a generic function must be explicitly
+    /// specialized before it can become a value.
     /// Constants and enum variants join as later slices land.
-    fn resolve_value_path(&mut self, expr: ExprId, segments: &[baml_type::Name]) -> Ty {
+    fn resolve_value_path(
+        &mut self,
+        body: &ExprBody,
+        expr: ExprId,
+        segments: &[baml_type::Name],
+        expected: &Expectation,
+    ) -> Ty {
         if segments.len() == 1 && segments[0].as_str() == "$id" {
             return Ty::string();
         }
@@ -6099,16 +6707,81 @@ impl<'db> InferenceContext<'db> {
         if let Some(baml_compiler2_hir::contributions::Definition::Function(function)) =
             self.lower.resolve_value(segments)
         {
+            let had_context =
+                expected.only_has_type().is_some() || self.optional_call_callee_depth > 0;
             let signature = function_signature(self.db, function);
             let instantiation: Vec<Ty> = signature
                 .generic_params
                 .iter()
                 .map(|param| self.fresh_generic_arg(param))
                 .collect();
+            let data = baml_compiler2_ppir::item_data::function_data(self.db, function);
+            if data.generic_params.is_empty() {
+                // Synthetic callback-effect parameters are inference-only;
+                // they do not make an otherwise non-generic function value
+                // require explicit specialization.
+            } else {
+                let user_params = function_user_generic_params(self.db, function, signature);
+                let generic_params = user_params
+                    .iter()
+                    .map(|param| param.name().clone())
+                    .collect();
+                let specialization_example_is_safe = data
+                    .generic_params
+                    .iter()
+                    .all(|param| param.bounds.is_empty());
+                let has_phantom_param = user_params
+                    .iter()
+                    .any(|param| !function_signature_mentions_param(signature, param));
+                let inference_evidence = user_params
+                    .iter()
+                    .filter_map(|param| instantiation.get(param.index() as usize).cloned())
+                    .collect();
+                self.pending_diags
+                    .push(PendingDiag::GenericFunctionValueNotSpecialized {
+                        expr,
+                        name: data.name.clone(),
+                        reference: segments
+                            .iter()
+                            .map(baml_type::Name::as_str)
+                            .collect::<Vec<_>>()
+                            .join("."),
+                        inference_evidence,
+                        specialization_args: Some(
+                            user_params
+                                .iter()
+                                .filter_map(|param| {
+                                    instantiation.get(param.index() as usize).cloned()
+                                })
+                                .collect(),
+                        ),
+                        unconditional: !had_context,
+                        had_expected_type: had_context,
+                        generic_params,
+                        binding_name: initializer_binding_name(body, expr),
+                        function_shape: (!has_phantom_param)
+                            .then(|| {
+                                generic_function_value_shape(
+                                    &self.viewpoint(),
+                                    signature,
+                                    user_params,
+                                    false,
+                                    false,
+                                )
+                            })
+                            .flatten(),
+                        annotation_ty: (specialization_example_is_safe && !has_phantom_param)
+                            .then(|| function_value_ty(signature, &instantiation)),
+                        specialization_example_is_safe,
+                        specialization_syntax_available: true,
+                    });
+            }
             self.write_member_resolution(expr, MemberResolution::Free { func: function });
             return function_value_ty(signature, &instantiation);
         }
         if let Some(function) = self.lower.resolve_exported_value(segments) {
+            let had_context =
+                expected.only_has_type().is_some() || self.optional_call_callee_depth > 0;
             let external = function
                 .external
                 .clone()
@@ -6118,6 +6791,68 @@ impl<'db> InferenceContext<'db> {
                 .iter()
                 .map(|param| self.fresh_generic_arg(param))
                 .collect();
+            if external.user_generic_params().next().is_some() {
+                let user_params: Vec<_> = external
+                    .user_generic_params()
+                    .map(|(param, _)| param.clone())
+                    .collect();
+                let generic_params = user_params
+                    .iter()
+                    .map(|param| param.name().clone())
+                    .collect();
+                let specialization_example_is_safe = external
+                    .user_generic_params()
+                    .all(|(_, bounds)| bounds.is_empty());
+                let shape_ty =
+                    external_generic_function_value_ty(&function, &user_params, false, false);
+                let has_phantom_param = user_params
+                    .iter()
+                    .any(|param| !ty_mentions_param(&shape_ty, param));
+                let inference_evidence = external
+                    .user_generic_params()
+                    .filter_map(|(param, _)| instantiation.get(param.index() as usize).cloned())
+                    .collect();
+                self.pending_diags
+                    .push(PendingDiag::GenericFunctionValueNotSpecialized {
+                        expr,
+                        name: function.name.clone(),
+                        reference: segments
+                            .iter()
+                            .map(baml_type::Name::as_str)
+                            .collect::<Vec<_>>()
+                            .join("."),
+                        inference_evidence,
+                        specialization_args: Some(
+                            user_params
+                                .iter()
+                                .filter_map(|param| {
+                                    instantiation.get(param.index() as usize).cloned()
+                                })
+                                .collect(),
+                        ),
+                        unconditional: !had_context,
+                        had_expected_type: had_context,
+                        generic_params,
+                        binding_name: initializer_binding_name(body, expr),
+                        function_shape: (!has_phantom_param)
+                            .then(|| {
+                                self.viewpoint()
+                                    .source_text(&rendered_plain(&shape_ty))
+                                    .ok()
+                            })
+                            .flatten(),
+                        annotation_ty: (specialization_example_is_safe && !has_phantom_param).then(
+                            || {
+                                crate::method_resolution::instantiate_external_signature(
+                                    &function,
+                                    &instantiation,
+                                )
+                            },
+                        ),
+                        specialization_example_is_safe,
+                        specialization_syntax_available: true,
+                    });
+            }
             self.write_member_resolution(expr, MemberResolution::External(external));
             return crate::method_resolution::instantiate_external_signature(
                 &function,
@@ -6157,7 +6892,7 @@ impl<'db> InferenceContext<'db> {
                 // (`let` in a body applies this before recording the
                 // binding), and a session cannot annotate one to opt out, so
                 // the widening is unconditional here.
-                let root_ty = self.widen_fresh(&root_ty);
+                let root_ty = self.widen_fresh(&Ty::from_plain(&root_ty));
                 let (ty, steps) = self.walk_path_members(expr, root_ty, &segments[1..]);
                 self.write_resolved_path(expr, steps);
                 return ty;
@@ -6269,13 +7004,10 @@ impl<'db> InferenceContext<'db> {
         own: OwnArgs,
         params: &[baml_type::ParamTy],
         callee: &baml_type::Name,
-        bounds: &FxHashMap<baml_type::ParamTy, Vec<InterfaceRef>>,
         position: crate::lower::TypePosition,
     ) -> Vec<Ty> {
         match own {
-            OwnArgs::Call(call) => {
-                self.instantiation_args_with_bounds(call, params, Some(callee), bounds, position)
-            }
+            OwnArgs::Call(call) => self.instantiation_args_at(call, params, Some(callee), position),
             OwnArgs::Fresh => params
                 .iter()
                 .map(|param| self.fresh_generic_arg(param))
@@ -6283,46 +7015,199 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    /// TIER: an interface-qualified static (`Trait.method`). Bounds
-    /// register at the instantiation, whatever the spelling.
-    fn interface_static_value(
+    /// TIER: an ITEM PROJECTION - the `(Self type, interface, item)` triple,
+    /// with either half optionally left to inference. The spellings differ
+    /// only in which halves are written:
+    ///
+    /// | spelling            | `qself`  | `qualifier` |
+    /// |---------------------|----------|-------------|
+    /// | `Interface.item`    | inferred | written     |
+    /// | `(Base as I).item`  | written  | written     |
+    ///
+    /// `Self` is slot 0 of an interface method's generic frame
+    /// (`lower::interface_frame`). A written `qself` PINS it; an inferred one
+    /// leaves a fresh variable whose implements-bound rides along through
+    /// `function_generic_bounds` and is discharged by the call's arguments.
+    /// That one slot is the entire difference between the spellings - which
+    /// is why they are one tier and not two.
+    ///
+    /// A turbofish binds the slots AFTER `Self`: the method's own generics
+    /// and the interface's, never `Self` itself, which has its own written
+    /// position in the qualified spelling and is inferred in the other.
+    ///
+    /// The receiver is never bound: `self` stays the written first argument,
+    /// the UFCS shape `Type.method(recv, ..)` already uses.
+    fn item_projection_value(
         &mut self,
-        prefix: &[baml_type::Name],
+        interface: baml_compiler2_hir::loc::InterfaceLoc<'db>,
+        written: Option<&WrittenQualifier<'_>>,
         member: &baml_type::Name,
         own: OwnArgs,
         anchor: ExprId,
         record_at: Option<ExprId>,
     ) -> Option<Ty> {
-        let (interface, method) = self.interface_static_method(prefix, member)?;
+        let qself = written.map(|written| &written.qself);
+        let realized = written.map(|written| written.realized);
+        let method = self.interface_method_loc(interface, member)?;
         let signature = function_signature(self.db, method);
-        let bounds = crate::lower::function_generic_bounds(self.db, method);
-        let instantiation = self.own_instantiation_with_bounds(
+        let Some((self_param, after_self)) = signature.generic_params.split_first() else {
+            unreachable!("an interface method's generic frame always opens with `Self`")
+        };
+        debug_assert_eq!(
+            self_param.name().as_str(),
+            "Self",
+            "interface method frame must open with the `Self` slot"
+        );
+
+        // The frame is `[Self] ++ interface generics ++ the method's own
+        // generics` (`lower::interface_frame`). A written qualifier realizes
+        // the generics group and it is PINNED from it: `Conv<int>` and
+        // `Conv<string>` are different interfaces a type may implement both
+        // of, so leaving their slots to inference would let two calls in one
+        // body unify against the same hole. Associated types are not slots -
+        // signature references to them are projections over `Self`, reduced
+        // once `Self` is known.
+        let interface_data = baml_compiler2_ppir::item_data::interface_data(self.db, interface);
+        let pinned = interface_data.generic_params.len();
+        // `lower::function_generic_frame` builds an interface method's frame
+        // from this same `interface_data`, appending the method's own generics
+        // after the two groups, so the frame is always at least this long.
+        debug_assert!(
+            pinned <= after_self.len(),
+            "interface method frame is shorter than the interface it was built from"
+        );
+        // The clamp is an explicitly-marked release-mode net for that
+        // invariant, never a resolution strategy: `debug_assert` above fails
+        // the tests if it is ever load-bearing.
+        let (frame_params, own_params) = after_self.split_at(pinned.min(after_self.len()));
+
+        let mut instantiation = Vec::with_capacity(signature.generic_params.len());
+        let self_slot = match qself {
+            Some(written) => written.clone(),
+            None => self.fresh_generic_arg(self_param),
+        };
+        // Guards on the `Self` slot, deferred until inference resolves it
+        // (the inferred spelling only pins `Self` through the arguments):
+        // an ERASED `Self` — an interface-existential or a union — obeys the
+        // one-`Self` object-safety rule when the method takes a receiver
+        // (dispatch derives the concrete type from the value), and is
+        // rejected outright when it does not (type-keyed dispatch has no
+        // value to consult, and an erased type names no single impl).
+        // An UNRESOLVED `Self` is a hard error: rustc's E0790, whose fix is
+        // the fully-qualified spelling.
+        let takes_self = signature
+            .params
+            .first()
+            .is_some_and(|param| param.name.as_str() == "self");
+        let iface_ref = InferInterface::new(
+            crate::interfaces::interface_loc_qtn(self.db, interface)
+                .unwrap_or_else(|| unreachable!("a resolved interface item has a source QTN")),
+            // The WRITTEN arguments: `Conv<int>` and `Conv<string>` are
+            // different interfaces, so a message naming a bare `Conv` would
+            // not say which one the reference meant. Empty for the inferred
+            // spelling, which wrote none. Associated types stay empty — they
+            // are determined rather than written, and naming them would
+            // over-specify the message.
+            realized.map_or_else(Box::default, |realized| {
+                realized.generics.iter().map(Ty::from_plain).collect()
+            }),
+            Box::new([]),
+        );
+        self.pending_diags
+            .push(PendingDiag::ItemProjectionSelfSlot {
+                expr: anchor,
+                var: self_slot.clone(),
+                interface: iface_ref,
+                member: member.clone(),
+                takes_self,
+                value_position: matches!(own, OwnArgs::Fresh),
+            });
+        if qself.is_none() {
+            self.pending_diags.push(PendingDiag::UninferredCtorParam {
+                expr: anchor,
+                var: self_slot.clone(),
+                name: baml_type::Name::new("Self"),
+            });
+        }
+        instantiation.push(self_slot);
+        for (index, param) in frame_params.iter().enumerate() {
+            // Realized generics first, then realized associated types by name;
+            // an unrealized slot (the `Interface.item` spelling, which has no
+            // subject to realize against) stays a fresh variable the call's
+            // arguments solve.
+            // The pinned group IS the declared generics — associated types
+            // are not frame slots, so the index maps 1:1; a realization that
+            // comes up short leaves the slot fresh.
+            let realized_arg =
+                realized.and_then(|realized| realized.generics.get(index).map(Ty::from_plain));
+            instantiation.push(match realized_arg {
+                Some(arg) => arg,
+                None => {
+                    let fresh = self.fresh_generic_arg(param);
+                    // Same discipline as the `Self` slot: a frame slot the
+                    // call leaves unsolved is a hard error, never an Error
+                    // type reaching emission.
+                    self.pending_diags.push(PendingDiag::UninferredCtorParam {
+                        expr: anchor,
+                        var: fresh.clone(),
+                        name: param.name().clone(),
+                    });
+                    fresh
+                }
+            });
+        }
+        let own_args = self.own_instantiation_with_bounds(
             own,
-            &signature.generic_params,
+            own_params,
             member,
-            &bounds,
             crate::lower::TypePosition::Existential,
         );
-        if let OwnArgs::Call(call) = own {
-            let instantiation = self.write_call_type_args(call, &instantiation, 0);
-            self.register_call_bounds(method, &instantiation, anchor);
-            self.record_runtime_dependent_arguments(call, signature, false);
-            if let Some(record_at) = record_at {
-                self.write_member_resolution(
-                    record_at,
-                    MemberResolution::InterfaceVirtualMethod {
-                        interface,
-                        method: member.clone(),
-                    },
-                );
+        if matches!(own, OwnArgs::Fresh) {
+            // Same discipline as the `Self` and pinned slots: a fresh own
+            // generic nothing solves is a hard error, never an Error type
+            // reaching emission. This lane is reachable from a CALL too —
+            // a consumed type-arg channel (`Bin<int>.pick()`, and equally
+            // the turbofish spelling `Bin.pick<int>()`, which the channel
+            // cannot distinguish from it) hands the written args to the
+            // CLASS frame and leaves the member's own generics with no
+            // written source at all.
+            for (param, arg) in own_params.iter().zip(&own_args) {
+                // Synthetic effect params are elaboration's, never spelled,
+                // and legitimately default when unconstrained.
+                if baml_type::is_synthetic_effect_param(param.name()) {
+                    continue;
+                }
+                self.pending_diags.push(PendingDiag::UninferredCtorParam {
+                    expr: anchor,
+                    var: arg.clone(),
+                    name: param.name().clone(),
+                });
             }
-            return Some(function_value_ty(signature, &instantiation));
+        }
+        instantiation.extend(own_args);
+        match own {
+            OwnArgs::Call(call) => {
+                instantiation = self.write_call_type_args(call, &instantiation, 0);
+            }
+            OwnArgs::Fresh => {
+                // A VALUE reference has no call site, but MIR still needs the
+                // (eventually solved) frame to resolve the callable — record
+                // it as a plan keyed by the reference expression itself, the
+                // same channel a call's instantiation rides. Writeback
+                // grounds it once inference finishes.
+                let plan = self.result.call_plans.entry(anchor).or_default();
+                plan.type_args.clone_from(&instantiation);
+                plan.own_offset = 0;
+            }
         }
         self.register_call_bounds(method, &instantiation, anchor);
         if let Some(record_at) = record_at {
-            // The slot is what's statically known - interface plus member,
-            // recorded uniformly for default and required methods (TIR's
-            // contract; MIR keys the fn constant / virtual dispatch on it).
+            // The slot is what is statically known - interface plus member -
+            // recorded uniformly for every spelling and for default and
+            // required methods alike. Resolving it to a concrete impl is
+            // downstream's job: the VM keys on the receiver's runtime type
+            // and caches the target. A written `Self` narrows WHICH interface
+            // slot, never who answers it.
             self.write_member_resolution(
                 record_at,
                 MemberResolution::InterfaceVirtualMethod {
@@ -6332,6 +7217,195 @@ impl<'db> InferenceContext<'db> {
             );
         }
         Some(function_value_ty(signature, &instantiation))
+    }
+
+    /// The `(Base as I).item` spelling: both halves written. Validates them
+    /// and hands the same tier its pinned `Self`.
+    ///
+    /// This is the only spelling that reaches two otherwise-unreachable
+    /// members - one declared by several implemented interfaces (the bare
+    /// `base.item` is E0121-ambiguous), and one whose `Self` appears in a
+    /// parameter (the existential `base.as<I>.item` is object-safety
+    /// rejected, and a written `Self` removes the need for a receiver).
+    fn qualified_path_value(
+        &mut self,
+        expr: ExprId,
+        member: &baml_type::Name,
+        own: OwnArgs,
+        record_at: Option<ExprId>,
+    ) -> Ty {
+        let Some(anchors) = self.type_refs.qualified_path_anchors.get(&expr).copied() else {
+            // The parser builds this node only with both halves present, so a
+            // missing anchor is a malformed body, already reported upstream.
+            return Ty::error();
+        };
+        let member = member.clone();
+
+        let lower = |this: &mut Self, type_ref, position| {
+            let (ty, diagnostics) =
+                this.lower_body_type_ref_at(type_ref, position, crate::lower::HolePolicy::Allowed);
+            this.queue_body_lowering_diagnostics(diagnostics);
+            this.reject_expr_position_holes(&ty, expr)
+        };
+        let qself = lower(self, anchors.qself, crate::lower::TypePosition::Existential);
+        // The qualifier is a CONSTRAINT HEAD, not an existential: its
+        // associated types are determined by `Self` and need not be written,
+        // exactly as in a bound (`T extends I`). The existential position's
+        // pin-them-all demand would reject `(int as I)` for any interface
+        // with an associated type.
+        let interface = lower(
+            self,
+            anchors.interface,
+            crate::lower::TypePosition::ConstraintHead,
+        );
+        if qself.has_error() || interface.has_error() {
+            return Ty::error();
+        }
+        // The interface-view gate is a STRUCTURE demand, as it is for
+        // `.as<I>`: an alias naming an interface answers as the interface.
+        let interface = self.expand_alias_ty(&interface);
+        let Some(qualifier) = InferInterface::of_ty(&interface) else {
+            self.pending_diags.push(PendingDiag::QualifierNotInterface {
+                expr,
+                target: interface,
+            });
+            return Ty::error();
+        };
+        let qself = self.structurally_resolve(&qself);
+        // Determination runs the impl matcher and the canonical algebra,
+        // neither of which admits an unresolved inference variable. Both
+        // halves are WRITTEN types, ground at lowering — the only way a
+        // variable survives to here is a written hole (`(Wrapper<_> as I).m`)
+        // that `reject_expr_position_holes` already reported and replaced with
+        // a fresh var. So this bail never introduces a silent `Ty::error()`:
+        // the diagnostic invariant is upheld by construction, and the assert
+        // pins that reading.
+        if qself.has_infer() || interface.has_infer() {
+            debug_assert!(
+                self.pending_diags.iter().any(
+                    |diag| matches!(diag, PendingDiag::ExprPositionHole { expr: at } if *at == expr)
+                ),
+                "an inference variable in a written qualifier must come from a reported hole"
+            );
+            return Ty::error();
+        }
+
+        // Which half is at fault, from the SHARED determination road: the
+        // qualifier must be an interface `qself` implements, and it must
+        // declare `member` DIRECTLY (`requires` is a bound, not inheritance).
+        // Written generic arguments are load-bearing here - `Bar<int>` and
+        // `Bar<string>` are different interfaces and a type may implement
+        // both - while associated types need not be written, being uniquely
+        // determined once `Self` is known.
+        let qself_plain = self.materialize_ty(&qself);
+        let interface_plain = self.materialize_ty(&interface);
+        let (determination, diagnostics) = crate::interfaces::determine_member_interface_with_facts(
+            self.db,
+            self.viewer(),
+            &self.facts,
+            &qself_plain,
+            Some(interface_plain),
+            &member,
+            crate::interfaces::MemberNamespace::Value,
+        );
+        for error in diagnostics {
+            self.pending_diags.push(PendingDiag::AnnotWf {
+                type_ref: anchors.interface,
+                error,
+            });
+        }
+        let unresolved_member = |this: &mut Self| {
+            if this.member_probe_depth == 0 {
+                this.pending_diags.push(PendingDiag::UnresolvedMember {
+                    expr,
+                    base: interface.clone(),
+                    member: member.clone(),
+                });
+            }
+            Ty::error()
+        };
+        let realized = match determination {
+            crate::interfaces::Determination::Determined(realized) => realized,
+            crate::interfaces::Determination::SubjectDoesNotImplementQualifier { .. } => {
+                if self.member_probe_depth == 0 {
+                    self.pending_diags
+                        .push(PendingDiag::QualifierNotImplemented {
+                            expr,
+                            value: qself,
+                            interface,
+                        });
+                }
+                return Ty::error();
+            }
+            crate::interfaces::Determination::Undeclared { .. }
+            | crate::interfaces::Determination::Ambiguous(_) => return unresolved_member(self),
+            // Already-poisoned inputs were reported where they were lowered.
+            crate::interfaces::Determination::InvalidBase
+            | crate::interfaces::Determination::Poisoned => return Ty::error(),
+        };
+
+        // A MOUNTED interface has no source method item to instantiate, the
+        // same limit the `Interface.item` spelling has; and determination
+        // proved the member exists in the VALUE namespace, so a miss below it
+        // is a FIELD, which has no static spelling - reading one needs a
+        // receiver to read it from.
+        let Some(interface_loc) = self.interface_loc_for(&qualifier.name) else {
+            return unresolved_member(self);
+        };
+        self.item_projection_value(
+            interface_loc,
+            Some(&WrittenQualifier {
+                qself,
+                realized: &realized,
+            }),
+            &member,
+            own,
+            expr,
+            record_at,
+        )
+        .unwrap_or_else(|| unresolved_member(self))
+    }
+
+    /// The source `InterfaceLoc` a qualified type name denotes, if any.
+    fn interface_loc_for(
+        &self,
+        qtn: &baml_type::DeclName,
+    ) -> Option<baml_compiler2_hir::loc::InterfaceLoc<'db>> {
+        match self.facts.definition_of(qtn) {
+            Some(baml_compiler2_hir::contributions::Definition::Interface(loc)) => Some(loc),
+            _ => None,
+        }
+    }
+
+    /// The interface's method item named `member`. Required and default
+    /// methods alike - they are one item kind.
+    fn interface_method_loc(
+        &self,
+        interface: baml_compiler2_hir::loc::InterfaceLoc<'db>,
+        member: &baml_type::Name,
+    ) -> Option<baml_compiler2_hir::loc::FunctionLoc<'db>> {
+        baml_compiler2_ppir::item_data::interface_data(self.db, interface)
+            .methods
+            .iter()
+            .copied()
+            .find(|&method| {
+                baml_compiler2_ppir::item_data::function_data(self.db, method).name == *member
+            })
+    }
+
+    /// The `Interface.item` spelling: the interface is written, `Self` is
+    /// inferred from the call's arguments. Bounds register at the
+    /// instantiation, whatever the spelling.
+    fn interface_static_value(
+        &mut self,
+        prefix: &[baml_type::Name],
+        member: &baml_type::Name,
+        own: OwnArgs,
+        anchor: ExprId,
+        record_at: Option<ExprId>,
+    ) -> Option<Ty> {
+        let (interface, _) = self.interface_static_method(prefix, member)?;
+        self.item_projection_value(interface, None, member, own, anchor, record_at)
     }
 
     /// TIER: a class-qualified static (`Array.filled`, `float.nan`,
@@ -6383,7 +7457,6 @@ impl<'db> InferenceContext<'db> {
                 .external
                 .clone()
                 .expect("mounted static method carries an external descriptor");
-            let bounds = external_bounds_map(&external);
             let frame: Vec<baml_type::ParamTy> = external
                 .owner_generic_params
                 .iter()
@@ -6392,12 +7465,14 @@ impl<'db> InferenceContext<'db> {
                 .collect();
             let (instantiation, own_offset) = match (own, pinned) {
                 (OwnArgs::Call(call), Some(owner_args)) => {
-                    let own_args = self.instantiation_args_with_bounds(
+                    let own_args = self.instantiation_args_at(
                         call,
                         &external.generic_params,
                         Some(member),
-                        &bounds,
-                        external_type_position(&external.target),
+                        external_type_position(
+                            baml_compiler2_hir::package::lang_roots(self.db),
+                            &external.target,
+                        ),
                     );
                     let own_offset = owner_args.len();
                     let mut instantiation = owner_args;
@@ -6405,12 +7480,14 @@ impl<'db> InferenceContext<'db> {
                     (instantiation, own_offset)
                 }
                 (OwnArgs::Call(call), None) => {
-                    let instantiation = self.instantiation_args_with_bounds(
+                    let instantiation = self.instantiation_args_at(
                         call,
                         &frame,
                         Some(member),
-                        &bounds,
-                        external_type_position(&external.target),
+                        external_type_position(
+                            baml_compiler2_hir::package::lang_roots(self.db),
+                            &external.target,
+                        ),
                     );
                     (instantiation, 0)
                 }
@@ -6435,12 +7512,6 @@ impl<'db> InferenceContext<'db> {
             let instantiation = if let OwnArgs::Call(call) = own {
                 let instantiation = self.write_call_type_args(call, &instantiation, own_offset);
                 self.register_external_call_bounds(&external, &instantiation, anchor);
-                self.record_external_runtime_dependent_arguments(
-                    call,
-                    &function,
-                    false,
-                    &instantiation,
-                );
                 self.result.call_plans.entry(call).or_default().target =
                     Some(external.target.clone());
                 instantiation
@@ -6469,7 +7540,7 @@ impl<'db> InferenceContext<'db> {
                 .iter()
                 .map(|param| self.fresh_generic_arg(param))
                 .collect();
-            let receiver = Ty::intern(TyKind::Class(
+            let receiver = Ty::intern(InferTy::Class(
                 qtn.clone(),
                 class_args.into(),
                 TyAttr::default(),
@@ -6477,6 +7548,7 @@ impl<'db> InferenceContext<'db> {
             if let crate::method_resolution::InterfaceMemberLookup::Found(interface_member) =
                 crate::method_resolution::lookup_interface_member(
                     self.db,
+                    self.viewer(),
                     &self.facts,
                     &receiver,
                     member,
@@ -6499,7 +7571,140 @@ impl<'db> InferenceContext<'db> {
                 return Some(fn_ty);
             }
         }
-        None
+        // TIER: a type-qualified implements-block member on a SOURCE class -
+        // the bare spelling of the `(C as I).item` projection with the
+        // interface INFERRED.
+        self.class_impl_static_value(prefix, member, own, anchor, record_at)
+    }
+
+    /// The impl tier of [`Self::class_static_value`]: `C.item` /
+    /// `C<args>.item` where `item` lives in an implements block (in-class or
+    /// free alike - the block spelling is metadata, not semantics). Mirrors
+    /// [`Self::qualified_path_value`] with the qualifier inferred: the
+    /// determination must be UNIQUE - two declaring interfaces need the
+    /// `(C as I).item` spelling (E0121's rule) - and the resolved member
+    /// types exactly as the qualified spelling would, so self-less statics
+    /// dispatch type-keyed and UFCS methods keep `self` as the written
+    /// first argument.
+    ///
+    /// The receiver must be GROUND before determination runs (the impl
+    /// matcher admits no inference variables), so the class arguments come
+    /// only from the spelling: an alias expansion's pinned args, the hoisted
+    /// receiver args (`Bin<int>.build(2)` - BEP-039 moves `<int>` onto the
+    /// call channel), or an empty frame. A generic class with no written
+    /// arguments does not reach this tier - which interface declares the
+    /// member could depend on the very arguments inference has not solved.
+    fn class_impl_static_value(
+        &mut self,
+        prefix: &[baml_type::Name],
+        member: &baml_type::Name,
+        own: OwnArgs,
+        anchor: ExprId,
+        record_at: Option<ExprId>,
+    ) -> Option<Ty> {
+        let (class, pinned) = self.static_class_for(prefix)?;
+        let frame = crate::lower::class_generic_frame(self.db, class);
+        // The class arguments and whether the call's written type-arg channel
+        // was consumed for them (the hoisted-receiver-args spelling).
+        let (args, channel_consumed) = match pinned {
+            Some(args) => (args, false),
+            None if frame.is_empty() => (Vec::new(), false),
+            None => {
+                let OwnArgs::Call(call) = own else {
+                    return None;
+                };
+                let written = self.type_refs.expr_type_args.get(&call)?.clone();
+                // The whole prefix must be written and static: a partial or
+                // runtime instantiation cannot ground the receiver here.
+                if written.len() != frame.len() {
+                    return None;
+                }
+                // Lowered WITHOUT call-plan slot recording: these args live
+                // inside the `Self` template, and the interface-item road
+                // reads recorded slots as the method's OWN suffix.
+                let args: Vec<Ty> = written
+                    .iter()
+                    .map(|type_ref| {
+                        let (lowered, diagnostics) = self.lower_body_type_ref_at(
+                            *type_ref,
+                            crate::lower::TypePosition::Existential,
+                            crate::lower::HolePolicy::Allowed,
+                        );
+                        self.queue_body_lowering_diagnostics(diagnostics);
+                        self.reject_expr_position_holes(&lowered, anchor)
+                    })
+                    .collect();
+                (args, true)
+            }
+        };
+        let qself = crate::lower::class_ty(
+            self.lang(),
+            crate::lower::class_qualified_name(self.db, class),
+            args,
+        );
+        if qself.has_infer() || qself.has_error() {
+            return None;
+        }
+        let (determination, _) = crate::interfaces::determine_member_interface_with_facts(
+            self.db,
+            self.viewer(),
+            &self.facts,
+            &rendered_plain(&qself),
+            None,
+            member,
+            crate::interfaces::MemberNamespace::Value,
+        );
+        let realized = match determination {
+            crate::interfaces::Determination::Determined(realized) => realized,
+            crate::interfaces::Determination::Ambiguous(candidates) => {
+                if self.member_probe_depth == 0 {
+                    self.pending_diags.push(PendingDiag::AmbiguousMember {
+                        expr: anchor,
+                        base: qself,
+                        member: member.clone(),
+                        sources: candidates
+                            .iter()
+                            .map(|iface| {
+                                InferInterface::new(
+                                    iface.name.clone(),
+                                    iface.generics.iter().map(Ty::from_plain).collect(),
+                                    iface
+                                        .associated_types
+                                        .iter()
+                                        .map(|(name, ty)| (name.clone(), Ty::from_plain(ty)))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                        is_field: false,
+                    });
+                }
+                return Some(Ty::error());
+            }
+            crate::interfaces::Determination::Undeclared { .. }
+            | crate::interfaces::Determination::SubjectDoesNotImplementQualifier { .. }
+            | crate::interfaces::Determination::InvalidBase
+            | crate::interfaces::Determination::Poisoned => return None,
+        };
+        let interface_loc = self.interface_loc_for(&realized.name)?;
+        // A consumed channel holds the CLASS args, so the member's own
+        // generics (if any) instantiate fresh instead of re-reading it.
+        let own = if channel_consumed {
+            OwnArgs::Fresh
+        } else {
+            own
+        };
+        self.item_projection_value(
+            interface_loc,
+            Some(&WrittenQualifier {
+                qself,
+                realized: &realized,
+            }),
+            member,
+            own,
+            anchor,
+            record_at,
+        )
     }
 
     fn source_class_static_value(
@@ -6520,7 +7725,6 @@ impl<'db> InferenceContext<'db> {
             })?;
         let signature = function_signature(self.db, method);
         let frame = crate::lower::class_generic_frame(self.db, class);
-        let bounds = crate::lower::function_generic_bounds(self.db, method);
         let position = if self.is_reflect_package_get_function(class, method) {
             crate::lower::TypePosition::ExtractionContract
         } else {
@@ -6534,9 +7738,8 @@ impl<'db> InferenceContext<'db> {
             Some(owner_args) => {
                 let own_params = &signature.generic_params[frame.len()..];
                 let mut instantiation = owner_args;
-                instantiation.extend(
-                    self.own_instantiation_with_bounds(own, own_params, member, &bounds, position),
-                );
+                instantiation
+                    .extend(self.own_instantiation_with_bounds(own, own_params, member, position));
                 (instantiation, frame.len())
             }
             None => (
@@ -6544,7 +7747,6 @@ impl<'db> InferenceContext<'db> {
                     own,
                     &signature.generic_params,
                     member,
-                    &bounds,
                     position,
                 ),
                 0,
@@ -6553,7 +7755,6 @@ impl<'db> InferenceContext<'db> {
         if let OwnArgs::Call(call) = own {
             let instantiation = self.write_call_type_args(call, &instantiation, own_offset);
             self.register_call_bounds(method, &instantiation, anchor);
-            self.record_runtime_dependent_arguments(call, signature, false);
             if let Some(record_at) = record_at {
                 self.write_member_resolution(
                     record_at,
@@ -6610,10 +7811,11 @@ impl<'db> InferenceContext<'db> {
         if segments.len() < 2 {
             return None;
         }
-        let ty = self.lower_scoped_type_path(segments);
-        let TyKind::EnumVariant(qtn, variant, _) = ty.kind() else {
+        let lowered = self.lower_scoped_type_path(segments);
+        let baml_type::LoweringTy::EnumVariant(qtn, variant, _) = &lowered else {
             return None;
         };
+        let ty = crate::impls::interned_ty(&crate::lower::reject_holes(&lowered));
         if let Some(record_at) = record_at
             && let Some(baml_compiler2_hir::contributions::Definition::Enum(enum_loc)) =
                 self.facts.definition_of(qtn)
@@ -6653,27 +7855,18 @@ impl<'db> InferenceContext<'db> {
         own: OwnArgs,
         record_base: Option<ExprId>,
     ) -> Option<Ty> {
-        if let OwnArgs::Call(call) = own
-            && self
-                .type_refs
-                .expr_type_args
-                .get(&call)
-                .is_some_and(|slots| {
-                    slots
-                        .iter()
-                        .any(|slot| matches!(slot, BodyTypeArgRef::Runtime { .. }))
-                })
-        {
-            return None;
-        }
         let written = self.lower_scoped_type_path(prefix);
-        let target = if !written.has_error() {
-            written
+        let target = if !written.contains_error() {
+            crate::impls::interned_ty(&crate::lower::reject_holes(&written))
         } else if let (OwnArgs::Call(call), Some((class, _))) = (own, self.static_class_for(prefix))
         {
             let frame = crate::lower::class_generic_frame(self.db, class);
             let args = self.instantiation_args(call, &frame, None);
-            crate::lower::class_ty(crate::lower::class_qualified_name(self.db, class), args)
+            crate::lower::class_ty(
+                self.lang(),
+                crate::lower::class_qualified_name(self.db, class),
+                args,
+            )
         } else {
             return None;
         };
@@ -6755,46 +7948,16 @@ impl<'db> InferenceContext<'db> {
     /// use. rust-analyzer expands aliases at lowering so every consumer sees
     /// the target; our lazy-alias design expands at the demand point.
     fn static_qualifier_ty(&self, prefix: &[baml_type::Name]) -> Option<Ty> {
-        let ty = match prefix {
-            [single] => match single.as_str() {
-                "int" => Ty::intern(TyKind::Int {
-                    attr: baml_type::TyAttr::default(),
-                }),
-                "bigint" => Ty::intern(TyKind::Bigint {
-                    attr: baml_type::TyAttr::default(),
-                }),
-                "float" => Ty::intern(TyKind::Float {
-                    attr: baml_type::TyAttr::default(),
-                }),
-                "string" => Ty::intern(TyKind::String {
-                    attr: baml_type::TyAttr::default(),
-                }),
-                "bool" => Ty::intern(TyKind::Bool {
-                    attr: baml_type::TyAttr::default(),
-                }),
-                "uint8array" => Ty::intern(TyKind::Uint8Array {
-                    attr: baml_type::TyAttr::default(),
-                }),
-                "image" => Ty::intern(TyKind::Media(
-                    baml_type::MediaKind::Image,
-                    baml_type::TyAttr::default(),
-                )),
-                "audio" => Ty::intern(TyKind::Media(
-                    baml_type::MediaKind::Audio,
-                    baml_type::TyAttr::default(),
-                )),
-                "video" => Ty::intern(TyKind::Media(
-                    baml_type::MediaKind::Video,
-                    baml_type::TyAttr::default(),
-                )),
-                "pdf" => Ty::intern(TyKind::Media(
-                    baml_type::MediaKind::Pdf,
-                    baml_type::TyAttr::default(),
-                )),
-                _ => self.lower_scoped_type_path(prefix),
-            },
-            _ => self.lower_scoped_type_path(prefix),
+        let builtin = match prefix {
+            [single] => baml_type::compiler_aliases::by_spelling(single.as_str())
+                .and_then(|alias| alias.lower_class(&[])),
+            _ => None,
         };
+        let ty = builtin.unwrap_or_else(|| {
+            crate::impls::interned_ty(&crate::lower::reject_holes(
+                &self.lower_scoped_type_path(prefix),
+            ))
+        });
         if ty.has_error() {
             return None;
         }
@@ -6838,10 +8001,9 @@ impl<'db> InferenceContext<'db> {
 
     /// Lambda typing (rust-analyzer's `deduce_closure_signature` shape).
     /// Written signature slots win; unannotated slots fill from the expected
-    /// function type flowing down. An unannotated parameter with no
-    /// expectation has no source of truth: the Error sentinel (TIR's
-    /// `CannotInferLambdaParamType`; the diagnostic is S17's). An omitted
-    /// `throws` stays the honest Error sentinel until S12 infers effects.
+    /// function type flowing down, or become fresh inference variables that
+    /// later uses can constrain. An omitted `throws` is inferred from the
+    /// lambda's body.
     fn infer_lambda(
         &mut self,
         body: &ExprBody,
@@ -6854,14 +8016,14 @@ impl<'db> InferenceContext<'db> {
             .only_has_type()
             .cloned()
             .map(|ty| self.structurally_resolve(&ty))
-            .map(|ty| self.expand_alias_ty(&ty))
-            // An OPTIONAL callback slot expects a function here just as much
-            // as an immediate one does: a lambda literal is never `null`, so
-            // the function arm is the only expectation it can satisfy. Without
-            // this the lambda's params would fall back to `Ty::error` and the
-            // slot's synthetic effect would never see the lambda's throws.
-            .and_then(|ty| match callback_root_fn(&ty)?.kind() {
-                TyKind::Function {
+            .and_then(|ty| self.callback_root_fn(&ty))
+            // A union with one concrete callback arm expects that function
+            // here just as much as an immediate callback does: the other arms
+            // provide no lambda signature. Without this the lambda's params
+            // remain unconstrained and its throws cannot flow through the
+            // callback slot's synthetic effect.
+            .and_then(|ty| match ty.kind() {
+                InferTy::Function {
                     params,
                     ret,
                     throws,
@@ -6870,21 +8032,35 @@ impl<'db> InferenceContext<'db> {
                 _ => None,
             });
 
+        let expected_arity = expected_fn.as_ref().and_then(|(expected_params, _, _)| {
+            (expected_params.len() != def.params.len()).then_some(expected_params.len())
+        });
+        if let Some(expected) = expected_arity {
+            self.pending_diags.push(PendingDiag::ArgCountMismatch {
+                expr,
+                expected,
+                got: def.params.len(),
+            });
+        }
+
         let param_tys: Vec<Ty> = def
             .params
             .iter()
             .enumerate()
-            .map(|(index, _)| {
+            .map(|(index, param)| {
                 let annotated = signature
                     .as_ref()
                     .and_then(|sig| sig.params.get(index).copied().flatten());
                 match annotated {
                     Some(type_ref) => self.lower_body_annotation(type_ref),
-                    None => expected_fn
+                    None => match expected_fn
                         .as_ref()
                         .and_then(|(params, _, _)| params.get(index))
-                        .map(|param| param.ty.clone())
-                        .unwrap_or_else(Ty::error),
+                    {
+                        Some(expected) => expected.ty.clone(),
+                        None if expected_fn.is_some() => Ty::error(),
+                        None => self.untyped_lambda_parameter_ty(expr, index, param.name.clone()),
+                    },
                 }
             })
             .collect();
@@ -6893,6 +8069,48 @@ impl<'db> InferenceContext<'db> {
             .as_ref()
             .and_then(|sig| sig.return_type)
             .map(|type_ref| self.lower_body_annotation(type_ref));
+        // Signature deduction from expectation (rustc's
+        // `check_supplied_sig_against_expectation`, which eq-unifies the
+        // supplied closure signature against the expected one and ignores
+        // failures; rust-analyzer's closure-sig deduction is the same): a WRITTEN
+        // annotation commits into the expected function type's corresponding
+        // slot while that slot is still an unsolved inference variable. This
+        // is what keeps a generic call's type argument "known unambiguously
+        // at the call site" (TYPE_SYSTEM.md) when the lambda spells it out —
+        // without the commit, the callee's own param (e.g. `Array.map`'s `U`)
+        // waits for the finish fixpoint while the walk continues, and a later
+        // member access on a receiver derived from it inspects a still
+        // unsolved var and silently finalizes `Error`, miscompiling
+        // downstream. A slot that already resolved structurally is left to
+        // the ordinary argument check (and unify mismatches are ignored here
+        // for the same reason: the arg check re-judges and reports them).
+        // `throws` is deliberately excluded — the effect channel owns it.
+        if let Some((exp_params, exp_ret, _)) = &expected_fn {
+            for (index, ty) in param_tys.iter().enumerate() {
+                let written = signature
+                    .as_ref()
+                    .and_then(|sig| sig.params.get(index).copied().flatten())
+                    .is_some();
+                if !written || ty.has_error() {
+                    continue;
+                }
+                let Some(expected_param) = exp_params.get(index) else {
+                    continue;
+                };
+                let expected = self.structurally_resolve(&expected_param.ty);
+                if expected.has_infer() {
+                    let _ = self.table.unify(ty, &expected);
+                }
+            }
+            if let Some(ret) = &annotated_ret
+                && !ret.has_error()
+            {
+                let expected = self.structurally_resolve(exp_ret);
+                if expected.has_infer() {
+                    let _ = self.table.unify(ret, &expected);
+                }
+            }
+        }
         let ret_expectation =
             annotated_ret.or_else(|| expected_fn.as_ref().map(|(_, ret, _)| ret.clone()));
 
@@ -6918,43 +8136,8 @@ impl<'db> InferenceContext<'db> {
         // The lambda's OWN effect channel: contributions inside the body
         // belong to the lambda, not the enclosing function - defining a
         // throwing lambda throws nothing; calling it does.
-        self.throws_channels.push(Vec::new());
-        let ret_ty = match def.body {
-            Some(lambda_body) => {
-                let saved_scope = self.current_scope;
-                if lambda_scope.is_some() {
-                    self.current_scope = lambda_scope;
-                }
-                let saved_diverges = std::mem::replace(&mut self.diverges, Diverges::Maybe);
-                let ret_ty = match &ret_expectation {
-                    // A void lambda DISCARDS its body's tail value, the
-                    // same statement semantics void functions get (test
-                    // bodies are synthesized `() -> void` lambdas).
-                    Some(ret) if is_unit(ret) => {
-                        self.infer_expr(body, lambda_body, &Expectation::None);
-                        ret.clone()
-                    }
-                    Some(ret) if !ret.has_error() => {
-                        self.check_expr(body, lambda_body, ret);
-                        ret.clone()
-                    }
-                    _ => {
-                        let body_ty = self.infer_expr(body, lambda_body, &Expectation::None);
-                        self.widen_fresh(&body_ty)
-                    }
-                };
-                self.diverges = saved_diverges;
-                self.current_scope = saved_scope;
-                ret_ty
-            }
-            None => ret_expectation.unwrap_or_else(Ty::error),
-        };
-        let channel = self.throws_channels.pop().expect("pushed above");
-        // An OMITTED clause in a GROUND typed context inherits the
-        // context's throws as its contract (TIR's rule: the lambda adopts
-        // the expected surface, and its body checks against it - the
-        // "local violation" road). Effect-param and open contexts skip:
-        // there the channel BINDS the context instead.
+        // Only a closed contextual effect supplies value context. An open
+        // effect is inferred from the body, not imposed on it.
         let contextual_throws = if written_throws.is_none() {
             expected_fn
                 .as_ref()
@@ -6963,19 +8146,101 @@ impl<'db> InferenceContext<'db> {
                     !throws.has_infer()
                         && !throws.has_error()
                         && !throws.has_typevar()
-                        && !matches!(throws.kind(), TyKind::Unknown { .. })
+                        && !matches!(throws.kind(), InferTy::Unknown { .. })
                 })
         } else {
             None
         };
         let written_throws = written_throws.or(contextual_throws);
+        self.throws_channels.push(ThrowsChannel {
+            expected: written_throws.clone().filter(|ty| !ty.has_infer()),
+            contributions: Vec::new(),
+        });
+        let ret_ty = match def.body {
+            Some(lambda_body) => {
+                let saved_scope = self.current_scope;
+                if lambda_scope.is_some() {
+                    self.current_scope = lambda_scope;
+                }
+                let saved_diverges = std::mem::replace(&mut self.diverges, Diverges::Maybe);
+                let saved_defer_loop_floors = std::mem::take(&mut self.defer_loop_floors);
+                let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+                self.return_frames.push(ReturnFrame {
+                    expected: ret_expectation.clone(),
+                    candidates: Vec::new(),
+                    scoped_bindings_floor: self.scoped_type_bindings.len(),
+                });
+                let body_ty = match &ret_expectation {
+                    // A void lambda DISCARDS its body's tail value, the
+                    // same statement semantics void functions get (test
+                    // bodies are synthesized `() -> void` lambdas).
+                    Some(ret) if is_unit(ret) => {
+                        self.infer_expr(body, lambda_body, &Expectation::Discarded)
+                    }
+                    Some(ret) if !ret.has_error() => self.check_expr(body, lambda_body, ret),
+                    Some(_) => self.infer_expr(body, lambda_body, &Expectation::Erroneous),
+                    None => self.infer_expr(body, lambda_body, &Expectation::None),
+                };
+                let mut return_frame = self.return_frames.pop().expect("pushed above");
+                return_frame.candidates.push(body_ty);
+                let joined = self.join_return_candidates(&return_frame.candidates);
+                let inferred_ret = self.widen_fresh(&joined);
+                let ret_ty = match ret_expectation {
+                    Some(ret) if is_unit(&ret) => ret,
+                    Some(ret) if !ret.has_error() => {
+                        if ret.has_infer() {
+                            self.sub(&inferred_ret, &ret);
+                        }
+                        ret
+                    }
+                    _ => inferred_ret,
+                };
+                self.loop_depth = saved_loop_depth;
+                self.defer_loop_floors = saved_defer_loop_floors;
+                self.diverges = saved_diverges;
+                self.current_scope = saved_scope;
+                ret_ty
+            }
+            None => ret_expectation.unwrap_or_else(Ty::error),
+        };
+        let channel = self
+            .throws_channels
+            .pop()
+            .expect("pushed above")
+            .contributions;
         // A WRITTEN closed clause is the lambda's contract: its body's
         // contributions check against it exactly as a function's do
         // (open contributions judge at finalize).
         if let Some(declared) = &written_throws {
-            let (_, open) = crate::lower::throws_clause_parts(declared);
-            if !open && !declared.has_error() {
+            // The annotation funnel already instantiated any written `_`
+            // member as a fresh effect variable, so a lambda clause is never
+            // PARTIAL here — the variable itself carries the openness, and
+            // `sub` below binds contributions into it (the pre-split
+            // `throws_clause_parts` probe on the instantiated clause was
+            // vacuously closed).
+            //
+            // BUG: that variable is never decided for a lambda whose clause
+            // is partial, so it finalizes to the `Error` sentinel and CALLING
+            // such a lambda panics in runtime lowering ("`Error` is not a
+            // valid `RuntimeTy`"). `let f = () -> int throws unknown | _ {
+            // throw "x" }; f()` checks clean and dies at run time, with no
+            // scoped binding involved (reproduced 2026-09-09). Defining one
+            // without calling it is fine, so the effect default
+            // (`default_unsolved_effects_to_never`) is not reaching this
+            // class.
+            if !declared.has_error() {
                 for (at, contribution) in &channel {
+                    // A contribution the clause's own written names already
+                    // admit is published by those names. Relating it to the
+                    // clause anyway would deposit it into the open
+                    // remainder's variable, which was minted outside this
+                    // body and so may not take a binding the body opened -
+                    // refusing a throw the author already covered.
+                    if self.escaping_scoped_param(contribution).is_some()
+                        && self.declared_name_publishes(contribution, declared)
+                    {
+                        continue;
+                    }
                     if contribution.has_infer() || !self.sub(contribution, declared) {
                         self.pending_diags.push(PendingDiag::ThrowsViolation {
                             at: *at,
@@ -6986,27 +8251,34 @@ impl<'db> InferenceContext<'db> {
                 }
             }
         }
-        let throws_ty = written_throws.unwrap_or_else(|| {
-            if channel.is_empty() {
-                Ty::never()
-            } else {
-                // The INFERRED surface keeps literal grain (spec rule;
-                // TIR diverged by widening thrown literals here) - a
-                // body-inferred `throw "neg"` surfaces as `throws
-                // "neg"`, and the grain flows into effect params.
-                let tys: Vec<Ty> = channel
-                    .iter()
-                    .map(|(_, ty)| self.table.resolve_completely(ty))
-                    .collect();
-                self.union_of(&tys)
+        let throws_ty = match written_throws {
+            Some(declared) => declared,
+            None => {
+                // An INFERRED clause publishes every contribution as part
+                // of the lambda's type, so one typed by a binding the
+                // body's own blocks closed cannot stay.
+                let channel = self.drop_escaping_effects(channel, None);
+                if channel.is_empty() {
+                    Ty::never()
+                } else {
+                    // The INFERRED surface keeps literal grain (spec rule;
+                    // TIR diverged by widening thrown literals here) - a
+                    // body-inferred `throw "neg"` surfaces as `throws
+                    // "neg"`, and the grain flows into effect params.
+                    let tys: Vec<Ty> = channel
+                        .iter()
+                        .map(|(_, ty)| self.table.resolve_completely(ty))
+                        .collect();
+                    self.union_of(&tys)
+                }
             }
-        });
+        };
 
-        let params: Box<[baml_type::interned::FunctionParam]> = def
+        let params: Box<[baml_type::interned::InferFunctionParamTy]> = def
             .params
             .iter()
             .zip(&param_tys)
-            .map(|(param, ty)| baml_type::interned::FunctionParam {
+            .map(|(param, ty)| baml_type::interned::InferFunctionParamTy {
                 name: Some(param.name.clone()),
                 ty: ty.clone(),
                 mode: if param.default.is_some() {
@@ -7016,12 +8288,17 @@ impl<'db> InferenceContext<'db> {
                 },
             })
             .collect();
-        Ty::intern(TyKind::Function {
+        let ty = Ty::intern(InferTy::Function {
             params,
             ret: ret_ty,
             throws: throws_ty,
             attr: TyAttr::default(),
-        })
+        });
+        if expected_arity.is_some() {
+            Ty::error()
+        } else {
+            ty
+        }
     }
 
     /// Registers one Implements obligation per declared bound of a
@@ -7036,7 +8313,6 @@ impl<'db> InferenceContext<'db> {
         at: ExprId,
     ) {
         let bounds = crate::lower::function_generic_bounds(self.db, function);
-        let runtime_params = self.runtime_call_params(at);
         // The concreteness rule covers the function's OWN declared params
         // (turbofish or inferred - the user's type arguments). The frame
         // PREFIX is the receiver's business: `Self` legitimately binds an
@@ -7054,54 +8330,12 @@ impl<'db> InferenceContext<'db> {
                 continue;
             };
             for bound in param_bounds {
-                if runtime_params.is_empty() && self.scoped_type_bindings.is_empty() {
-                    let interface = baml_type::interned::InterfaceRef::new(
-                        bound.name.clone(),
-                        bound
-                            .generics
-                            .iter()
-                            .map(|generic| substitute_params(generic, instantiation))
-                            .collect(),
-                        bound
-                            .associated_types
-                            .iter()
-                            .map(|(name, ty)| (name.clone(), substitute_params(ty, instantiation)))
-                            .collect(),
-                    );
-                    self.register_obligation(obligations::Obligation::Implements {
-                        ty: arg.clone(),
-                        interface,
-                        at,
-                        not_concrete_rejects: (param.index() as usize) >= own_start,
-                    });
-                    continue;
-                }
-                let runtime_slot_dependent = runtime_params
-                    .iter()
-                    .any(|runtime| runtime == &param || interface_mentions_param(&bound, runtime));
-                let argument = substitute_static_call_params(
-                    &Ty::intern(TyKind::TypeVar(param.clone(), TyAttr::default())),
-                    instantiation,
-                    &runtime_params,
-                );
-                let bound =
-                    substitute_static_interface_params(&bound, instantiation, &runtime_params);
-                let scoped_binding_dependent = self.scoped_type_bindings.iter().any(|binding| {
-                    ty_mentions_param(&argument, &binding.parameter)
-                        || interface_mentions_param(&bound, &binding.parameter)
-                });
-                if runtime_slot_dependent || scoped_binding_dependent {
-                    self.result
-                        .call_plans
-                        .entry(at)
-                        .or_default()
-                        .deferred_checks
-                        .push(RuntimeCheck::Bound { argument, bound });
-                    continue;
-                }
+                // Declared bounds are plain; the obligation machinery's
+                // vocabulary is interned — ingest once per bound.
+                let bound = InferInterface::from_constraint(&bound);
                 self.register_obligation(obligations::Obligation::Implements {
                     ty: arg.clone(),
-                    interface: bound,
+                    interface: substitute_interface_params(&bound, instantiation),
                     at,
                     not_concrete_rejects: (param.index() as usize) >= own_start,
                 });
@@ -7115,7 +8349,6 @@ impl<'db> InferenceContext<'db> {
         instantiation: &[Ty],
         at: ExprId,
     ) {
-        let runtime_params = self.runtime_call_params(at);
         let own_start = external.owner_generic_params.len();
         let params = external
             .owner_generic_params
@@ -7132,81 +8365,14 @@ impl<'db> InferenceContext<'db> {
                 continue;
             };
             for bound in bounds {
-                let bound = InterfaceRef::from_constraint(bound);
-                let runtime_slot_dependent = runtime_params
-                    .iter()
-                    .any(|runtime| runtime == param || interface_mentions_param(&bound, runtime));
-                let argument = substitute_static_call_params(
-                    &Ty::intern(TyKind::TypeVar(param.clone(), TyAttr::default())),
-                    instantiation,
-                    &runtime_params,
-                );
-                let bound =
-                    substitute_static_interface_params(&bound, instantiation, &runtime_params);
-                let scoped_binding_dependent = self.scoped_type_bindings.iter().any(|binding| {
-                    ty_mentions_param(&argument, &binding.parameter)
-                        || interface_mentions_param(&bound, &binding.parameter)
-                });
-                if runtime_slot_dependent || scoped_binding_dependent {
-                    self.result
-                        .call_plans
-                        .entry(at)
-                        .or_default()
-                        .deferred_checks
-                        .push(RuntimeCheck::Bound { argument, bound });
-                    continue;
-                }
+                let bound = InferInterface::from_constraint(bound);
                 self.register_obligation(obligations::Obligation::Implements {
                     ty: arg.clone(),
-                    interface: bound,
+                    interface: substitute_interface_params(&bound, instantiation),
                     at,
                     not_concrete_rejects: (param.index() as usize) >= own_start,
                 });
             }
-        }
-    }
-
-    fn record_external_runtime_dependent_arguments(
-        &mut self,
-        call: ExprId,
-        function: &crate::package_interface::ResolvedFunction,
-        bound_receiver: bool,
-        instantiation: &[Ty],
-    ) {
-        let runtime_params = self.runtime_call_params(call);
-        if runtime_params.is_empty() {
-            return;
-        }
-        self.report_runtime_type_escape(
-            call,
-            &Ty::from_plain(&function.return_type),
-            RuntimeTypeEscape::Value,
-        );
-        self.report_runtime_type_escape(
-            call,
-            &Ty::from_plain(&function.callable_throws),
-            RuntimeTypeEscape::Error,
-        );
-        let mut dependent = FxHashMap::default();
-        for (param_index, param) in function
-            .params
-            .iter()
-            .skip(usize::from(bound_receiver))
-            .enumerate()
-        {
-            let template = Ty::from_plain(&param.ty);
-            if runtime_params
-                .iter()
-                .any(|runtime| ty_mentions_param(&template, runtime))
-            {
-                dependent.insert(
-                    param_index,
-                    substitute_static_call_params(&template, instantiation, &runtime_params),
-                );
-            }
-        }
-        if !dependent.is_empty() {
-            self.runtime_dependent_call_params.insert(call, dependent);
         }
     }
 
@@ -7227,7 +8393,11 @@ impl<'db> InferenceContext<'db> {
                 continue;
             };
             for bound in param_bounds {
-                let interface = baml_type::interned::InterfaceRef::new(
+                // Declared bounds are plain; the obligation machinery's
+                // vocabulary is interned — ingest once per bound.
+                let bound = InferInterface::from_constraint(&bound);
+                let bound = &bound;
+                let interface = baml_type::interned::InferInterface::new(
                     bound.name.clone(),
                     bound
                         .generics
@@ -7253,31 +8423,30 @@ impl<'db> InferenceContext<'db> {
     /// The instantiation vector for a generic item at a use site: explicit
     /// turbofish args (with `_` holes as fresh vars) where written, fresh
     /// variables everywhere else.
+    /// [`Self::instantiation_args_at`] at the ordinary type position.
     fn instantiation_args(
         &mut self,
         site: ExprId,
         generic_params: &[baml_type::ParamTy],
         callee: Option<&baml_type::Name>,
     ) -> Vec<Ty> {
-        self.instantiation_args_with_bounds(
+        self.instantiation_args_at(
             site,
             generic_params,
             callee,
-            &FxHashMap::default(),
             crate::lower::TypePosition::Existential,
         )
     }
 
-    /// The call-site instantiation road with the callee's declared bounds and
-    /// the one context-sensitive type position supplied explicitly. Written
-    /// slots align only with user-writable params; synthetic effect params
-    /// always receive fresh effect variables.
-    fn instantiation_args_with_bounds(
+    /// The call-site instantiation road, with the one context-sensitive type
+    /// position supplied explicitly. Written slots align only with
+    /// user-writable params; synthetic effect params always receive fresh
+    /// effect variables.
+    fn instantiation_args_at(
         &mut self,
         site: ExprId,
         generic_params: &[baml_type::ParamTy],
         callee: Option<&baml_type::Name>,
-        bounds: &FxHashMap<baml_type::ParamTy, Vec<InterfaceRef>>,
         position: crate::lower::TypePosition,
     ) -> Vec<Ty> {
         let written = self
@@ -7312,234 +8481,29 @@ impl<'db> InferenceContext<'db> {
                 instantiation.push(self.fresh_generic_arg(param));
                 continue;
             }
-            let Some(slot) = written.next() else {
+            let Some(type_ref) = written.next() else {
                 instantiation.push(self.fresh_generic_arg(param));
                 continue;
             };
-            match slot {
-                BodyTypeArgRef::Static(type_ref) => {
-                    let computed = self.computed_generic_argument_name(*type_ref, site);
-                    let lowered =
-                        self.lower_scoped_type_ref_at(&self.type_refs.store, *type_ref, position);
-                    if let Some(name) = computed {
-                        self.specialize_computed_generic_diagnostic(*type_ref, site, &name);
-                    }
-                    let ty = self.reject_expr_position_holes(&lowered, site);
-                    slots.push(CallTypeArgPlan::Static {
-                        ty: ty.clone(),
-                        emission_ty: ty.clone(),
-                    });
-                    instantiation.push(ty);
-                }
-                BodyTypeArgRef::Runtime { operand } => {
-                    let occurrence_ty = bounds
-                        .get(param)
-                        .and_then(|bounds| bounds.first())
-                        .map(interface_occurrence_ty)
-                        .unwrap_or_else(|| {
-                            Ty::intern(TyKind::Unknown {
-                                attr: TyAttr::default(),
-                            })
-                        });
-                    slots.push(CallTypeArgPlan::Runtime {
-                        operand: *operand,
-                        occurrence_ty: occurrence_ty.clone(),
-                        parameter: param.clone(),
-                    });
-                    instantiation.push(occurrence_ty);
-                }
+            let computed = self.computed_generic_argument_name(*type_ref, site);
+            let (lowered, diagnostics) =
+                self.lower_body_type_ref_at(*type_ref, position, crate::lower::HolePolicy::Allowed);
+            if let Some(name) = computed {
+                self.specialize_computed_generic_diagnostic(diagnostics, *type_ref, site, &name);
+            } else {
+                self.queue_body_lowering_diagnostics(diagnostics);
             }
+            let ty = self.reject_expr_position_holes(&lowered, site);
+            slots.push(CallTypeArgPlan {
+                ty: ty.clone(),
+                emission_ty: ty.clone(),
+            });
+            instantiation.push(ty);
         }
         if !slots.is_empty() {
             self.result.call_plans.entry(site).or_default().slots = slots;
         }
         instantiation
-    }
-
-    fn runtime_call_params(&self, call: ExprId) -> Vec<baml_type::ParamTy> {
-        self.result
-            .call_plans
-            .get(&call)
-            .into_iter()
-            .flat_map(|plan| &plan.slots)
-            .filter_map(|slot| match slot {
-                CallTypeArgPlan::Runtime { parameter, .. } => Some(parameter.clone()),
-                CallTypeArgPlan::Static { .. } => None,
-            })
-            .collect()
-    }
-
-    /// BEP-066 ruling (A): an inline `unreflect(value)` type argument is legal
-    /// only while the runtime type stays out of the expression's published
-    /// type. The parameter is rigid for this call alone — the call site
-    /// publishes `occurrence_ty` in its place — so a published type that still
-    /// mentions the parameter would be typed by a substitution the value does
-    /// not actually satisfy afterwards, and every later dispatch re-derives
-    /// the receiver's arguments from that published type.
-    ///
-    /// The exception, and the reason this is an occurs-check on the published
-    /// type rather than a ban on the spelling, is a type that IS the parameter
-    /// (`parse<T>(..) -> T`): occurrence-substitution then types a VALUE, the
-    /// runtime tag rides on the value itself, and nothing static claims more
-    /// than `unknown`. That is the supported dynamic path and stays legal.
-    /// One position deeper — `Wrapper<T>`, `T[]`, `T?`, a constructed `C<T>` —
-    /// the occurrence substitutes into a type CONSTRUCTOR, and the published
-    /// type starts asserting something about the value.
-    ///
-    /// A call publishes two types, and the rule reads the same in both: the
-    /// result the caller binds, and the [`RuntimeTypeEscape::Error`] a
-    /// `throws` clause hands to the caller's handler — which is just as
-    /// visible after the call returns, and just as often written `Boom<T>`.
-    fn report_runtime_type_escape(
-        &mut self,
-        call: ExprId,
-        published: &Ty,
-        escape: RuntimeTypeEscape,
-    ) {
-        if escape == RuntimeTypeEscape::Value {
-            // The `?.` check runs later, at the chain boundary, where the
-            // callee's signature is long out of reach — so the one fact it
-            // needs is recorded here: does this call's RESULT name the
-            // parameter at all? A result that never mentions it (`-> bool`,
-            // `-> Wrapper<unknown>`) publishes nothing about the runtime type,
-            // and wrapping nothing in `| null` is still nothing.
-            self.runtime_slots_named_by_result.extend(
-                self.escaping_carriers(call, |parameter| ty_mentions_param(published, parameter)),
-            );
-        }
-        let escaping = self.escaping_carriers(call, |parameter| {
-            runtime_param_escapes(published, parameter)
-        });
-        self.report_escaping_carriers(call, escaping, escape);
-    }
-
-    /// The carrier expressions of `call`'s inline `unreflect(...)` slots whose
-    /// parameter `escapes`.
-    fn escaping_carriers(
-        &self,
-        call: ExprId,
-        escapes: impl Fn(&baml_type::ParamTy) -> bool,
-    ) -> Vec<ExprId> {
-        self.result
-            .call_plans
-            .get(&call)
-            .into_iter()
-            .flat_map(|plan| &plan.slots)
-            .filter_map(|slot| match slot {
-                CallTypeArgPlan::Runtime {
-                    operand, parameter, ..
-                } => escapes(parameter).then_some(*operand),
-                CallTypeArgPlan::Static { .. } => None,
-            })
-            .collect()
-    }
-
-    fn report_escaping_carriers(
-        &mut self,
-        enclosing: ExprId,
-        carriers: Vec<ExprId>,
-        escape: RuntimeTypeEscape,
-    ) {
-        for carrier in carriers {
-            // A callee can be typed more than once (the interface probe
-            // re-runs the member road), and a slot can escape through more
-            // than one published type; the slot is reported once.
-            if self.reported_runtime_escapes.insert(carrier) {
-                self.pending_diags
-                    .push(PendingDiag::RuntimeTypeMustBeNamed {
-                        carrier,
-                        enclosing,
-                        escape,
-                    });
-            }
-        }
-    }
-
-    /// The `?.` arm of the same rule, reported at the chain BOUNDARY because
-    /// that is where the wrapper appears: a short-circuiting chain republishes
-    /// its tail's result as `T | null`, so a call whose bare `-> T` result was
-    /// legal on its own stops being legal once `?.` wraps it. This is the
-    /// spelling half of the declared `-> T?` refusal — both publish `unknown?`
-    /// and both now say the same thing.
-    ///
-    /// It is still the published type that decides, never the punctuation: a
-    /// tail whose result never mentions the parameter (`-> bool`, or the
-    /// declared-erased `-> Wrapper<unknown>`) publishes nothing about the
-    /// runtime type, so the chain's `| null` has nothing to wrap and the call
-    /// stays legal. [`Self::report_runtime_type_escape`] recorded that fact
-    /// while the callee's signature was still in hand.
-    ///
-    /// Only the chain's TAIL is affected: it is the expression whose value the
-    /// chain republishes. A call in argument position, or one whose result is
-    /// consumed further along the chain (`a?.b.m<unreflect(t)>().field`),
-    /// publishes its own result unchanged and keeps whatever verdict its
-    /// signature earned.
-    fn report_chain_null_escape(&mut self, body: &ExprBody, tail: ExprId) {
-        if !matches!(
-            body.exprs[tail],
-            Expr::Call { .. } | Expr::OptionalCall { .. }
-        ) {
-            return;
-        }
-        let escaping = self.escaping_carriers(tail, |_| true);
-        let escaping: Vec<ExprId> = escaping
-            .into_iter()
-            .filter(|carrier| self.runtime_slots_named_by_result.contains(carrier))
-            .collect();
-        self.report_escaping_carriers(tail, escaping, RuntimeTypeEscape::Value);
-    }
-
-    fn record_runtime_dependent_arguments(
-        &mut self,
-        call: ExprId,
-        signature: &crate::lower::FunctionSignature,
-        bound_receiver: bool,
-    ) {
-        if !self.result.call_plans.get(&call).is_some_and(|plan| {
-            plan.slots
-                .iter()
-                .any(|slot| matches!(slot, CallTypeArgPlan::Runtime { .. }))
-        }) {
-            return;
-        }
-        self.report_runtime_type_escape(call, &signature.ret, RuntimeTypeEscape::Value);
-        // `signature.throws` is the DECLARED clause when the author wrote one
-        // and the inferred effect otherwise (S12). Both are published to the
-        // caller, so both are checked — the note is worded for a clause the
-        // author may never have spelled.
-        self.report_runtime_type_escape(call, &signature.throws, RuntimeTypeEscape::Error);
-        let runtime_params = self.runtime_call_params(call);
-        if runtime_params.is_empty() {
-            return;
-        }
-        let Some(instantiation) = self
-            .result
-            .call_plans
-            .get(&call)
-            .map(|plan| plan.type_args.clone())
-        else {
-            return;
-        };
-        let mut dependent = FxHashMap::default();
-        for (param_index, param) in signature
-            .params
-            .iter()
-            .skip(usize::from(bound_receiver))
-            .enumerate()
-        {
-            if runtime_params
-                .iter()
-                .any(|runtime| ty_mentions_param(&param.ty, runtime))
-            {
-                dependent.insert(
-                    param_index,
-                    substitute_static_call_params(&param.ty, &instantiation, &runtime_params),
-                );
-            }
-        }
-        if !dependent.is_empty() {
-            self.runtime_dependent_call_params.insert(call, dependent);
-        }
     }
 
     fn is_reflect_package_get_function(
@@ -7548,12 +8512,8 @@ impl<'db> InferenceContext<'db> {
         function: baml_compiler2_hir::loc::FunctionLoc<'db>,
     ) -> bool {
         let qtn = crate::lower::class_qualified_name(self.db, class);
-        qtn.package().as_str() == "baml"
-            && qtn
-                .namespace()
-                .iter()
-                .map(baml_type::Name::as_str)
-                .eq(["reflect"])
+        self.lang().is(baml_base::LangPackage::Reflect, qtn.root())
+            && qtn.namespace().is_empty()
             && qtn.name().as_str() == "Package"
             && baml_compiler2_ppir::item_data::function_data(self.db, function)
                 .name
@@ -7563,11 +8523,11 @@ impl<'db> InferenceContext<'db> {
 
     fn computed_generic_argument_name(
         &self,
-        type_ref: baml_compiler2_hir::type_ref::TypeRefId,
+        type_ref: BodyTypeRefId,
         site: ExprId,
     ) -> Option<baml_type::Name> {
         use baml_compiler2_hir::type_ref::TypeRefKind;
-        let written = &self.type_refs.store[type_ref];
+        let written = &self.type_refs.store[self.type_refs.raw_id(type_ref)];
         let TypeRefKind::Path {
             segments,
             generic_args,
@@ -7596,18 +8556,19 @@ impl<'db> InferenceContext<'db> {
         (is_value && !is_type).then(|| name.clone())
     }
 
-    /// Replace the lowering sink's generic unresolved-type finding for a
-    /// value-shaped slot with M-1's targeted whole-slot diagnostic. Any other
-    /// lowering findings already queued retain their original anchors.
+    /// Replace a generic unresolved-type finding for a value-shaped slot with
+    /// M-1's targeted whole-slot diagnostic. Any other findings from the same
+    /// lowering operation retain their original anchors.
     fn specialize_computed_generic_diagnostic(
         &mut self,
-        type_ref: baml_compiler2_hir::type_ref::TypeRefId,
+        diagnostics: Vec<crate::lower::LoweringDiag>,
+        type_ref: BodyTypeRefId,
         site: ExprId,
         name: &baml_type::Name,
     ) {
         let mut replaced = false;
-        for lowering in self.lower.take_diagnostics() {
-            if lowering.type_ref == type_ref
+        for lowering in diagnostics {
+            if lowering.type_ref == self.type_refs.raw_id(type_ref)
                 && matches!(
                     &lowering.kind,
                     crate::lower::LoweringDiagKind::Unresolved { name: unresolved, .. }
@@ -7617,7 +8578,7 @@ impl<'db> InferenceContext<'db> {
                 replaced = true;
             } else {
                 self.pending_diags.push(PendingDiag::BodyAnnot {
-                    type_ref: lowering.type_ref,
+                    type_ref: self.type_refs.diagnostic_id(lowering.type_ref),
                     kind: lowering.kind,
                 });
             }
@@ -7636,9 +8597,51 @@ impl<'db> InferenceContext<'db> {
     /// `never`, not Error - S12's defaulting rule).
     fn fresh_generic_arg(&mut self, param: &baml_type::ParamTy) -> Ty {
         if baml_type::is_synthetic_effect_param(param.name()) {
-            self.table.new_effect_var_ty()
+            self.table.new_var_ty_of(unify::VarPolicy::Effect)
         } else {
             self.table.new_var_ty()
+        }
+    }
+
+    /// Shared completeness check for local and mounted class constructors.
+    /// A valid spread has the exact class type and therefore supplies every
+    /// slot; without one, each omitted slot must admit its `null` initializer.
+    fn report_missing_required_object_fields(
+        &mut self,
+        object: ExprId,
+        class_name: &baml_type::DeclName,
+        field_types: &[(baml_type::Name, baml_type::Ty)],
+        instantiation: &[Ty],
+        fields: &[ObjectExprField],
+        has_spread: bool,
+    ) {
+        if has_spread {
+            return;
+        }
+
+        let mut missing = Vec::new();
+        for (name, field_ty) in field_types {
+            if fields.iter().any(|field| field.name == *name) {
+                continue;
+            }
+            // Declaration types are plain; the engine ingests them here (the
+            // total direction) to substitute and resolve.
+            let field_ty = substitute_params(&crate::impls::interned_ty(field_ty), instantiation);
+            let resolved = self.structurally_resolve(&field_ty);
+            // An error sentinel means the declaration's rule is unknown, not
+            // that the field is non-nullable. Its source diagnostic is the
+            // actionable error; continue checking independently valid slots.
+            if !resolved.has_error() && !type_admits_null(&resolved) {
+                missing.push(name.clone());
+            }
+        }
+        if !missing.is_empty() {
+            self.pending_diags
+                .push(PendingDiag::MissingRequiredObjectFields {
+                    object,
+                    class_name: class_name.clone(),
+                    field_names: missing,
+                });
         }
     }
 
@@ -7715,7 +8718,7 @@ impl<'db> InferenceContext<'db> {
         };
         let db = self.db;
         let class_name = crate::lower::class_qualified_name(db, class);
-        if baml_type::type_kind::is_type_kind_class(&class_name) {
+        if baml_type::type_kind::is_type_kind_class_decl(self.lang(), &class_name) {
             for field in fields {
                 self.infer_expr(body, field.value, &Expectation::None);
             }
@@ -7729,7 +8732,9 @@ impl<'db> InferenceContext<'db> {
                 });
             return Ty::error();
         }
-        if let Some(companion) = baml_type::type_kind::builtin_companion_of(&class_name) {
+        if let Some(companion) =
+            baml_type::type_kind::builtin_companion_of_decl(self.lang(), &class_name)
+        {
             for field in fields {
                 self.infer_expr(body, field.value, &Expectation::None);
             }
@@ -7764,9 +8769,9 @@ impl<'db> InferenceContext<'db> {
             let Some(param) = generic_names.get(slot) else {
                 continue;
             };
-            let mentioned = field_types
-                .iter()
-                .any(|(_, field_ty)| ty_mentions_param(field_ty, param));
+            let mentioned = field_types.iter().any(|(_, field_ty)| {
+                ty_mentions_param(&crate::impls::interned_ty(field_ty), param)
+            });
             if mentioned && arg.has_infer() {
                 self.pending_diags.push(PendingDiag::UninferredCtorParam {
                     expr: object,
@@ -7780,7 +8785,8 @@ impl<'db> InferenceContext<'db> {
             let value = field.value;
             match field_types.iter().find(|(field, _)| field == name) {
                 Some((_, field_ty)) => {
-                    let field_ty = substitute_params(field_ty, &instantiation);
+                    let field_ty =
+                        substitute_params(&crate::impls::interned_ty(field_ty), &instantiation);
                     self.check_expr(body, value, &field_ty);
                 }
                 None => {
@@ -7799,7 +8805,10 @@ impl<'db> InferenceContext<'db> {
                             });
                         match field_types.iter().find(|(field, _)| *field == class_field) {
                             Some((_, field_ty)) => {
-                                let field_ty = substitute_params(field_ty, &instantiation);
+                                let field_ty = substitute_params(
+                                    &crate::impls::interned_ty(field_ty),
+                                    &instantiation,
+                                );
                                 self.check_expr(body, value, &field_ty);
                             }
                             None => {
@@ -7826,8 +8835,16 @@ impl<'db> InferenceContext<'db> {
                 }
             }
         }
+        self.report_missing_required_object_fields(
+            object,
+            &class_name,
+            &field_types,
+            &instantiation,
+            fields,
+            !spreads.is_empty(),
+        );
         let short = type_name.0.last().expect("type paths are never empty");
-        let object_ty = Ty::intern(TyKind::Class(
+        let object_ty = Ty::intern(InferTy::Class(
             self.lower.qualify_definition(
                 baml_compiler2_hir::contributions::Definition::Class(class),
                 short,
@@ -7850,7 +8867,7 @@ impl<'db> InferenceContext<'db> {
         &mut self,
         body: &ExprBody,
         object: ExprId,
-        class_name: baml_type::QualifiedTypeName,
+        class_name: baml_type::DeclName,
         exported_fields: &[(
             baml_type::Name,
             baml_type::Ty,
@@ -7861,7 +8878,7 @@ impl<'db> InferenceContext<'db> {
         fields: &[ObjectExprField],
         spreads: &[baml_compiler2_ast::SpreadField],
     ) -> Ty {
-        if baml_type::type_kind::is_type_kind_class(&class_name) {
+        if baml_type::type_kind::is_type_kind_class_decl(self.lang(), &class_name) {
             for field in fields {
                 self.infer_expr(body, field.value, &Expectation::None);
             }
@@ -7875,7 +8892,9 @@ impl<'db> InferenceContext<'db> {
                 });
             return Ty::error();
         }
-        if let Some(companion) = baml_type::type_kind::builtin_companion_of(&class_name) {
+        if let Some(companion) =
+            baml_type::type_kind::builtin_companion_of_decl(self.lang(), &class_name)
+        {
             for field in fields {
                 self.infer_expr(body, field.value, &Expectation::None);
             }
@@ -7900,8 +8919,8 @@ impl<'db> InferenceContext<'db> {
                 continue;
             };
             for bound in generic_param_bounds.get(index).into_iter().flatten() {
-                let bound = InterfaceRef::from_constraint(bound);
-                let interface = InterfaceRef::new(
+                let bound = InferInterface::from_constraint(bound);
+                let interface = InferInterface::new(
                     bound.name.clone(),
                     bound
                         .generics
@@ -7961,7 +8980,19 @@ impl<'db> InferenceContext<'db> {
                 });
             }
         }
-        let object_ty = Ty::intern(TyKind::Class(
+        let plain_field_types: Vec<(baml_type::Name, baml_type::Ty)> = exported_fields
+            .iter()
+            .map(|(name, ty, _)| (name.clone(), ty.clone()))
+            .collect();
+        self.report_missing_required_object_fields(
+            object,
+            &class_name,
+            &plain_field_types,
+            &instantiation,
+            fields,
+            !spreads.is_empty(),
+        );
+        let object_ty = Ty::intern(InferTy::Class(
             class_name,
             instantiation.into_boxed_slice(),
             TyAttr::default(),
@@ -7986,6 +9017,32 @@ impl<'db> InferenceContext<'db> {
         ty
     }
 
+    fn report_bare_output_format_reference(
+        &mut self,
+        expr: ExprId,
+        class: baml_compiler2_hir::loc::ClassLoc<'db>,
+        function: baml_compiler2_hir::loc::FunctionLoc<'db>,
+    ) {
+        let class_data = baml_compiler2_ppir::item_data::class_data(self.db, class);
+        let function_data = baml_compiler2_ppir::item_data::function_data(self.db, function);
+        let package = baml_compiler2_hir::file_package::file_package(self.db, class.file(self.db));
+        let is_output_format = function_data.name.as_str() == "output_format"
+            && self.lang().is(baml_base::LangPackage::Ai, package.root)
+            && match class_data.name.as_str() {
+                "Context" => package.namespace_path.is_empty(),
+                "SpecCtx" => package
+                    .namespace_path
+                    .iter()
+                    .map(baml_type::Name::as_str)
+                    .eq(["internal"]),
+                _ => false,
+            };
+        if is_output_format {
+            self.pending_diags
+                .push(PendingDiag::BareOutputFormatReference { expr });
+        }
+    }
+
     /// The resolution core behind [`InferenceContext::field_access`]:
     /// hands the resolution BACK instead of recording, so the union arm
     /// can drop its per-member recursion's resolutions (one expression,
@@ -7996,7 +9053,7 @@ impl<'db> InferenceContext<'db> {
         at: ExprId,
         base_ty: &Ty,
         member: &baml_type::Name,
-    ) -> (Ty, Option<MemberResolution<'db>>) {
+    ) -> (Ty, Option<MemberResolution<'db, Ty>>) {
         // `structurally_resolve` expands weak aliases, so `json`
         // answers as its union and an alias-of-class answers as the
         // class - every arm below sees the target.
@@ -8009,11 +9066,11 @@ impl<'db> InferenceContext<'db> {
         // reachable (they need not agree across arms); zero shared
         // declarers report "no common interface", two or more are
         // ambiguous.
-        if let TyKind::Union(members, _) = resolved.kind() {
+        if let InferTy::Union(members, _) = resolved.kind() {
             let members = members.to_vec();
             return self.union_member_access(at, &resolved, &members, member);
         }
-        if let TyKind::Class(qtn, args, _) = resolved.kind()
+        if let InferTy::Class(qtn, args, _) = resolved.kind()
             && let Some(baml_compiler2_hir::contributions::Definition::Class(class)) =
                 self.facts.definition_of(qtn)
             && let Some((_, field_ty)) = crate::lower::class_field_types(self.db, class)
@@ -8021,14 +9078,14 @@ impl<'db> InferenceContext<'db> {
                 .find(|(field, _)| field == member)
         {
             return (
-                substitute_params(field_ty, args),
+                substitute_params(&crate::impls::interned_ty(field_ty), args),
                 Some(MemberResolution::Field {
                     class,
                     field: member.clone(),
                 }),
             );
         }
-        if let TyKind::Class(qtn, args, _) = resolved.kind()
+        if let InferTy::Class(qtn, args, _) = resolved.kind()
             && let Some(crate::package_interface::ExportedType::Class { fields, .. }) =
                 crate::package_interface::mounted_type_row(self.db, qtn)
             && let Some((_, field_ty, _)) = fields.iter().find(|(field, ..)| field == member)
@@ -8048,6 +9105,7 @@ impl<'db> InferenceContext<'db> {
             // - see the callee road's twin check.
             if let Some((sources, is_field)) = crate::method_resolution::concrete_member_ambiguity(
                 self.db,
+                self.viewer(),
                 &self.facts,
                 &resolved,
                 member,
@@ -8065,6 +9123,12 @@ impl<'db> InferenceContext<'db> {
             }
             match candidate.source {
                 crate::method_resolution::MethodCandidateSource::Source { method, class } => {
+                    if self.reject_selfless_inherent_method(method, member, at) {
+                        return (Ty::error(), None);
+                    }
+                    if self.member_probe_depth == 0 {
+                        self.report_bare_output_format_reference(at, class, method);
+                    }
                     let signature = function_signature(self.db, method);
                     let mut instantiation = candidate.class_args;
                     let own: Vec<Ty> = signature.generic_params[instantiation.len()..]
@@ -8115,11 +9179,15 @@ impl<'db> InferenceContext<'db> {
         }
         match crate::method_resolution::lookup_interface_member(
             self.db,
+            self.viewer(),
             &self.facts,
             &resolved,
             member,
         ) {
             crate::method_resolution::InterfaceMemberLookup::Found(interface_member) => {
+                if self.reject_selfless_instance_member(&interface_member, member, at) {
+                    return (Ty::error(), None);
+                }
                 let resolution = self.declarer_resolution(&interface_member.declarer, member);
                 return (self.interface_member_value(interface_member), resolution);
             }
@@ -8148,7 +9216,7 @@ impl<'db> InferenceContext<'db> {
                         });
                 }
                 return (
-                    Ty::intern(TyKind::Unknown {
+                    Ty::intern(InferTy::Unknown {
                         attr: TyAttr::default(),
                     }),
                     None,
@@ -8203,15 +9271,19 @@ impl<'db> InferenceContext<'db> {
         union_ty: &Ty,
         members: &[Ty],
         member: &baml_type::Name,
-    ) -> (Ty, Option<MemberResolution<'db>>) {
+    ) -> (Ty, Option<MemberResolution<'db, Ty>>) {
         match crate::method_resolution::lookup_union_member(
             self.db,
+            self.viewer(),
             &self.facts,
             union_ty,
             members,
             member,
         ) {
             crate::method_resolution::UnionMemberLookup::Found(interface_member) => {
+                if self.reject_selfless_instance_member(&interface_member, member, at) {
+                    return (Ty::error(), None);
+                }
                 let resolution = self.declarer_resolution(&interface_member.declarer, member);
                 (self.interface_member_value(interface_member), resolution)
             }
@@ -8241,9 +9313,6 @@ impl<'db> InferenceContext<'db> {
                 }
                 (Ty::error(), None)
             }
-            crate::method_resolution::UnionMemberLookup::ClassFieldJoin(field_ty) => {
-                (field_ty, None)
-            }
             crate::method_resolution::UnionMemberLookup::NoCommonInterface => {
                 if self.member_probe_depth == 0 && !union_ty.has_error() && !union_ty.has_infer() {
                     self.pending_diags
@@ -8267,7 +9336,7 @@ impl<'db> InferenceContext<'db> {
         &self,
         declarer: &crate::method_resolution::MemberDeclarer<'db>,
         member: &baml_type::Name,
-    ) -> Option<MemberResolution<'db>> {
+    ) -> Option<MemberResolution<'db, Ty>> {
         use crate::method_resolution::MemberDeclarer;
         match declarer {
             MemberDeclarer::VirtualField {
@@ -8286,12 +9355,17 @@ impl<'db> InferenceContext<'db> {
                     method: member.clone(),
                 })
             }
-            MemberDeclarer::ImplMethod { block, func } => {
-                Some(MemberResolution::InterfaceConcreteMethod {
-                    impl_block: *block,
-                    func: *func,
-                })
-            }
+            MemberDeclarer::ImplMethod {
+                block,
+                func,
+                frame_type_args,
+                from_interface_default,
+            } => Some(MemberResolution::InterfaceConcreteMethod {
+                impl_block: *block,
+                func: *func,
+                frame_type_args: frame_type_args.clone(),
+                from_interface_default: *from_interface_default,
+            }),
             MemberDeclarer::ImplField { .. } => None,
             MemberDeclarer::ExternalMethod(callable) => {
                 Some(MemberResolution::External(callable.clone()))
@@ -8321,10 +9395,7 @@ impl<'db> InferenceContext<'db> {
         let db = self.db;
         let data = baml_compiler2_ppir::item_data::class_data(db, class);
         let pkg = baml_compiler2_hir::file_package::file_package(db, class.file(db));
-        let pkg_items = baml_compiler2_ppir::package_items(
-            db,
-            baml_compiler2_hir::package::PackageId::new(db, pkg.package.clone()),
-        );
+        let pkg_items = baml_compiler2_ppir::package_items(db, pkg.root);
         for block in &data.implements {
             let Some(interface) = crate::interfaces::resolve_ref_to_interface(
                 db,
@@ -8358,9 +9429,77 @@ impl<'db> InferenceContext<'db> {
     /// (the unqualified spelling may not resolve there), and generic args
     /// ride along so same-interface-different-args sources stay distinct
     /// (TIR's `qualified_interface_display`).
-    fn qualified_interface_display(&self, iface: &baml_type::interned::InterfaceRef) -> String {
+    /// Where the language packages are installed.
+    fn lang(&self) -> baml_base::LangRoots {
+        baml_compiler2_hir::package::lang_roots(self.db)
+    }
+
+    /// A declaration of an installed language package, or `None` when that
+    /// package is not installed — in which case nothing it declares exists
+    /// and the rule asking for it does not apply.
+    fn lang_decl(
+        &self,
+        package: baml_base::LangPackage,
+        namespace: &[&str],
+        name: &str,
+    ) -> Option<baml_type::DeclName> {
+        let root = self.lang().get(package)?;
+        Some(baml_type::DeclName::in_root(
+            root,
+            namespace
+                .iter()
+                .copied()
+                .map(baml_type::Name::new)
+                .collect(),
+            baml_type::Name::new(name),
+        ))
+    }
+
+    /// The class type `package.namespace.name`, or the error sentinel when
+    /// the package is not installed.
+    fn lang_class_ty(&self, package: baml_base::LangPackage, namespace: &[&str], name: &str) -> Ty {
+        match self.lang_decl(package, namespace, name) {
+            Some(decl) => Ty::intern(InferTy::Class(decl, Box::new([]), TyAttr::default())),
+            None => Ty::error(),
+        }
+    }
+
+    /// The interface existential `package.namespace.name`, or the error
+    /// sentinel when the package is not installed.
+    fn lang_interface_ty(
+        &self,
+        package: baml_base::LangPackage,
+        namespace: &[&str],
+        name: &str,
+    ) -> Ty {
+        match self.lang_decl(package, namespace, name) {
+            Some(decl) => Ty::intern(InferTy::Interface(
+                decl,
+                Box::new([]),
+                Box::new([]),
+                TyAttr::default(),
+            )),
+            None => Ty::error(),
+        }
+    }
+
+    /// The viewpoint this body's diagnostics spell types from: its own file's
+    /// package.
+    fn viewpoint(&self) -> crate::render::Viewpoint<'db> {
+        crate::render::Viewpoint::user_facing(self.db, self.viewer())
+    }
+
+    /// The package this body belongs to: what its member lookups can see and
+    /// the viewpoint its diagnostics render from.
+    fn viewer(&self) -> baml_base::SourceRoot {
+        baml_compiler2_hir::file_package::file_package(self.db, self.owner_file).root
+    }
+
+    fn qualified_interface_display(&self, iface: &baml_type::interned::InferInterface) -> String {
         let qtn = &iface.name;
-        let base = if qtn.is_local() && !self.lower.namespace_context().is_empty() {
+        let vp = self.viewpoint();
+        let base = if Some(qtn.root()) == vp.viewer() && !self.lower.namespace_context().is_empty()
+        {
             match qtn.namespace().as_slice() {
                 [] => format!("root.{}", qtn.name()),
                 ns => format!(
@@ -8373,7 +9512,7 @@ impl<'db> InferenceContext<'db> {
                 ),
             }
         } else {
-            qtn.render_user_facing()
+            qtn.spell(&vp)
         };
         if iface.generics.is_empty() {
             base
@@ -8381,7 +9520,7 @@ impl<'db> InferenceContext<'db> {
             let args = iface
                 .generics
                 .iter()
-                .map(|arg| arg.to_plain().render_user_facing())
+                .map(|arg| rendered_plain(arg).spell(&self.viewpoint()))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{base}<{args}>")
@@ -8391,6 +9530,169 @@ impl<'db> InferenceContext<'db> {
     /// An interface member in VALUE position: no turbofish, so a default
     /// method's own generics instantiate fresh; methods bind their
     /// receiver. Shared by field access and the `default.` value road.
+    /// Whether a resolved interface METHOD takes a `self` receiver. A
+    /// `self`-less method is an associated function, not an instance member:
+    /// it is reachable through the type-qualified spellings only (Rust's
+    /// E0599 "associated function, not method" split), because the receiver
+    /// spellings' lowering passes the receiver as `self` — which a
+    /// `self`-less callee has no slot for.
+    fn interface_member_takes_self(
+        &self,
+        member: &crate::method_resolution::InterfaceMember<'db>,
+    ) -> bool {
+        use crate::method_resolution::MemberDeclarer;
+        match &member.declarer {
+            MemberDeclarer::VirtualMethod { method, .. }
+            | MemberDeclarer::ImplMethod { func: method, .. } => {
+                function_signature(self.db, *method)
+                    .params
+                    .first()
+                    .is_some_and(|param| param.name.as_str() == "self")
+            }
+            MemberDeclarer::ExternalMethod(callable) => callable.takes_self,
+            // Fields have no receiver-vs-associated split.
+            MemberDeclarer::VirtualField { .. }
+            | MemberDeclarer::ImplField { .. }
+            | MemberDeclarer::ExternalVirtualField { .. } => true,
+        }
+    }
+
+    /// Reject a `self`-less interface method reached through a VALUE receiver
+    /// (`f.make(5)`, `f.as<I>.make()`, union receivers): returns `true` and
+    /// reports when the member is such a method. See
+    /// [`Self::interface_member_takes_self`] for why this cannot be allowed
+    /// to slide (the receiver would be passed into the first real parameter).
+    /// A class-INHERENT static (`function make(seed: int) -> Widget`) reached
+    /// through a value receiver. Rejected for the same reason its interface
+    /// twin is: the receiver contributes nothing the call needs, and reading
+    /// it as one is what allowed it to be smuggled into the first real
+    /// parameter. `Widget.make(..)` is the spelling.
+    fn reject_selfless_inherent_method(
+        &mut self,
+        method: baml_compiler2_hir::loc::FunctionLoc<'db>,
+        member_name: &baml_type::Name,
+        at: ExprId,
+    ) -> bool {
+        let takes_self = function_signature(self.db, method)
+            .params
+            .first()
+            .is_some_and(|param| param.name.as_str() == "self");
+        if takes_self {
+            return false;
+        }
+        if self.member_probe_depth == 0 {
+            // An in-class `implements` method resolves as an ordinary class
+            // candidate, so this road — not the member-lookup one — is where a
+            // CONCRETE receiver's interface static lands. Name its interface
+            // when it has one; `None` is reserved for genuinely inherent
+            // statics, whose spelling is the owning type.
+            let interface_name = self.declaring_interface_of_method(method);
+            self.pending_diags
+                .push(PendingDiag::SelflessInstanceMember {
+                    expr: at,
+                    interface_name,
+                    member: member_name.clone(),
+                });
+        }
+        true
+    }
+
+    /// The interface a resolved member was declared by, for the diagnostic
+    /// that names it. Both METHOD declarers can answer: a symbolic receiver
+    /// carries the interface directly, and a concrete one carries the impl's
+    /// method, whose interface target is recorded (an adopted default body
+    /// is owned by the interface itself). The FIELD declarers cannot occur
+    /// here — the only caller has already required `member.is_method`.
+    fn member_declaring_interface(
+        &self,
+        declarer: &crate::method_resolution::MemberDeclarer<'db>,
+    ) -> Option<baml_type::Name> {
+        use crate::method_resolution::MemberDeclarer;
+
+        match declarer {
+            MemberDeclarer::VirtualMethod { interface, .. } => {
+                Some(self.interface_short_name(*interface))
+            }
+            MemberDeclarer::ImplMethod { func, .. } => self.declaring_interface_of_method(*func),
+            // A mounted method's descriptor is source-less: it records
+            // `takes_self` but not the interface that declared it, so there is
+            // no name to give and the message stays the general one.
+            MemberDeclarer::ExternalMethod(_) => None,
+            // FIELD declarers cannot reach here — the only caller has already
+            // required `member.is_method`.
+            MemberDeclarer::VirtualField { .. }
+            | MemberDeclarer::ImplField { .. }
+            | MemberDeclarer::ExternalVirtualField { .. } => None,
+        }
+    }
+
+    fn interface_short_name(
+        &self,
+        interface: baml_compiler2_hir::loc::InterfaceLoc<'db>,
+    ) -> baml_type::Name {
+        baml_compiler2_ppir::item_data::interface_data(self.db, interface)
+            .name
+            .clone()
+    }
+
+    /// The interface a METHOD belongs to, from the method alone: an inherited
+    /// default body is owned by the interface, and a method written inside an
+    /// `implements` block records that block's interface target. `None` for a
+    /// genuinely inherent method, which no interface declares.
+    ///
+    /// Keyed on the method rather than the resolution because BOTH `self`-less
+    /// rejections need the answer and reach it differently — a member lookup
+    /// hands back a declarer, while an in-class `implements` method resolves
+    /// as an ordinary class candidate with no declarer at all.
+    fn declaring_interface_of_method(
+        &self,
+        func: baml_compiler2_hir::loc::FunctionLoc<'db>,
+    ) -> Option<baml_type::Name> {
+        if let Some(baml_compiler2_ppir::item_data::MethodOwner::Interface(interface)) =
+            baml_compiler2_ppir::item_data::method_owner(self.db, func)
+        {
+            return Some(self.interface_short_name(interface));
+        }
+        let target =
+            baml_compiler2_ppir::item_data::method_interface_target(self.db, func).as_ref()?;
+        let target_ty = self.lower.lower_type_ref_at(
+            &target.type_refs,
+            target.target,
+            crate::lower::TypePosition::ConstraintHead,
+        );
+        match &target_ty {
+            baml_type::LoweringTy::Interface(name, ..) => Some(name.name().clone()),
+            _ => None,
+        }
+    }
+
+    /// A `self`-less member reached through a VALUE receiver. Rejected
+    /// whatever the receiver's kind — concrete, existential, or union: the
+    /// value contributes nothing the call needs, and reading it as a receiver
+    /// is what let it be smuggled into the first real parameter. The
+    /// type-qualified spellings are the only roads, so the receiver itself is
+    /// not a parameter here.
+    fn reject_selfless_instance_member(
+        &mut self,
+        member: &crate::method_resolution::InterfaceMember<'db>,
+        member_name: &baml_type::Name,
+        at: ExprId,
+    ) -> bool {
+        if !member.is_method || self.interface_member_takes_self(member) {
+            return false;
+        }
+        if self.member_probe_depth == 0 {
+            let interface_name = self.member_declaring_interface(&member.declarer);
+            self.pending_diags
+                .push(PendingDiag::SelflessInstanceMember {
+                    expr: at,
+                    interface_name,
+                    member: member_name.clone(),
+                });
+        }
+        true
+    }
+
     fn interface_member_value(
         &mut self,
         interface_member: crate::method_resolution::InterfaceMember<'db>,
@@ -8422,7 +9724,8 @@ impl<'db> InferenceContext<'db> {
                 }
             };
         }
-        if interface_member.is_method {
+        // Same rule as the call road: a `self`-less method binds nothing.
+        if interface_member.is_method && self.interface_member_takes_self(&interface_member) {
             return bind_receiver(interface_member.ty);
         }
         interface_member.ty
@@ -8478,7 +9781,7 @@ impl<'db> InferenceContext<'db> {
     fn expand_alias_ty(&mut self, ty: &Ty) -> Ty {
         let mut resolved = ty.clone();
         let mut fuel = 8u32;
-        while let TyKind::TypeAlias(qtn, _) = resolved.kind() {
+        while let InferTy::TypeAlias(qtn, _) = resolved.kind() {
             if fuel == 0 {
                 break;
             }
@@ -8491,6 +9794,50 @@ impl<'db> InferenceContext<'db> {
         resolved
     }
 
+    /// The sole concrete function type at a callback root: `ty` itself, or
+    /// the unique function member nested through unions and type aliases.
+    ///
+    /// A lambda literal can use that signature even when the other union arms
+    /// are non-callable values (`string | Callback`, for example). Multiple
+    /// function arms remain ambiguous and provide no context. The traversal is
+    /// fuel-bounded because recursive aliases are valid types but cannot offer
+    /// a finite unique callback shape.
+    fn callback_root_fn(&mut self, ty: &Ty) -> Option<Ty> {
+        fn collect(
+            this: &mut InferenceContext<'_>,
+            ty: &Ty,
+            callback: &mut Option<Ty>,
+            fuel: u8,
+        ) -> bool {
+            if fuel == 0 {
+                return false;
+            }
+            let expanded = this.expand_alias_ty(ty);
+            match expanded.kind() {
+                InferTy::Function { .. } => {
+                    if callback.is_some() {
+                        return false;
+                    }
+                    *callback = Some(expanded);
+                    true
+                }
+                InferTy::Union(members, _) => {
+                    let members = members.to_vec();
+                    members
+                        .iter()
+                        .all(|member| collect(this, member, callback, fuel.saturating_sub(1)))
+                }
+                InferTy::TypeAlias(..) => false,
+                _ => true,
+            }
+        }
+
+        let mut callback = None;
+        collect(self, ty, &mut callback, 16)
+            .then_some(callback)
+            .flatten()
+    }
+
     /// The element an ARRAY literal adopts from its expectation: the
     /// expected list itself, or the UNIQUE list member of an expected
     /// union - expected-type propagation into aggregates (r-a's
@@ -8501,10 +9848,10 @@ impl<'db> InferenceContext<'db> {
     fn expected_list_element(&mut self, expected: &Expectation) -> Option<Ty> {
         let shape = self.expectation_shape(expected)?;
         match shape.kind() {
-            TyKind::List(element, _) => Some(element.clone()),
-            TyKind::Union(members, _) => {
+            InferTy::List(element, _) => Some(element.clone()),
+            InferTy::Union(members, _) => {
                 let mut lists = members.iter().filter_map(|member| match member.kind() {
-                    TyKind::List(element, _) => Some(element.clone()),
+                    InferTy::List(element, _) => Some(element.clone()),
                     _ => None,
                 });
                 let first = lists.next()?;
@@ -8518,10 +9865,10 @@ impl<'db> InferenceContext<'db> {
     fn expected_map_entry(&mut self, expected: &Expectation) -> Option<(Ty, Ty)> {
         let shape = self.expectation_shape(expected)?;
         match shape.kind() {
-            TyKind::Map { key, value, .. } => Some((key.clone(), value.clone())),
-            TyKind::Union(members, _) => {
+            InferTy::Map { key, value, .. } => Some((key.clone(), value.clone())),
+            InferTy::Union(members, _) => {
                 let mut maps = members.iter().filter_map(|member| match member.kind() {
-                    TyKind::Map { key, value, .. } => Some((key.clone(), value.clone())),
+                    InferTy::Map { key, value, .. } => Some((key.clone(), value.clone())),
                     _ => None,
                 });
                 let first = maps.next()?;
@@ -8640,49 +9987,28 @@ impl<'db> InferenceContext<'db> {
     /// One body-position annotation, lowered and hole-instantiated - the
     /// single entry for every type written inside a body (let ascriptions,
     /// lambda signature slots, turbofish go through `instantiation_args`).
-    fn lower_body_annotation(&mut self, type_ref: baml_compiler2_hir::type_ref::TypeRefId) -> Ty {
+    fn lower_body_annotation(&mut self, type_ref: BodyTypeRefId) -> Ty {
         if let Some(cached) = self.annotation_cache.get(&type_ref) {
             return cached.clone();
         }
-        let lowered = self.lower_scoped_type_ref_at(
-            &self.type_refs.store,
+        let (lowered, diagnostics) = self.lower_body_type_ref_at(
             type_ref,
             crate::lower::TypePosition::Existential,
+            crate::lower::HolePolicy::Allowed,
         );
+        self.queue_body_lowering_diagnostics(diagnostics);
         // Written-type well-formedness (rustc's wfcheck at body
         // annotations): generic arguments must satisfy their heads'
         // declared bounds. Hole-carrying annotations skip - their holes
         // solve first and the instantiation sites judge them.
-        if !lowered.has_infer() {
+        if !lowered.contains_hole() {
             let env = self.wf_scope_env.get_or_init(|| match self.body_owner {
                 Some(function) => crate::lower::function_generic_bounds(self.db, function)
                     .into_iter()
-                    .map(|(param, refs)| {
-                        (
-                            param,
-                            refs.iter()
-                                .map(|bound| baml_type::Interface {
-                                    name: bound.name.clone(),
-                                    generics: bound
-                                        .generics
-                                        .iter()
-                                        .map(baml_type::interned::Ty::to_plain)
-                                        .collect(),
-                                    associated_types: bound
-                                        .associated_types
-                                        .iter()
-                                        .map(|(name, ty)| (name.clone(), ty.to_plain()))
-                                        .collect(),
-                                })
-                                .collect(),
-                        )
-                    })
                     .collect(),
                 None => rustc_hash::FxHashMap::default(),
             });
-            for error in
-                crate::interfaces::type_generic_bound_errors(self.db, env, &lowered.to_plain())
-            {
+            for error in crate::interfaces::type_generic_bound_errors(self.db, env, &lowered) {
                 self.pending_diags
                     .push(PendingDiag::AnnotWf { type_ref, error });
             }
@@ -8696,21 +10022,127 @@ impl<'db> InferenceContext<'db> {
     /// lowering is pure and emits var-less hole nodes for `_`; the inference
     /// side instantiates each hole as a fresh table variable, filled from
     /// context.
-    fn instantiate_holes(&mut self, ty: &Ty, at: HoleAnchor) -> Ty {
-        if !ty.has_infer() {
-            return ty.clone();
+    fn instantiate_holes(&mut self, ty: &baml_type::LoweringTy, at: HoleAnchor) -> Ty {
+        self.ingest_lowered(ty, IngestHoles::Anchored(at))
+    }
+
+    /// The lowering→inference ingestion: intern the closed structure, and
+    /// let the policy decide what each `_` hole becomes. Both policies mint
+    /// a fresh table variable — they differ in whether the hole is legal
+    /// (annotation positions record it in `hole_vars` for unsolved-hole
+    /// reporting) or immediately diagnosed (expression positions, an
+    /// unconditional E0147).
+    fn ingest_lowered(&mut self, ty: &baml_type::LoweringTy, policy: IngestHoles) -> Ty {
+        if let baml_type::LoweringTy::Infer { .. } = ty {
+            return match policy {
+                IngestHoles::Anchored(at) => {
+                    let var_ty = self.table.new_var_ty();
+                    if let InferTy::InferVar { var, .. } = var_ty.kind() {
+                        self.hole_vars.push((*var, at));
+                    }
+                    var_ty
+                }
+                IngestHoles::ExprPosition(expr) => {
+                    self.pending_diags
+                        .push(PendingDiag::ExprPositionHole { expr });
+                    self.table.new_var_ty()
+                }
+            };
         }
-        if matches!(ty.kind(), TyKind::Infer { var: None, .. }) {
-            let var_ty = self.table.new_var_ty();
-            if let TyKind::Infer { var: Some(var), .. } = var_ty.kind() {
-                self.hole_vars.push((*var, at));
+        match baml_type::Ty::try_from(ty) {
+            // No holes below: the interned ingestion is total.
+            Ok(closed) => Ty::from_plain(&closed),
+            Err(_) => self.ingest_lowered_slow(ty, policy),
+        }
+    }
+
+    /// The hole-carrying slow path of [`Self::ingest_lowered`]: rebuild the
+    /// recursive shapes interned with each child re-ingested. Leaves never
+    /// reach here (a leaf is closed, so the fast path takes it).
+    fn ingest_lowered_slow(&mut self, ty: &baml_type::LoweringTy, policy: IngestHoles) -> Ty {
+        use baml_type::LoweringTy as LoweringTyShape;
+        let kind = match ty {
+            LoweringTyShape::List(inner, attr) => {
+                InferTy::List(self.ingest_lowered(inner, policy), attr.clone())
             }
-            return var_ty;
-        }
-        Ty::intern(
-            ty.kind()
-                .map_children(|child| self.instantiate_holes(child, at)),
-        )
+            LoweringTyShape::Map { key, value, attr } => InferTy::Map {
+                key: self.ingest_lowered(key, policy),
+                value: self.ingest_lowered(value, policy),
+                attr: attr.clone(),
+            },
+            LoweringTyShape::Union(members, attr) => InferTy::Union(
+                members
+                    .iter()
+                    .map(|member| self.ingest_lowered(member, policy))
+                    .collect(),
+                attr.clone(),
+            ),
+            LoweringTyShape::Class(name, args, attr) => InferTy::Class(
+                name.clone(),
+                args.iter()
+                    .map(|arg| self.ingest_lowered(arg, policy))
+                    .collect(),
+                attr.clone(),
+            ),
+            LoweringTyShape::Interface(name, args, pins, attr) => InferTy::Interface(
+                name.clone(),
+                args.iter()
+                    .map(|arg| self.ingest_lowered(arg, policy))
+                    .collect(),
+                pins.iter()
+                    .map(|(name, ty)| (name.clone(), self.ingest_lowered(ty, policy)))
+                    .collect(),
+                attr.clone(),
+            ),
+            LoweringTyShape::Function {
+                params,
+                ret,
+                throws,
+                attr,
+            } => InferTy::Function {
+                params: params
+                    .iter()
+                    .map(|param| baml_type::interned::InferFunctionParamTy {
+                        name: param.name.clone(),
+                        ty: self.ingest_lowered(&param.ty, policy),
+                        mode: param.mode,
+                    })
+                    .collect(),
+                ret: self.ingest_lowered(ret, policy),
+                throws: self.ingest_lowered(throws, policy),
+                attr: attr.clone(),
+            },
+            LoweringTyShape::Future(value, error, attr) => InferTy::Future(
+                self.ingest_lowered(value, policy),
+                self.ingest_lowered(error, policy),
+                attr.clone(),
+            ),
+            LoweringTyShape::AssociatedTypeProjection {
+                base,
+                interface,
+                member,
+                attr,
+            } => InferTy::AssociatedTypeProjection {
+                base: self.ingest_lowered(base, policy),
+                interface: baml_type::interned::InferInterface::new(
+                    interface.name.clone(),
+                    interface
+                        .generics
+                        .iter()
+                        .map(|arg| self.ingest_lowered(arg, policy))
+                        .collect(),
+                    interface
+                        .associated_types
+                        .iter()
+                        .map(|(name, ty)| (name.clone(), self.ingest_lowered(ty, policy)))
+                        .collect(),
+                ),
+                member: member.clone(),
+                attr: attr.clone(),
+            },
+            _ => unreachable!("closed leaves take the ingest fast path"),
+        };
+        Ty::intern(kind)
     }
 
     /// [`Self::instantiate_holes`] for EXPRESSION-position type arguments
@@ -8721,19 +10153,8 @@ impl<'db> InferenceContext<'db> {
     /// still instantiates as a fresh var so inference proceeds for
     /// RECOVERY, but the diagnostic is unconditional and immediate,
     /// never dependent on whether the var happens to solve.
-    fn reject_expr_position_holes(&mut self, ty: &Ty, at: ExprId) -> Ty {
-        if !ty.has_infer() {
-            return ty.clone();
-        }
-        if matches!(ty.kind(), TyKind::Infer { var: None, .. }) {
-            self.pending_diags
-                .push(PendingDiag::ExprPositionHole { expr: at });
-            return self.table.new_var_ty();
-        }
-        Ty::intern(
-            ty.kind()
-                .map_children(|child| self.reject_expr_position_holes(child, at)),
-        )
+    fn reject_expr_position_holes(&mut self, ty: &baml_type::LoweringTy, at: ExprId) -> Ty {
+        self.ingest_lowered(ty, IngestHoles::ExprPosition(at))
     }
 
     /// `base catch (e) { arms }` / `catch_all`: narrowing on the ERROR
@@ -8751,9 +10172,17 @@ impl<'db> InferenceContext<'db> {
         expected: &Expectation,
     ) -> Ty {
         let branch_expectation = expected.adjust_for_branches(&mut self.table);
-        self.throws_channels.push(Vec::new());
+        // Caught values need not satisfy the enclosing callable's contract.
+        self.throws_channels.push(ThrowsChannel::default());
         let base_ty = self.infer_expr(body, base, &branch_expectation);
-        let channel = self.throws_channels.pop().expect("pushed above");
+        let channel = self
+            .throws_channels
+            .pop()
+            .expect("pushed above")
+            .contributions;
+        // An arm's binding would carry the fact's type past the block that
+        // scoped it.
+        let channel = self.drop_escaping_effects(channel, None);
         // catch discharges a SET of throw FACTS, never a value of a
         // union type (match scrutinizes values; catch removes facts):
         // each contribution finalizes and top-level unions split into
@@ -8762,13 +10191,13 @@ impl<'db> InferenceContext<'db> {
         let mut facts: Vec<Ty> = Vec::new();
         for (_, contribution) in &channel {
             let finalized = self.finalize_incoming_effect(contribution);
-            if matches!(finalized.kind(), TyKind::Never { .. }) {
+            if matches!(finalized.kind(), InferTy::Never { .. }) {
                 continue;
             }
             let resolved = self.table.resolve_completely(&finalized);
             let canonical = self.matrix_scrut(&resolved);
             match canonical.kind() {
-                TyKind::Union(members, _) => {
+                InferTy::Union(members, _) => {
                     for member in members {
                         if !facts.contains(member) {
                             facts.push(member.clone());
@@ -8796,26 +10225,21 @@ impl<'db> InferenceContext<'db> {
                 .insert(clause.binding, clause_binding_ty);
             if let Some(context) = clause.stack_trace_binding {
                 // The second binding (`catch (e, ctx)`) is the full error
-                // CONTEXT - `baml.errors.ErrorContext` (the AST field's
+                // CONTEXT - `baml.errors.Context` (the AST field's
                 // "stack trace" name understates it; TIR resolves the
                 // class). Lookup-gated, fail-safe to Error.
-                let context_ty = match self.facts.definition_of(&baml_type::TypeName::new(
-                    baml_type::Name::new("baml"),
-                    vec![baml_type::Name::new("errors")],
-                    baml_type::Name::new("ErrorContext"),
-                )) {
-                    Some(baml_compiler2_hir::contributions::Definition::Class(_)) => {
-                        Ty::intern(TyKind::Class(
-                            baml_type::TypeName::new(
-                                baml_type::Name::new("baml"),
-                                vec![baml_type::Name::new("errors")],
-                                baml_type::Name::new("ErrorContext"),
-                            ),
-                            Box::new([]),
-                            TyAttr::default(),
-                        ))
+                let context_ty = match self
+                    .lang_decl(baml_base::LangPackage::Baml, &["errors"], "Context")
+                    .filter(|context| {
+                        matches!(
+                            self.facts.definition_of(context),
+                            Some(baml_compiler2_hir::contributions::Definition::Class(_))
+                        )
+                    }) {
+                    Some(context) => {
+                        Ty::intern(InferTy::Class(context, Box::new([]), TyAttr::default()))
                     }
-                    _ => Ty::error(),
+                    None => Ty::error(),
                 };
                 self.result.type_of_pat.insert(context, context_ty);
             }
@@ -8830,7 +10254,7 @@ impl<'db> InferenceContext<'db> {
                     .lower_pattern(
                         body,
                         arm.pattern,
-                        &Ty::intern(TyKind::Unknown {
+                        &Ty::intern(InferTy::Unknown {
                             attr: TyAttr::default(),
                         }),
                     )
@@ -8871,7 +10295,7 @@ impl<'db> InferenceContext<'db> {
                 // its claim probed as `unknown` - so with no facts left
                 // its world is `never`, not the top type.
                 let arm_scrut = if may.is_empty() {
-                    if matches!(claim.kind(), TyKind::Unknown { .. }) {
+                    if matches!(claim.kind(), InferTy::Unknown { .. }) {
                         Ty::never()
                     } else {
                         claim.clone()
@@ -8907,8 +10331,8 @@ impl<'db> InferenceContext<'db> {
     fn panic_subset(&mut self, claim: &Ty) -> Option<Ty> {
         let expanded = self.expand_alias_ty(claim);
         match expanded.kind() {
-            TyKind::Class(qtn, _, _) if qtn.is_panic_type() => Some(expanded.clone()),
-            TyKind::Union(members, _) => {
+            InferTy::Class(qtn, _, _) if qtn.is_panic_type(self.lang()) => Some(expanded.clone()),
+            InferTy::Union(members, _) => {
                 let members = members.to_vec();
                 let panics: Vec<Ty> = members
                     .iter()
@@ -8921,6 +10345,32 @@ impl<'db> InferenceContext<'db> {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// The non-`baml.panics.*` component of a thrown type - what a `throw`
+    /// actually contributes to the channel.
+    ///
+    /// The complement of [`Self::panic_subset`]: that one keeps the half a
+    /// catch arm may always trap, this one keeps the half a `throws` clause
+    /// must account for. `None` means the type was panics all the way down.
+    fn non_panic_subset(&mut self, ty: &Ty) -> Option<Ty> {
+        let expanded = self.expand_alias_ty(ty);
+        match expanded.kind() {
+            InferTy::Class(qtn, _, _) if qtn.is_panic_type(self.lang()) => None,
+            InferTy::Union(members, _) => {
+                let members = members.to_vec();
+                let rest: Vec<Ty> = members
+                    .iter()
+                    .filter_map(|member| self.non_panic_subset(member))
+                    .collect();
+                if rest.is_empty() {
+                    None
+                } else {
+                    Some(self.union_of(&rest))
+                }
+            }
+            _ => Some(expanded.clone()),
         }
     }
 
@@ -8974,10 +10424,10 @@ impl<'db> InferenceContext<'db> {
             return;
         }
         let nullable = match resolved.kind() {
-            TyKind::Null { .. } | TyKind::Unknown { .. } => true,
-            TyKind::Union(members, _) => members
+            InferTy::Null { .. } | InferTy::Unknown { .. } => true,
+            InferTy::Union(members, _) => members
                 .iter()
-                .any(|member| matches!(member.kind(), TyKind::Null { .. })),
+                .any(|member| matches!(member.kind(), InferTy::Null { .. })),
             _ => false,
         };
         // An optional link INSIDE a chain sees its base already peeled;
@@ -9012,10 +10462,10 @@ impl<'db> InferenceContext<'db> {
                         continue;
                     }
                     let nullable = match resolved.kind() {
-                        TyKind::Null { .. } => true,
-                        TyKind::Union(members, _) => members
+                        InferTy::Null { .. } => true,
+                        InferTy::Union(members, _) => members
                             .iter()
-                            .any(|member| matches!(member.kind(), TyKind::Null { .. })),
+                            .any(|member| matches!(member.kind(), InferTy::Null { .. })),
                         _ => false,
                     };
                     if nullable {
@@ -9050,15 +10500,31 @@ impl<'db> InferenceContext<'db> {
     /// clause mentions rigid type vars (the check defers through bounds
     /// rather than being skipped: B-1082's rule).
     fn record_throw(&mut self, at: ExprId, ty: &Ty) {
-        if matches!(ty.kind(), TyKind::Never { .. }) || ty.has_error() {
+        if matches!(ty.kind(), InferTy::Never { .. }) || ty.has_error() {
             return;
         }
+        // Panics are RAISED, not thrown: catchable at runtime, but never part
+        // of a `throws` contract. `throw baml.panics.X` therefore contributes
+        // nothing to the channel - it re-raises, exactly as `baml.sys.panic`
+        // does, and the emitted `ThrowIfPanic` guard already carries the
+        // matching runtime behaviour past wildcard arms. A throw whose type
+        // mixes panics with ordinary errors contributes only the ordinary
+        // half. Untouched when no panic is present, so every other throw
+        // records exactly the type it always did.
+        let ty = if self.panic_subset(ty).is_some() {
+            match self.non_panic_subset(ty) {
+                Some(rest) => rest,
+                None => return,
+            }
+        } else {
+            ty.clone()
+        };
         // Thrown literals KEEP their literal types (no widening): catch
         // arms match on literal error codes, and the canonical union at
         // the channel is the generation site. The RUNTIME boundary
         // widens (the provider's conversion): `reflect.signature` on a
         // `throw "negative"` lambda reconstructs `string`.
-        let contribution = ty.clone();
+        let contribution = ty;
         // An OPEN clause (`throws T | _`) admits every contribution; the
         // remainder joins the surface at finalize instead of erroring.
         if let Some(declared) = self.declared_throws.clone()
@@ -9082,6 +10548,7 @@ impl<'db> InferenceContext<'db> {
         self.throws_channels
             .last_mut()
             .expect("channel stack never empty")
+            .contributions
             .push((at, contribution));
     }
 
@@ -9096,7 +10563,7 @@ impl<'db> InferenceContext<'db> {
     /// Records one member access's resolution (r-a's
     /// `write_method_resolution` family). A call's entry sits on the
     /// CALLEE expression; value reads sit on the accessing expression.
-    fn write_member_resolution(&mut self, expr: ExprId, resolution: MemberResolution<'db>) {
+    fn write_member_resolution(&mut self, expr: ExprId, resolution: MemberResolution<'db, Ty>) {
         self.result.member_resolutions.insert(expr, resolution);
     }
 
@@ -9113,57 +10580,8 @@ impl<'db> InferenceContext<'db> {
         own_offset: usize,
     ) -> Vec<Ty> {
         let explicit = self.type_refs.expr_type_args.contains_key(&call);
-        if !self.result.call_plans.get(&call).is_some_and(|plan| {
-            plan.slots
-                .iter()
-                .any(|slot| matches!(slot, CallTypeArgPlan::Runtime { .. }))
-        }) {
-            let type_args = type_args.to_vec();
-            let plan = self.result.call_plans.entry(call).or_default();
-            plan.type_args.clone_from(&type_args);
-            plan.own_offset = own_offset;
-            plan.explicit = explicit;
-            return type_args;
-        }
-        let runtime_params = self.runtime_call_params(call);
-        let mut type_args = type_args.to_vec();
-        let runtime_occurrences: Vec<(baml_type::ParamTy, Ty)> = self
-            .result
-            .call_plans
-            .get(&call)
-            .into_iter()
-            .flat_map(|plan| &plan.slots)
-            .filter_map(|slot| match slot {
-                CallTypeArgPlan::Runtime {
-                    occurrence_ty,
-                    parameter,
-                    ..
-                } => Some((
-                    parameter.clone(),
-                    substitute_static_call_params(occurrence_ty, &type_args, &runtime_params),
-                )),
-                CallTypeArgPlan::Static { .. } => None,
-            })
-            .collect();
-        for (parameter, occurrence_ty) in &runtime_occurrences {
-            if let Some(slot) = type_args.get_mut(parameter.index() as usize) {
-                *slot = occurrence_ty.clone();
-            }
-        }
+        let type_args = type_args.to_vec();
         let plan = self.result.call_plans.entry(call).or_default();
-        for slot in &mut plan.slots {
-            if let CallTypeArgPlan::Runtime {
-                occurrence_ty,
-                parameter,
-                ..
-            } = slot
-                && let Some((_, specialized)) = runtime_occurrences
-                    .iter()
-                    .find(|(candidate, _)| candidate == parameter)
-            {
-                *occurrence_ty = specialized.clone();
-            }
-        }
         plan.type_args.clone_from(&type_args);
         plan.own_offset = own_offset;
         plan.explicit = explicit;
@@ -9180,7 +10598,7 @@ impl<'db> InferenceContext<'db> {
         expr: ExprId,
         root_ty: Ty,
         members: &[baml_type::Name],
-    ) -> (Ty, Vec<ResolvedPathSegment<'db>>) {
+    ) -> (Ty, Vec<ResolvedPathSegment<'db, Ty>>) {
         let mut steps = vec![ResolvedPathSegment {
             ty: root_ty.clone(),
             resolution: None,
@@ -9197,11 +10615,7 @@ impl<'db> InferenceContext<'db> {
         (ty, steps)
     }
 
-    /// Writes a completed path ladder: the per-segment table entry (only
-    /// multi-segment paths - a bare local is just `type_of_expr`) and the
-    /// FINAL member's resolution at the path expression, where value
-    /// consumers key.
-    fn write_resolved_path(&mut self, expr: ExprId, steps: Vec<ResolvedPathSegment<'db>>) {
+    fn write_resolved_path(&mut self, expr: ExprId, steps: Vec<ResolvedPathSegment<'db, Ty>>) {
         if steps.len() < 2 {
             return;
         }
@@ -9211,6 +10625,103 @@ impl<'db> InferenceContext<'db> {
         self.result
             .path_resolutions
             .insert(expr, ResolvedPath { segments: steps });
+    }
+
+    fn untyped_empty_container_ty(
+        &mut self,
+        expr: ExprId,
+        make_container: impl FnOnce(Ty) -> Ty,
+    ) -> Ty {
+        let slot = self.table.new_var_ty_of(unify::VarPolicy::ContainerSlot);
+        let InferTy::InferVar { var, .. } = slot.kind() else {
+            unreachable!("a fresh establishment variable must be an inference type");
+        };
+        let var = *var;
+        let containing_type = make_container(slot);
+        self.infer_var_origin_order.push(var);
+        self.infer_var_origins.insert(
+            var,
+            InferVarOrigin::TypeMustBeKnown {
+                location: crate::diagnostics::DiagnosticLocation::Expr(expr),
+                containing_type: containing_type.clone(),
+            },
+        );
+        containing_type
+    }
+
+    fn untyped_lambda_parameter_ty(
+        &mut self,
+        lambda: ExprId,
+        parameter_index: usize,
+        name: baml_type::Name,
+    ) -> Ty {
+        let ty = self.table.new_var_ty_of(unify::VarPolicy::LambdaParam);
+        let InferTy::InferVar { var, .. } = ty.kind() else {
+            unreachable!("a fresh lambda parameter variable must be an inference type");
+        };
+        let var = *var;
+        self.infer_var_origin_order.push(var);
+        self.infer_var_origins.insert(
+            var,
+            InferVarOrigin::LambdaParameter {
+                lambda,
+                parameter_index,
+                name,
+            },
+        );
+        ty
+    }
+
+    fn take_unresolved_infer_diagnostics(
+        &mut self,
+    ) -> Vec<(
+        crate::diagnostics::DiagnosticLocation,
+        crate::diagnostics::TirTypeError,
+    )> {
+        let mut diagnostics = Vec::new();
+        for var in std::mem::take(&mut self.infer_var_origin_order) {
+            let Some(origin) = self.infer_var_origins.remove(&var) else {
+                continue;
+            };
+            let Some(root) = self.table.unsolved_root_var(var) else {
+                continue;
+            };
+            let (location, error) = match origin {
+                InferVarOrigin::TypeMustBeKnown {
+                    location,
+                    containing_type,
+                } => {
+                    let full_type = self.table.resolve_completely(&containing_type);
+                    if full_type.has_error() {
+                        continue;
+                    }
+                    (
+                        location,
+                        crate::diagnostics::TirTypeError::TypeMustBeKnown {
+                            full_type: rendered_plain(&full_type),
+                        },
+                    )
+                }
+                InferVarOrigin::LambdaParameter {
+                    lambda,
+                    parameter_index,
+                    name,
+                } => (
+                    crate::diagnostics::DiagnosticLocation::LambdaParameter(
+                        lambda,
+                        parameter_index,
+                    ),
+                    crate::diagnostics::TirTypeError::CannotInferLambdaParamType {
+                        param_name: name,
+                    },
+                ),
+            };
+            if !self.diagnosed_infer_vars.insert(root) {
+                continue;
+            }
+            diagnostics.push((location, error));
+        }
+        diagnostics
     }
 
     fn finish(mut self) -> InferenceResult<'db> {
@@ -9267,6 +10778,25 @@ impl<'db> InferenceContext<'db> {
         // BAML's only defaulting rule: an unconstrained EFFECT is `never`
         // (a value variable erases to Error instead - ruling 2).
         self.table.default_unsolved_effects_to_never();
+        // An escape refused on a road with no anchor after its block had
+        // closed (a pattern walk's deposit resolved late) has no block
+        // tail left to report at; the body is the last enclosing scope.
+        if let Some(root) = self.body_root {
+            for (param, value) in std::mem::take(&mut self.anchorless_escapes) {
+                self.report_scoped_type_escape(
+                    root,
+                    &param,
+                    &value,
+                    ScopedTypeEscapeKind::Inferred,
+                );
+            }
+        }
+        debug_assert!(
+            self.anchorless_escapes.is_empty(),
+            "every refused escape is reported: at its block's tail when the \
+             binding closes, and at the body root for one refused after that"
+        );
+        let unresolved_infer_diagnostics = self.take_unresolved_infer_diagnostics();
         let throws = match self.declared_throws.clone() {
             // A closed clause IS the surface (declared wins, rule 1),
             // VERBATIM - the written member order is render fidelity
@@ -9278,10 +10808,13 @@ impl<'db> InferenceContext<'db> {
             // named part joining the union (spec rule 3 - callers see
             // declared + inferred).
             declared => {
-                let contributions = self.throws_channels[0].clone();
+                let contributions = self.throws_channels[0].contributions.clone();
+                // Every block has closed: a contribution still typed by a
+                // scoped binding would be published as the owner's surface.
+                let contributions = self.drop_escaping_effects(contributions, declared.as_ref());
                 let mut resolved: Vec<Ty> = contributions
                     .iter()
-                    .map(|(_, ty)| self.finalize_ty(ty))
+                    .map(|(_, ty)| self.finalize_ty(ty).into_ty())
                     .filter(|ty| !ty.has_error())
                     .collect();
                 if let Some(named) = declared {
@@ -9296,49 +10829,129 @@ impl<'db> InferenceContext<'db> {
         };
         // E0097: with a CLOSED declared clause, a declared fact nothing
         // thrown matches exactly (interface-implementor coverage aside)
-        // is extraneous - a warning, anchored at the body root (the
-        // clause itself lives in the signature store).
+        // is extraneous, anchored at the body root (the clause itself
+        // lives in the signature store). An imprecise `unknown` contract
+        // is an error; other extraneous members remain warnings.
         if let Some(declared) = self.declared_throws.clone()
             && !self.declared_throws_open
             && !declared.has_error()
-            && !crate::lower::is_open_throws_contract(self.db, &declared)
             && let Some(root) = self.body_root
         {
+            let is_open_contract = crate::lower::is_open_throws_contract(self.db, &declared);
             // Coverage compares WIDENED facts (TIR's fact grain: a thrown
             // `"boom"` covers a declared `string`) while the report keeps
             // the declared spelling.
-            let declared_facts = crate::package_interface::flatten_ty_to_facts(
-                &self.finalize_ty(&declared).to_plain(),
-            );
+            // An open union needs its preserved written surface: finalizing
+            // `unknown | SomeError` canonicalizes it to semantic `unknown`
+            // and erases `SomeError` before coverage can report it. Other
+            // contracts still need finalization so projections and solved
+            // variables compare against the effective facts correctly.
+            let declared_for_coverage = if is_open_contract {
+                rendered_plain(&declared)
+            } else {
+                self.plain_finalized(&declared)
+            };
+            let declared_facts =
+                crate::package_interface::flatten_ty_to_facts(&declared_for_coverage);
             let effective: std::collections::BTreeSet<baml_type::Ty> = self.throws_channels[0]
+                .contributions
                 .clone()
                 .iter()
                 .flat_map(|(_, ty)| {
-                    crate::throw_facts::flatten_declared_ty_to_facts(
-                        &self.finalize_ty(ty).to_plain(),
-                    )
+                    crate::throw_facts::flatten_declared_ty_to_facts(&self.plain_finalized(ty))
                 })
                 .collect();
-            let mut extraneous: Vec<String> = declared_facts
+            // A contribution typed by a block-scoped binding was judged at
+            // its throw, where the name was in scope; the clause outside
+            // cannot name it, so what the clause may say about it is its
+            // NEAREST RELAXATION: `Boom<T>` and `T[]` relax to `unknown`
+            // (invariant arguments), `() -> T throws never` to
+            // `() -> unknown throws never`. Coverage judges declared facts
+            // against those relaxations too.
+            let relaxed: std::collections::BTreeSet<baml_type::Ty> = effective
+                .iter()
+                .filter(|fact| mentions_scoped_param(fact))
+                .flat_map(|fact| {
+                    crate::throw_facts::flatten_declared_ty_to_facts(&nearest_scoped_relaxation(
+                        fact,
+                        RelaxationVariance::Covariant,
+                    ))
+                })
+                .collect();
+            let extraneous: Vec<baml_type::Ty> = declared_facts
                 .iter()
                 .filter(|decl| {
                     let widened_decl: std::collections::BTreeSet<baml_type::Ty> =
                         crate::throw_facts::flatten_declared_ty_to_facts(decl);
-                    let covered = widened_decl.iter().all(|w| effective.contains(w));
+                    let covered = widened_decl
+                        .iter()
+                        .all(|w| effective.contains(w) || relaxed.contains(w));
                     !(covered
                         || matches!(decl, baml_type::Ty::Interface(..))
                             && effective.iter().any(|eff| {
                                 baml_type::normalize::is_subtype(eff, decl, &self.facts)
                             }))
                 })
-                .map(baml_type::Ty::render_user_facing)
+                .cloned()
                 .collect();
-            extraneous.sort();
-            if !extraneous.is_empty() {
-                self.pending_diags.push(PendingDiag::ExtraneousThrows {
-                    at: root,
-                    extra_types: extraneous,
-                });
+            if is_open_contract {
+                // A declared `unknown` is precise exactly when something
+                // thrown relaxes to nothing closer than `unknown` itself.
+                let throws_unknown = effective
+                    .iter()
+                    .any(|ty| crate::lower::is_open_throws_contract(self.db, &Ty::from_plain(ty)))
+                    || relaxed
+                        .iter()
+                        .any(|ty| matches!(ty, baml_type::Ty::Unknown { .. }));
+                if !throws_unknown {
+                    // Report what the clause SHOULD say: a scoped
+                    // contribution by its relaxation, everything else as is.
+                    let inferred = throws_clause_union(
+                        effective
+                            .iter()
+                            .filter(|fact| !mentions_scoped_param(fact))
+                            .chain(relaxed.iter())
+                            .cloned(),
+                    );
+                    self.pending_diags
+                        .push(PendingDiag::ImpreciseUnknownThrows {
+                            at: root,
+                            inferred,
+                            needs_declaration: !relaxed.is_empty(),
+                        });
+                } else {
+                    // The `unknown` member is meaningful, but any other
+                    // uncovered members remain ordinary E0097 warnings. Do
+                    // not report an alias that expands to `unknown` as an
+                    // extraneous member merely because coverage compares the
+                    // alias's written surface with the resolved thrown type.
+                    let mut extra_types: Vec<String> = extraneous
+                        .iter()
+                        .filter(|ty| {
+                            !crate::lower::is_open_throws_contract(self.db, &Ty::from_plain(ty))
+                        })
+                        .map(|ty| ty.spell(&self.viewpoint()))
+                        .collect();
+                    extra_types.sort();
+                    if !extra_types.is_empty() {
+                        self.pending_diags.push(PendingDiag::ExtraneousThrows {
+                            at: root,
+                            extra_types,
+                        });
+                    }
+                }
+            } else if !extraneous.is_empty() {
+                let mut extra_types: Vec<String> = extraneous
+                    .iter()
+                    .map(|ty| ty.spell(&self.viewpoint()))
+                    .collect();
+                extra_types.sort();
+                if !extra_types.is_empty() {
+                    self.pending_diags.push(PendingDiag::ExtraneousThrows {
+                        at: root,
+                        extra_types,
+                    });
+                }
             }
         }
         let mut result = std::mem::take(&mut self.result);
@@ -9348,7 +10961,7 @@ impl<'db> InferenceContext<'db> {
             .values_mut()
             .chain(result.type_of_pat.values_mut())
         {
-            *ty = self.finalize_ty(ty);
+            *ty = self.finalize_ty(ty).into_ty();
         }
         // Truthiness decisions deferred past the fixpoint (B-1563): a
         // condition still carrying an inference variable at check time
@@ -9359,8 +10972,8 @@ impl<'db> InferenceContext<'db> {
         // a definite failure joins the mismatch table (first writer per
         // expr wins - a direct mismatch is the better message).
         for (expr, expected, actual) in std::mem::take(&mut self.provisional_checks) {
-            let expected = self.finalize_ty(&expected);
-            let actual = self.finalize_ty(&actual);
+            let expected = self.finalize_ty(&expected).into_ty();
+            let actual = self.finalize_ty(&actual).into_ty();
             if expected.has_error() || actual.has_error() || self.cached_subtype(&actual, &expected)
             {
                 continue;
@@ -9371,8 +10984,8 @@ impl<'db> InferenceContext<'db> {
                 .or_insert((expected, actual));
         }
         for (expected, actual) in result.type_mismatches.values_mut() {
-            *expected = self.finalize_ty(expected);
-            *actual = self.finalize_ty(actual);
+            *expected = self.finalize_ty(expected).into_ty();
+            *actual = self.finalize_ty(actual).into_ty();
         }
         // S17: materialize the user-facing diagnostics - the finalized
         // mismatch table plus the pendings, in the shared vocabulary with
@@ -9383,6 +10996,14 @@ impl<'db> InferenceContext<'db> {
                 DiagnosticLocation, DiagnosticSeverity, TirDiagnostic, TirTypeError,
             };
             let mut diags: Vec<TirDiagnostic<'db>> = Vec::new();
+            for (location, error) in unresolved_infer_diagnostics {
+                diags.push(TirDiagnostic {
+                    error,
+                    severity: DiagnosticSeverity::Error,
+                    primary: location,
+                    related: Vec::new(),
+                });
+            }
             for (&expr, (expected, actual)) in &result.type_mismatches {
                 // rustc's tainted_by_errors discipline: a mismatch whose
                 // operand IS the error sentinel is a CASCADE of a reported
@@ -9392,7 +11013,7 @@ impl<'db> InferenceContext<'db> {
                 // elements to the sentinel without erasing the finding).
                 let tainted = |ty: &Ty| {
                     ty.has_error()
-                        && matches!(ty.kind(), TyKind::Error { .. } | TyKind::Unknown { .. })
+                        && matches!(ty.kind(), InferTy::Error { .. } | InferTy::Unknown { .. })
                 };
                 if tainted(expected) || tainted(actual) {
                     continue;
@@ -9406,14 +11027,14 @@ impl<'db> InferenceContext<'db> {
                 // The for-desugar's iterability failure reads as its own
                 // message (TIR's NotIterable), not a raw interface mismatch.
                 let error = match expected.kind() {
-                    TyKind::Interface(qtn, _, _, _)
-                        if qtn.package().as_str() == "baml"
+                    InferTy::Interface(qtn, _, _, _)
+                        if self.lang().is(baml_base::LangPackage::Baml, qtn.root())
                             && qtn.namespace().len() == 1
                             && qtn.namespace()[0].as_str() == "iter"
                             && qtn.name().as_str() == "Iterable" =>
                     {
                         TirTypeError::NotIterable {
-                            ty: actual.to_plain(),
+                            ty: self.materialize_ty(actual),
                         }
                     }
                     // BEP-044 wf3 #G18: a value that ALMOST implements an
@@ -9422,21 +11043,21 @@ impl<'db> InferenceContext<'db> {
                     // bound fails - names the unsatisfied bound (rustc's
                     // obligation-cause refinement of a fulfillment error)
                     // rather than a bare mismatch.
-                    TyKind::Interface(..) => {
+                    InferTy::Interface(..) => {
                         match self.first_failing_blanket_bound(actual, expected) {
                             Some(bound) => TirTypeError::BlanketBoundNotSatisfied {
-                                value_type: actual.to_plain(),
+                                value_type: self.materialize_ty(actual),
                                 bound,
                             },
                             None => TirTypeError::TypeMismatch {
-                                expected: expected.to_plain(),
-                                got: actual.to_plain(),
+                                expected: self.materialize_ty(expected),
+                                got: self.materialize_ty(actual),
                             },
                         }
                     }
                     _ => TirTypeError::TypeMismatch {
-                        expected: expected.to_plain(),
-                        got: actual.to_plain(),
+                        expected: self.materialize_ty(expected),
+                        got: self.materialize_ty(actual),
                     },
                 };
                 diags.push(TirDiagnostic {
@@ -9444,14 +11065,6 @@ impl<'db> InferenceContext<'db> {
                     severity: DiagnosticSeverity::Error,
                     primary: DiagnosticLocation::Expr(expr),
                     related: Vec::new(),
-                });
-            }
-            // The body LowerCtx's sink: every written annotation whose
-            // path resolved nowhere (E0002), anchored at its TypeRefId.
-            for lowering in self.lower.take_diagnostics() {
-                self.pending_diags.push(PendingDiag::BodyAnnot {
-                    type_ref: lowering.type_ref,
-                    kind: lowering.kind,
                 });
             }
             // A `_` hole that never solved reports E0147 at the hole
@@ -9477,7 +11090,7 @@ impl<'db> InferenceContext<'db> {
                     continue;
                 }
                 let location = match at {
-                    HoleAnchor::TypeRef(type_ref) => DiagnosticLocation::TypeRef(type_ref),
+                    HoleAnchor::TypeRef(type_ref) => DiagnosticLocation::BodyTypeRef(type_ref),
                 };
                 diags.push(TirDiagnostic {
                     error: TirTypeError::CannotInferType,
@@ -9495,7 +11108,7 @@ impl<'db> InferenceContext<'db> {
                         missing,
                     } => (
                         TirTypeError::NonExhaustiveMatch {
-                            scrutinee_type: self.finalize_ty(&scrutinee).to_plain(),
+                            scrutinee_type: self.plain_finalized(&scrutinee),
                             missing_cases: missing,
                         },
                         expr,
@@ -9515,20 +11128,26 @@ impl<'db> InferenceContext<'db> {
                         expr,
                         name,
                         suggestions,
-                    } => (TirTypeError::UnresolvedType { name, suggestions }, expr),
+                    } => (
+                        crate::diagnostics::removed_reflect_spelling(&name)
+                            .unwrap_or(TirTypeError::UnresolvedType { name, suggestions }),
+                        expr,
+                    ),
                     PendingDiag::PositionalAfterNamed { expr } => {
                         (TirTypeError::PositionalArgumentAfterNamed, expr)
                     }
                     PendingDiag::DuplicateNamedArg { expr, name } => {
                         (TirTypeError::DuplicateNamedArgument { name }, expr)
                     }
-                    PendingDiag::UnresolvedName { expr, name } => {
-                        (TirTypeError::UnresolvedName { name }, expr)
-                    }
+                    PendingDiag::UnresolvedName { expr, name } => (
+                        crate::diagnostics::removed_reflect_spelling(&name)
+                            .unwrap_or(TirTypeError::UnresolvedName { name }),
+                        expr,
+                    ),
                     PendingDiag::TopLevelLetCycle { expr } => (TirTypeError::CannotInferType, expr),
                     PendingDiag::UnresolvedMember { expr, base, member } => (
                         TirTypeError::UnresolvedMember {
-                            base_type: self.finalize_ty(&base).to_plain(),
+                            base_type: self.plain_finalized(&base),
                             member,
                         },
                         expr,
@@ -9537,7 +11156,7 @@ impl<'db> InferenceContext<'db> {
                         diags.push(TirDiagnostic {
                             error,
                             severity: DiagnosticSeverity::Error,
-                            primary: DiagnosticLocation::TypeRef(type_ref),
+                            primary: DiagnosticLocation::BodyTypeRef(type_ref),
                             related: Vec::new(),
                         });
                         continue;
@@ -9594,7 +11213,7 @@ impl<'db> InferenceContext<'db> {
                         is_field,
                     } => {
                         let receiver = baml_type::Name::new(
-                            self.finalize_ty(&base).to_plain().render_user_facing(),
+                            self.plain_finalized(&base).spell(&self.viewpoint()),
                         );
                         let sources: Vec<String> = sources
                             .iter()
@@ -9623,7 +11242,7 @@ impl<'db> InferenceContext<'db> {
                     } => (
                         TirTypeError::InterfaceFieldRequiresProjection {
                             class_name: baml_type::Name::new(
-                                self.finalize_ty(&base).to_plain().render_user_facing(),
+                                self.plain_finalized(&base).spell(&self.viewpoint()),
                             ),
                             field_name: member,
                             interface_name: baml_type::Name::new(
@@ -9649,23 +11268,15 @@ impl<'db> InferenceContext<'db> {
                     ),
                     PendingDiag::UnionNoCommonInterface { expr, base, member } => (
                         TirTypeError::UnionMemberNoCommonInterface {
-                            union: self.finalize_ty(&base).to_plain(),
+                            union: self.plain_finalized(&base),
                             member,
                         },
                         expr,
                     ),
                     PendingDiag::BoundedArgNotConcrete { expr, arg, bound } => (
                         TirTypeError::BoundedTypeArgNotConcrete {
-                            arg: self.finalize_ty(&arg).to_plain(),
-                            bound: Box::new([baml_type::Interface::new(
-                                bound.name.clone(),
-                                bound.generics.iter().map(Ty::to_plain).collect(),
-                                bound
-                                    .associated_types
-                                    .iter()
-                                    .map(|(name, ty)| (name.clone(), ty.to_plain()))
-                                    .collect(),
-                            )]),
+                            arg: self.plain_finalized(&arg),
+                            bound: Box::new([self.materialize_interface(&bound)]),
                         },
                         expr,
                     ),
@@ -9680,20 +11291,20 @@ impl<'db> InferenceContext<'db> {
                         },
                         object,
                     ),
-                    PendingDiag::UpcastTargetNotInterface { expr, target } => (
+                    PendingDiag::QualifierNotInterface { expr, target } => (
                         TirTypeError::InvalidInterfaceUpcastTarget {
-                            target: self.finalize_ty(&target).to_plain(),
+                            target: self.plain_finalized(&target),
                         },
                         expr,
                     ),
-                    PendingDiag::UpcastNotImplemented {
+                    PendingDiag::QualifierNotImplemented {
                         expr,
                         value,
                         interface,
                     } => (
                         TirTypeError::TypeDoesNotImplementInterface {
-                            value_type: self.finalize_ty(&value).to_plain(),
-                            interface: self.finalize_ty(&interface).to_plain(),
+                            value_type: self.plain_finalized(&value),
+                            interface: self.plain_finalized(&interface),
                         },
                         expr,
                     ),
@@ -9710,6 +11321,68 @@ impl<'db> InferenceContext<'db> {
                         },
                         expr,
                     ),
+                    PendingDiag::GenericFunctionValueNotSpecialized {
+                        expr,
+                        name,
+                        reference,
+                        inference_evidence,
+                        specialization_args,
+                        unconditional,
+                        had_expected_type,
+                        generic_params,
+                        binding_name,
+                        function_shape,
+                        annotation_ty,
+                        specialization_example_is_safe,
+                        specialization_syntax_available,
+                    } => {
+                        let has_unresolved_user_arg = inference_evidence
+                            .iter()
+                            .any(|arg| self.finalize_ty(arg).has_error());
+                        if !unconditional && !has_unresolved_user_arg {
+                            continue;
+                        }
+                        let specialization_example =
+                            if specialization_example_is_safe && specialization_syntax_available {
+                                let mut args = Vec::with_capacity(generic_params.len());
+                                if let Some(specialization_args) = specialization_args {
+                                    for arg in &specialization_args {
+                                        let finalized = self.finalize_ty(arg);
+                                        args.push(
+                                            rendered_plain(&diagnostic_example_ty(&finalized))
+                                                .spell(&self.viewpoint()),
+                                        );
+                                    }
+                                } else {
+                                    args.resize(generic_params.len(), "int".to_string());
+                                }
+                                Some(args.join(", "))
+                            } else {
+                                None
+                            };
+                        // Insertable source: an example naming a package this
+                        // package cannot spell is no example.
+                        let annotation_example = annotation_ty.and_then(|ty| {
+                            let finalized = self.finalize_ty(&ty);
+                            self.viewpoint()
+                                .source_text(&rendered_plain(&diagnostic_example_ty(&finalized)))
+                                .ok()
+                        });
+                        (
+                            TirTypeError::GenericFunctionValueNotSpecialized {
+                                name,
+                                reference,
+                                had_expected_type,
+                                generic_params,
+                                binding_name,
+                                function_shape,
+                                annotation_example,
+                                specialization_example,
+                                specialization_syntax_available,
+                            },
+                            expr,
+                        )
+                    }
                     PendingDiag::ComputedGenericArgumentRequiresUnreflect { expr, name } => (
                         TirTypeError::ComputedGenericArgumentRequiresUnreflect { name },
                         expr,
@@ -9717,27 +11390,29 @@ impl<'db> InferenceContext<'db> {
                     PendingDiag::MountedPackageCallUnsupported { expr, path } => {
                         (TirTypeError::MountedPackageCallUnsupported { path }, expr)
                     }
-                    PendingDiag::RuntimeTypeArgumentOnStreamingCall { expr, callee } => (
-                        TirTypeError::RuntimeTypeArgumentOnStreamingCall {
-                            callee_name: callee,
-                        },
-                        expr,
-                    ),
-                    PendingDiag::RuntimeTypeArgumentOnIndirectCall { expr } => {
-                        (TirTypeError::RuntimeTypeArgumentOnIndirectCall, expr)
-                    }
-                    PendingDiag::RuntimeTypeMustBeNamed {
-                        carrier,
-                        enclosing,
-                        escape,
+                    PendingDiag::ScopedTypeEscapesBlock {
+                        at,
+                        name,
+                        value,
+                        kind,
                     } => {
-                        diags.push(TirDiagnostic {
-                            error: TirTypeError::RuntimeTypeMustBeNamed { escape },
-                            severity: DiagnosticSeverity::Error,
-                            primary: DiagnosticLocation::UnreflectArg { carrier, enclosing },
-                            related: Vec::new(),
-                        });
-                        continue;
+                        let value = self.plain_finalized(&value);
+                        // The thrown type is final here, so this is where the
+                        // remedy the label names can be computed rather than
+                        // described.
+                        let kind = match kind {
+                            ScopedTypeEscapeKind::Thrown { .. } => ScopedTypeEscapeKind::Thrown {
+                                relaxation: Some(nearest_scoped_relaxation(
+                                    &value,
+                                    RelaxationVariance::Covariant,
+                                )),
+                            },
+                            other => other,
+                        };
+                        (
+                            TirTypeError::ScopedTypeEscapesBlock { name, value, kind },
+                            at,
+                        )
                     }
                     PendingDiag::CannotConstructReflectionKind { expr, class_name } => (
                         TirTypeError::CannotConstructReflectionKind { class_name },
@@ -9756,7 +11431,7 @@ impl<'db> InferenceContext<'db> {
                     ),
                     PendingDiag::NotCallable { expr, ty } => (
                         TirTypeError::NotCallable {
-                            ty: self.finalize_ty(&ty).to_plain(),
+                            ty: self.plain_finalized(&ty),
                         },
                         expr,
                     ),
@@ -9775,8 +11450,8 @@ impl<'db> InferenceContext<'db> {
                         rhs,
                     } => {
                         use baml_compiler2_ast::{BinaryOp, UnaryOp};
-                        let lhs = self.finalize_ty(&lhs).to_plain();
-                        let rhs = rhs.map(|ty| self.finalize_ty(&ty).to_plain());
+                        let lhs = self.plain_finalized(&lhs);
+                        let rhs = rhs.map(|ty| self.plain_finalized(&ty));
                         let error = match (interface, rhs) {
                             ("Index", _) => TirTypeError::NotIndexable { ty: lhs },
                             ("Negate", _) => TirTypeError::InvalidUnaryOp {
@@ -9814,10 +11489,13 @@ impl<'db> InferenceContext<'db> {
                     }
                     PendingDiag::InterpolatedMaybeNull { expr, ty } => (
                         TirTypeError::InterpolatedValueMaybeNull {
-                            ty: self.finalize_ty(&ty).to_plain(),
+                            ty: self.plain_finalized(&ty),
                         },
                         expr,
                     ),
+                    PendingDiag::BareOutputFormatReference { expr } => {
+                        (TirTypeError::OutputFormatNotCalled, expr)
+                    }
                     PendingDiag::ConditionAlwaysConst {
                         expr,
                         ty,
@@ -9825,7 +11503,7 @@ impl<'db> InferenceContext<'db> {
                     } => {
                         diags.push(TirDiagnostic {
                             error: TirTypeError::ConditionAlwaysConstant {
-                                ty: self.finalize_ty(&ty).to_plain(),
+                                ty: self.plain_finalized(&ty),
                                 always_true,
                             },
                             severity: DiagnosticSeverity::Warning,
@@ -9891,8 +11569,104 @@ impl<'db> InferenceContext<'db> {
                     PendingDiag::VoidResultUsed { expr } => {
                         (TirTypeError::VoidFunctionResultUsed, expr)
                     }
+                    PendingDiag::SelflessInstanceMember {
+                        expr,
+                        interface_name,
+                        member,
+                    } => (
+                        TirTypeError::SelflessInstanceMember {
+                            interface_name,
+                            method_name: member,
+                        },
+                        expr,
+                    ),
+                    PendingDiag::ItemProjectionSelfSlot {
+                        expr,
+                        var,
+                        interface,
+                        member,
+                        takes_self,
+                        value_position,
+                    } => {
+                        let slot = self.finalize_ty(&var);
+                        // `never` names no implementor (it satisfies any bound
+                        // vacuously by subtyping, which is exactly why it must
+                        // be caught here), and a LITERAL type is not an
+                        // implementor either — impls attach to its base, so a
+                        // `Self`-returning method would produce a base-typed
+                        // value inhabiting the literal type.
+                        if matches!(slot.kind(), InferTy::Never { .. } | InferTy::Literal(..)) {
+                            diags.push(TirDiagnostic {
+                                error: TirTypeError::SelflessMethodNeedsConcreteSelf {
+                                    interface_name: baml_type::Name::new(
+                                        self.qualified_interface_display(&interface),
+                                    ),
+                                    method_name: member,
+                                    self_ty: self.materialize_ty(&slot),
+                                },
+                                severity: DiagnosticSeverity::Error,
+                                primary: DiagnosticLocation::Expr(expr),
+                                related: Vec::new(),
+                            });
+                            continue;
+                        }
+                        if !matches!(slot.kind(), InferTy::Interface(..) | InferTy::Union(..)) {
+                            continue;
+                        }
+                        if !takes_self {
+                            (
+                                TirTypeError::SelflessMethodNeedsConcreteSelf {
+                                    interface_name: baml_type::Name::new(
+                                        self.qualified_interface_display(&interface),
+                                    ),
+                                    method_name: member,
+                                    self_ty: self.materialize_ty(&slot),
+                                },
+                                expr,
+                            )
+                        } else if let Some(position) =
+                            crate::method_resolution::declared_method_self_restriction(
+                                self.db,
+                                &self.facts,
+                                &interface,
+                                &member,
+                            )
+                        {
+                            (
+                                TirTypeError::InvalidSelfCallThroughInterface {
+                                    interface_name: baml_type::Name::new(
+                                        self.qualified_interface_display(&interface),
+                                    ),
+                                    method_name: member,
+                                    position,
+                                },
+                                expr,
+                            )
+                        } else if value_position {
+                            (
+                                TirTypeError::ErasedSelfMethodValue {
+                                    interface_name: baml_type::Name::new(
+                                        self.qualified_interface_display(&interface),
+                                    ),
+                                    method_name: member,
+                                    self_ty: self.materialize_ty(&slot),
+                                },
+                                expr,
+                            )
+                        } else {
+                            continue;
+                        }
+                    }
                     PendingDiag::UninferredCtorParam { expr, var, name } => {
                         if !self.finalize_ty(&var).has_error() {
+                            continue;
+                        }
+                        // A slot an escape refusal filled already carries that
+                        // report; only a slot nothing spoke for is "cannot
+                        // infer".
+                        if let InferTy::InferVar { var: slot, .. } = var.kind()
+                            && self.refused_escape_vars.contains(slot)
+                        {
                             continue;
                         }
                         diags.push(TirDiagnostic {
@@ -9908,7 +11682,7 @@ impl<'db> InferenceContext<'db> {
                         expected_input,
                         got,
                     } => {
-                        let got = self.finalize_ty(&got).to_plain();
+                        let got = self.plain_finalized(&got);
                         // A flow-narrowed literal reads as its base in the
                         // contract wording (`got int`, not `got 7`).
                         let got = match got {
@@ -9926,7 +11700,7 @@ impl<'db> InferenceContext<'db> {
                         };
                         diags.push(TirDiagnostic {
                             error: TirTypeError::SpawnWithNotATransformer {
-                                expected_input: self.finalize_ty(&expected_input).to_plain(),
+                                expected_input: self.plain_finalized(&expected_input),
                                 got,
                             },
                             severity: DiagnosticSeverity::Error,
@@ -9939,6 +11713,22 @@ impl<'db> InferenceContext<'db> {
                         diags.push(TirDiagnostic {
                             error: TirTypeError::ExtraneousThrowsDeclaration { extra_types },
                             severity: DiagnosticSeverity::Warning,
+                            primary: DiagnosticLocation::Expr(at),
+                            related: Vec::new(),
+                        });
+                        continue;
+                    }
+                    PendingDiag::ImpreciseUnknownThrows {
+                        at,
+                        inferred,
+                        needs_declaration,
+                    } => {
+                        diags.push(TirDiagnostic {
+                            error: TirTypeError::ImpreciseUnknownThrows {
+                                inferred,
+                                needs_declaration,
+                            },
+                            severity: DiagnosticSeverity::Error,
                             primary: DiagnosticLocation::Expr(at),
                             related: Vec::new(),
                         });
@@ -9962,6 +11752,36 @@ impl<'db> InferenceContext<'db> {
                         });
                         continue;
                     }
+                    PendingDiag::ReturnTypeMismatch {
+                        stmt,
+                        expr,
+                        expected,
+                        actual,
+                    } => {
+                        let expected = self.finalize_ty(&expected);
+                        let actual = self.finalize_ty(&actual);
+                        if expected.has_error()
+                            || actual.has_error()
+                            || self.cached_subtype(&actual, &expected)
+                        {
+                            continue;
+                        }
+                        let primary = match (stmt, expr) {
+                            (Some(stmt), _) => DiagnosticLocation::Stmt(stmt),
+                            (None, Some(expr)) => DiagnosticLocation::Expr(expr),
+                            (None, None) => unreachable!("one anchor is always set"),
+                        };
+                        diags.push(TirDiagnostic {
+                            error: TirTypeError::TypeMismatch {
+                                expected: expected.to_plain(),
+                                got: actual.to_plain(),
+                            },
+                            severity: DiagnosticSeverity::Error,
+                            primary,
+                            related: Vec::new(),
+                        });
+                        continue;
+                    }
                     PendingDiag::UnresolvedShorthand {
                         expr,
                         name,
@@ -9979,8 +11799,8 @@ impl<'db> InferenceContext<'db> {
                         diags.push(TirDiagnostic {
                             error: TirTypeError::ComparisonAlwaysDisjoint {
                                 op,
-                                lhs: self.finalize_ty(&lhs).to_plain(),
-                                rhs: self.finalize_ty(&rhs).to_plain(),
+                                lhs: self.plain_finalized(&lhs),
+                                rhs: self.plain_finalized(&rhs),
                             },
                             severity: DiagnosticSeverity::Warning,
                             primary: DiagnosticLocation::Expr(at),
@@ -9992,8 +11812,8 @@ impl<'db> InferenceContext<'db> {
                         diags.push(TirDiagnostic {
                             error: TirTypeError::OrderingDifferentTypes {
                                 op,
-                                lhs: self.finalize_ty(&lhs).to_plain(),
-                                rhs: self.finalize_ty(&rhs).to_plain(),
+                                lhs: self.plain_finalized(&lhs),
+                                rhs: self.plain_finalized(&rhs),
                             },
                             severity: DiagnosticSeverity::Error,
                             primary: DiagnosticLocation::Expr(at),
@@ -10005,7 +11825,7 @@ impl<'db> InferenceContext<'db> {
                         diags.push(TirDiagnostic {
                             error: TirTypeError::OrderingRequiresCompare {
                                 op,
-                                ty: self.finalize_ty(&ty).to_plain(),
+                                ty: self.plain_finalized(&ty),
                             },
                             severity: DiagnosticSeverity::Error,
                             primary: DiagnosticLocation::Expr(at),
@@ -10040,6 +11860,22 @@ impl<'db> InferenceContext<'db> {
                             error,
                             severity: DiagnosticSeverity::Error,
                             primary: DiagnosticLocation::ObjectFieldName(object, value),
+                            related: Vec::new(),
+                        });
+                        continue;
+                    }
+                    PendingDiag::MissingRequiredObjectFields {
+                        object,
+                        class_name,
+                        field_names,
+                    } => {
+                        diags.push(TirDiagnostic {
+                            error: TirTypeError::MissingRequiredClassFields {
+                                class_name,
+                                field_names,
+                            },
+                            severity: DiagnosticSeverity::Error,
+                            primary: DiagnosticLocation::Expr(object),
                             related: Vec::new(),
                         });
                         continue;
@@ -10083,7 +11919,7 @@ impl<'db> InferenceContext<'db> {
                         // A synthetic-effect-param extra traces to a
                         // CALLBACK parameter: the humanized wording names
                         // it (TIR's CallbackThrowsContractViolation).
-                        if let TyKind::TypeVar(param, _) = extra.kind()
+                        if let InferTy::TypeVar(param, _) = extra.kind()
                             && baml_type::is_synthetic_effect_param(param.name())
                             && let Some(callback) = self.callback_param_for_effect(param)
                         {
@@ -10099,14 +11935,11 @@ impl<'db> InferenceContext<'db> {
                             });
                             continue;
                         }
-                        let extra_types: Vec<String> =
-                            crate::throw_facts::flatten_declared_ty_to_facts(&extra.to_plain())
-                                .into_iter()
-                                .map(|fact| fact.render_user_facing())
-                                .collect();
-                        if extra_types.is_empty() {
+                        let Some(extra_union) = throws_clause_union(
+                            crate::throw_facts::flatten_declared_ty_to_facts(&extra.to_plain()),
+                        ) else {
                             continue;
-                        }
+                        };
                         // The error-CHANNEL pin (B-1082): a surviving
                         // violation also records on the mismatch channel
                         // at the thrown value. This runs AFTER the
@@ -10115,11 +11948,11 @@ impl<'db> InferenceContext<'db> {
                         result
                             .type_mismatches
                             .entry(at)
-                            .or_insert((declared.clone(), extra.clone()));
+                            .or_insert((declared.clone().into_ty(), extra.clone().into_ty()));
                         diags.push(TirDiagnostic {
                             error: TirTypeError::ThrowsContractViolation {
                                 declared: declared.to_plain(),
-                                extra_types,
+                                extra: extra_union,
                             },
                             severity: DiagnosticSeverity::Error,
                             primary: DiagnosticLocation::Expr(at),
@@ -10134,8 +11967,8 @@ impl<'db> InferenceContext<'db> {
                     } => {
                         diags.push(TirDiagnostic {
                             error: TirTypeError::TypeMismatch {
-                                expected: self.finalize_ty(&expected).to_plain(),
-                                got: self.finalize_ty(&found).to_plain(),
+                                expected: self.plain_finalized(&expected),
+                                got: self.plain_finalized(&found),
                             },
                             severity: DiagnosticSeverity::Error,
                             primary: DiagnosticLocation::Pat(pat),
@@ -10145,7 +11978,8 @@ impl<'db> InferenceContext<'db> {
                     }
                     PendingDiag::UnresolvedPatternName { pat, name } => {
                         diags.push(TirDiagnostic {
-                            error: TirTypeError::UnresolvedName { name },
+                            error: crate::diagnostics::removed_reflect_spelling(&name)
+                                .unwrap_or(TirTypeError::UnresolvedName { name }),
                             severity: DiagnosticSeverity::Error,
                             primary: DiagnosticLocation::Pat(pat),
                             related: Vec::new(),
@@ -10170,8 +12004,8 @@ impl<'db> InferenceContext<'db> {
                         diags.push(TirDiagnostic {
                             error: TirTypeError::OrPatternBindingTypeMismatch {
                                 name,
-                                first_type: self.finalize_ty(&first).to_plain(),
-                                other_type: self.finalize_ty(&other).to_plain(),
+                                first_type: self.plain_finalized(&first),
+                                other_type: self.plain_finalized(&other),
                             },
                             severity: DiagnosticSeverity::Error,
                             primary: DiagnosticLocation::Pat(pat),
@@ -10194,7 +12028,7 @@ impl<'db> InferenceContext<'db> {
                         diags.push(TirDiagnostic {
                             error: crate::lower::lowering_diag_error(&kind),
                             severity: DiagnosticSeverity::Error,
-                            primary: DiagnosticLocation::TypeRef(type_ref),
+                            primary: DiagnosticLocation::BodyTypeRef(type_ref),
                             related: Vec::new(),
                         });
                         continue;
@@ -10210,7 +12044,7 @@ impl<'db> InferenceContext<'db> {
                     }
                     PendingDiag::LetElseMustDiverge { expr, got } => (
                         TirTypeError::LetElseMustDiverge {
-                            got: self.finalize_ty(&got).to_plain(),
+                            got: self.plain_finalized(&got),
                         },
                         expr,
                     ),
@@ -10234,13 +12068,13 @@ impl<'db> InferenceContext<'db> {
                 DiagnosticLocation::Expr(id)
                 | DiagnosticLocation::ExprMember(id)
                 | DiagnosticLocation::ExprSegment(id, _)
+                | DiagnosticLocation::LambdaParameter(id, _)
                 | DiagnosticLocation::ObjectFieldName(_, id) => (0u8, u32::from(id.into_raw())),
                 DiagnosticLocation::Stmt(id) => (1, u32::from(id.into_raw())),
                 DiagnosticLocation::TypeAnnot(id) => (2, u32::from(id.into_raw())),
                 DiagnosticLocation::Pat(id) => (4, u32::from(id.into_raw())),
-                DiagnosticLocation::TypeRef(id) => (5, u32::from(id.into_raw())),
-                DiagnosticLocation::UnreflectArg { carrier, .. } => {
-                    (6, u32::from(carrier.into_raw()))
+                DiagnosticLocation::BodyTypeRef(id) => {
+                    (5, u32::from(self.type_refs.raw_id(id).into_raw()))
                 }
                 DiagnosticLocation::Span(range) => (3, u32::from(range.start())),
             });
@@ -10251,99 +12085,47 @@ impl<'db> InferenceContext<'db> {
         // `resolve_type_vars_in_body`): the virtual-field VIEW and the
         // path ladders' per-segment types carry types.
         for resolution in result.member_resolutions.values_mut() {
-            if let MemberResolution::InterfaceVirtualField { view, .. }
-            | MemberResolution::ExternalInterfaceVirtualField { view, .. } = resolution
-            {
-                *view = self.finalize_ty(view);
-            }
+            finalize_member_resolution(&mut self, resolution);
         }
         for path in result.path_resolutions.values_mut() {
             for segment in &mut path.segments {
-                segment.ty = self.finalize_ty(&segment.ty);
-                if let Some(
-                    MemberResolution::InterfaceVirtualField { view, .. }
-                    | MemberResolution::ExternalInterfaceVirtualField { view, .. },
-                ) = &mut segment.resolution
-                {
-                    *view = self.finalize_ty(view);
+                segment.ty = self.finalize_ty(&segment.ty).into_ty();
+                if let Some(resolution) = &mut segment.resolution {
+                    finalize_member_resolution(&mut self, resolution);
                 }
             }
         }
         for plan in result.call_plans.values_mut() {
             for ty in &mut plan.type_args {
-                *ty = self.finalize_ty(ty);
+                *ty = self.finalize_ty(ty).into_ty();
             }
-            for slot in &mut plan.slots {
-                match slot {
-                    CallTypeArgPlan::Static { ty, emission_ty } => {
-                        *ty = self.finalize_ty(ty);
-                        *emission_ty = self.finalize_emission_ty(emission_ty);
-                    }
-                    CallTypeArgPlan::Runtime { occurrence_ty, .. } => {
-                        *occurrence_ty = self.finalize_ty(occurrence_ty);
-                    }
-                }
-            }
-            for check in &mut plan.deferred_checks {
-                match check {
-                    RuntimeCheck::Argument { expected, .. } => {
-                        *expected = self.finalize_ty(expected);
-                    }
-                    RuntimeCheck::Bound { argument, bound } => {
-                        *argument = self.finalize_ty(argument);
-                        *bound = InterfaceRef::new(
-                            bound.name.clone(),
-                            bound
-                                .generics
-                                .iter()
-                                .map(|ty| self.finalize_ty(ty))
-                                .collect(),
-                            bound
-                                .associated_types
-                                .iter()
-                                .map(|(name, ty)| (name.clone(), self.finalize_ty(ty)))
-                                .collect(),
-                        );
-                    }
-                }
-            }
-        }
-        for check in &mut result.runtime_checks {
-            match check {
-                RuntimeCheck::Argument { expected, .. } => {
-                    *expected = self.finalize_ty(expected);
-                }
-                RuntimeCheck::Bound { argument, bound } => {
-                    *argument = self.finalize_ty(argument);
-                    *bound = InterfaceRef::new(
-                        bound.name.clone(),
-                        bound
-                            .generics
-                            .iter()
-                            .map(|ty| self.finalize_ty(ty))
-                            .collect(),
-                        bound
-                            .associated_types
-                            .iter()
-                            .map(|(name, ty)| (name.clone(), self.finalize_ty(ty)))
-                            .collect(),
-                    );
-                }
+            for CallTypeArgPlan { ty, emission_ty } in &mut plan.slots {
+                *ty = self.finalize_ty(ty).into_ty();
+                *emission_ty = self.finalize_emission_ty(emission_ty).into_ty();
             }
         }
         for adjustments in result.expr_adjustments.values_mut() {
             for adjustment in adjustments.iter_mut() {
-                adjustment.target = self.finalize_ty(&adjustment.target);
+                adjustment.target = self.finalize_ty(&adjustment.target).into_ty();
             }
         }
-        result
+        self.materialize_result(result)
+    }
+
+    /// [`finalize_ty`](Self::finalize_ty) + the total plain exit: the
+    /// one-step form for diagnostic payloads and other plain-vocabulary
+    /// consumers inside `finish`.
+    fn plain_finalized(&mut self, ty: &Ty) -> baml_type::Ty {
+        self.finalize_ty(ty).to_plain()
     }
 
     /// One recorded type, finalized: solved variables substituted,
     /// survivors erased to the local Error sentinel, unions
     /// re-canonicalized (skipped for error-carrying types - the canonical
     /// algebra is Error-tolerant and would collapse them arbitrarily).
-    fn finalize_ty(&mut self, ty: &Ty) -> Ty {
+    /// The [`ClosedTy`] return IS the finalize guarantee: nothing leaves
+    /// this function still carrying a variable.
+    fn finalize_ty(&mut self, ty: &Ty) -> ClosedTy {
         let resolved = self.table.resolve_completely(ty);
         let erased = erase_infer(&resolved);
         if erased.has_error() {
@@ -10361,7 +12143,7 @@ impl<'db> InferenceContext<'db> {
     /// substitution, inference cleanup, and mandatory projection reduction as
     /// semantic finalization, but deliberately leaves every union node in its
     /// written order instead of applying union set algebra.
-    fn finalize_emission_ty(&mut self, ty: &Ty) -> Ty {
+    fn finalize_emission_ty(&mut self, ty: &Ty) -> ClosedTy {
         let resolved = self.table.resolve_completely(ty);
         let erased = erase_infer(&resolved);
         self.reduce_projections(&erased, PROJECTION_FINALIZE_FUEL)
@@ -10374,50 +12156,32 @@ impl<'db> InferenceContext<'db> {
     /// `(IntStore as Store).Item` finalizes as `int`. Targeted rather than
     /// full canonicalization, which would also expand nominal aliases;
     /// renders keep those by design.
-    fn reduce_projections(&self, ty: &Ty, fuel: u32) -> Ty {
+    fn reduce_projections(&self, ty: &ClosedTy, fuel: u32) -> ClosedTy {
         if fuel == 0 || !ty.has_projection() {
             return ty.clone();
         }
-        let rebuilt = Ty::intern(
-            ty.kind()
-                .map_children(|child| self.reduce_projections(child, fuel)),
-        );
-        // Node-local normalization (rustc's lazy normalize): a projection
-        // reduces when ITS OWN subtree is ground - var-carrying siblings
-        // elsewhere in the type are irrelevant to this lookup. A
-        // var-carrying projection stays (the oracle's plain conversion
-        // erases inference vars).
-        if rebuilt.has_infer() {
-            return rebuilt;
-        }
-        if let TyKind::AssociatedTypeProjection {
-            base,
-            interface,
-            member,
-            ..
-        } = rebuilt.kind()
-        {
-            let plain_base = base.to_plain();
-            let plain_interface = baml_type::Interface::new(
-                interface.name.clone(),
-                interface.generics.iter().map(Ty::to_plain).collect(),
-                interface
-                    .associated_types
-                    .iter()
-                    .map(|(name, pin)| (name.clone(), pin.to_plain()))
-                    .collect(),
-            );
-            if let baml_type::normalize::ProjectionStep::Reduced(step) =
+        let rebuilt = ty.map_children(|child| self.reduce_projections(child, fuel));
+        // Node-local normalization (rustc's lazy normalize): a ground
+        // projection reduces through the oracle. The closed descent means
+        // the plain image is total; destructuring it hands the oracle its
+        // native vocabulary in one step.
+        if let InferTy::AssociatedTypeProjection { .. } = rebuilt.kind()
+            && let baml_type::Ty::AssociatedTypeProjection {
+                base,
+                interface,
+                member,
+                ..
+            } = rebuilt.to_plain()
+            && let baml_type::normalize::ProjectionStep::Reduced(step) =
                 baml_type::normalize::TypeContext::project(
                     &self.facts,
-                    &plain_base,
-                    &plain_interface,
-                    member,
+                    &base,
+                    &interface,
+                    &member,
                     fuel,
                 )
-            {
-                return self.reduce_projections(&Ty::from_plain(&step), fuel - 1);
-            }
+        {
+            return self.reduce_projections(&ClosedTy::from_plain(&step), fuel - 1);
         }
         rebuilt
     }
@@ -10431,15 +12195,13 @@ impl<'db> InferenceContext<'db> {
     /// oracle cannot determine stays the error sentinel: iteration over
     /// a type with no `Iterable` evidence has no element type.
     fn iteration_item(&mut self, collection: &Ty, at: ExprId) -> Ty {
-        let iterable = baml_type::interned::InterfaceRef::new(
-            baml_type::TypeName::new(
-                baml_type::Name::new("baml"),
-                vec![baml_type::Name::new("iter")],
-                baml_type::Name::new("Iterable"),
-            ),
-            Box::new([]),
-            Vec::new(),
-        );
+        let Some(iterable_decl) =
+            self.lang_decl(baml_base::LangPackage::Baml, &["iter"], "Iterable")
+        else {
+            return Ty::error();
+        };
+        let iterable =
+            baml_type::interned::InferInterface::new(iterable_decl, Box::new([]), Box::new([]));
         // rustc's for-desugar is an `into_iter` CALL: the iterability
         // obligation registers against the collection (selection
         // forces its vars; an unsatisfiable subject records the
@@ -10454,7 +12216,7 @@ impl<'db> InferenceContext<'db> {
             not_concrete_rejects: false,
         });
         let existential = iterable.existential();
-        let projection = Ty::intern(TyKind::AssociatedTypeProjection {
+        let projection = Ty::intern(InferTy::AssociatedTypeProjection {
             base: collection.clone(),
             interface: iterable,
             member: baml_type::Name::new("Item"),
@@ -10473,10 +12235,16 @@ impl<'db> InferenceContext<'db> {
             // which `lower_to_runtime` carries for per-receiver dispatch;
             // erasing it to an error rejected legal generic and union
             // collections without any diagnostic (the shipped abort).
+            // Judge only a CLOSED collection (an open one defers to later
+            // resolution, as before), and canonicalize only under that
+            // gate: the semantic join is meaningless on open input, and
+            // running it first was a latent ICE.
             let collection = self.table.resolve_completely(collection);
-            let collection = self.canonicalize_unions(&collection);
-            if !collection.has_infer() && !self.cached_subtype(&collection, &existential) {
-                return Ty::error();
+            if let Ok(collection) = ClosedTy::try_from(&collection) {
+                let canonical = self.canonicalize_unions(&collection);
+                if !self.cached_subtype(&canonical, &existential) {
+                    return Ty::error();
+                }
             }
         }
         reduced
@@ -10491,44 +12259,50 @@ impl<'db> InferenceContext<'db> {
     /// canonical sort is an internal detail load-bearing for the TIR-era
     /// tier snapshots, so the convention applies at this crate's result
     /// boundary; it folds into the shared algebra at cutover (S16).
-    fn canonicalize_unions(&self, ty: &Ty) -> Ty {
+    fn canonicalize_unions(&self, ty: &ClosedTy) -> ClosedTy {
         match ty.kind() {
-            TyKind::Union(members, _) => {
-                let members: Vec<Ty> = members
-                    .iter()
-                    .map(|member| self.canonicalize_unions(member))
-                    .collect();
+            InferTy::Union(..) => {
+                let mut members: Vec<ClosedTy> = Vec::new();
+                ty.for_each_child(|member| members.push(self.canonicalize_unions(member)));
                 // Error-carrying unions clean up STRUCTURALLY only:
                 // the canonical algebra's equivalence treats the Error
                 // sentinel as bidirectionally compatible (checking's
                 // cascade suppression), so a container member like
                 // `!error[]` would MERGE into `int[]` and vanish.
                 // rustc's discipline is the opposite for identity -
-                // `TyKind::Error` equals only itself in canonical
+                // `InferTy::Error` equals only itself in canonical
                 // forms; compat lives in the relate layer alone.
                 // Until the shared algebra splits those roles (S16,
                 // when TIR stops consuming it), flatten/dedup/collapse
                 // here and skip absorption.
-                if members.iter().any(Ty::has_error) {
-                    return syntactic_union(&members);
+                if members.iter().any(|member| member.has_error()) {
+                    let raw: Vec<Ty> = members
+                        .iter()
+                        .map(|member| member.as_ty().clone())
+                        .collect();
+                    return ClosedTy::try_from(syntactic_union(&raw)).unwrap_or_else(|_| {
+                        unreachable!("a syntactic union of closed members is closed")
+                    });
                 }
                 let joined = canonical_union_interned(&members, &self.facts);
                 match joined.kind() {
-                    TyKind::Union(members, attr) => {
+                    InferTy::Union(members, attr) => {
                         let (mut ordered, nulls): (Vec<Ty>, Vec<Ty>) = members
                             .iter()
                             .cloned()
-                            .partition(|member| !matches!(member.kind(), TyKind::Null { .. }));
+                            .partition(|member| !matches!(member.kind(), InferTy::Null { .. }));
                         ordered.extend(nulls);
-                        Ty::intern(TyKind::Union(ordered.into(), attr.clone()))
+                        ClosedTy::try_from(Ty::intern(InferTy::Union(ordered.into(), attr.clone())))
+                            .unwrap_or_else(|_| {
+                                unreachable!(
+                                    "reordering a closed union's members preserves closedness"
+                                )
+                            })
                     }
                     _ => joined,
                 }
             }
-            _ => Ty::intern(
-                ty.kind()
-                    .map_children(|child| self.canonicalize_unions(child)),
-            ),
+            _ => ty.map_children(|child| self.canonicalize_unions(child)),
         }
     }
 
@@ -10572,7 +12346,7 @@ impl<'db> InferenceContext<'db> {
                 .lowers
                 .iter()
                 .chain(bounds.uppers.iter())
-                .all(|ty| !self.table.resolve_completely(ty).has_infer());
+                .all(|bound| !self.table.resolve_completely(&bound.ty).has_infer());
             if !fully_ground {
                 return false;
             }
@@ -10599,15 +12373,21 @@ impl<'db> InferenceContext<'db> {
         if self.table.is_solved(var) {
             return false;
         }
-        let (lowers, deferred_lowers): (Vec<Ty>, Vec<Ty>) = bounds
+        let (lower_bounds, deferred_lowers): (Vec<unify::Bound>, Vec<unify::Bound>) = bounds
             .lowers
             .iter()
-            .map(|ty| self.table.resolve_completely(ty))
-            .partition(|ty| !ty.has_infer());
-        let (uppers, deferred_uppers): (Vec<Ty>, Vec<Ty>) = bounds
+            .map(|bound| unify::Bound {
+                ty: self.table.resolve_completely(&bound.ty),
+                anchor: bound.anchor,
+            })
+            .partition(|bound| !bound.ty.has_infer());
+        let (upper_bounds, deferred_uppers): (Vec<unify::Bound>, Vec<unify::Bound>) = bounds
             .uppers
             .iter()
-            .map(|ty| self.table.resolve_completely(ty))
+            .map(|bound| unify::Bound {
+                ty: self.table.resolve_completely(&bound.ty),
+                anchor: bound.anchor,
+            })
             // A TOP-TYPE upper is no constraint (everything satisfies
             // it) and therefore no EVIDENCE: the minimum-upper meet must
             // not commit a class to `unknown` from a vacuous bound while
@@ -10615,8 +12395,10 @@ impl<'db> InferenceContext<'db> {
             // only the declared `throws unknown` check when the lambda's
             // `never` has not landed yet). Informative uppers keep the
             // meet (B-898's `?D <= Generate<int>` solves the class).
-            .filter(|ty| !matches!(ty.kind(), TyKind::Unknown { .. }))
-            .partition(|ty| !ty.has_infer());
+            .filter(|bound| !matches!(bound.ty.kind(), InferTy::Unknown { .. }))
+            .partition(|bound| !bound.ty.has_infer());
+        let lowers: Vec<Ty> = lower_bounds.iter().map(|bound| bound.ty.clone()).collect();
+        let uppers: Vec<Ty> = upper_bounds.iter().map(|bound| bound.ty.clone()).collect();
         if lowers.is_empty() && uppers.is_empty() {
             // GENERALIZATION (rustc's combine/generalize shape):
             // a var whose only information is one var-carrying
@@ -10634,12 +12416,12 @@ impl<'db> InferenceContext<'db> {
             // conflicting bound is a mismatch, not a join.
             if deferred_uppers.is_empty()
                 && let Some((first, rest)) = deferred_lowers.split_first()
-                && rest.iter().all(|lower| lower == first)
+                && rest.iter().all(|lower| lower.ty == first.ty)
             {
                 // No widening here: this tier is occurs-guarded
                 // ALIASING, not a meet, and a deferred (var-carrying)
                 // lower can never be a top-level fresh literal anyway.
-                let alias = first.clone();
+                let alias = first.ty.clone();
                 if self.table.unify(&Ty::infer_var(var), &alias).is_ok() {
                     return true;
                 }
@@ -10648,10 +12430,12 @@ impl<'db> InferenceContext<'db> {
         }
         let var_ty = Ty::infer_var(var);
         for deferred in deferred_lowers {
-            self.deferred_subs.push((deferred, var_ty.clone(), None));
+            self.deferred_subs
+                .push((deferred.ty, var_ty.clone(), deferred.anchor));
         }
         for deferred in deferred_uppers {
-            self.deferred_subs.push((var_ty.clone(), deferred, None));
+            self.deferred_subs
+                .push((var_ty.clone(), deferred.ty, deferred.anchor));
         }
         let solution = if lowers.is_empty() {
             // No values flowed in: the MINIMUM upper is the meet
@@ -10733,15 +12517,17 @@ impl<'db> InferenceContext<'db> {
                     maximum
                 }
                 _ => {
-                    // No join: genuinely incompatible demands. An empty
-                    // CONTAINER's slot follows TIR's establishment-order
-                    // rule - the FIRST ground demand wins so the binding
-                    // stays usable and every later incompatible demand
-                    // (and any violated upper) reports through the
-                    // provisional re-check at finalize. Any other var (a
-                    // call instantiation) fails resolution instead
-                    // (ruling 1: disagreeing lowers reject, not join).
-                    if self.table.is_establishment_var(var) {
+                    // No join: genuinely incompatible demands. A monomorphic
+                    // source with no initial type follows first-demand order:
+                    // the first ground demand wins so later incompatible
+                    // demands report through the provisional re-check at
+                    // finalize. Other vars, such as call instantiations, fail
+                    // resolution instead.
+                    if self
+                        .table
+                        .unsolved_policy(var)
+                        .is_some_and(unify::VarPolicy::first_demand_commits)
+                    {
                         widened.first().cloned().unwrap_or_else(Ty::error)
                     } else {
                         return false;
@@ -10749,6 +12535,34 @@ impl<'db> InferenceContext<'db> {
                 }
             }
         };
+        // Every deposit was universe-checked when it was made, and every
+        // open variable a deposit carried was lowered to this class's
+        // universe then, so a block-scoped parameter reaches the solution
+        // only through a bound whose own variable was decided after the
+        // deposit (at its block's closing brace). That bound is the
+        // escape, reported where it was deposited; the class takes the
+        // `Error` fill so the failure does not cascade.
+        if let Some(param) = self.table.escaping_scoped_param(var, &solution) {
+            let offending = lower_bounds
+                .iter()
+                .chain(upper_bounds.iter())
+                .find(|bound| self.table.escaping_scoped_param(var, &bound.ty).is_some())
+                .cloned();
+            match offending {
+                Some(unify::Bound {
+                    ty,
+                    anchor: Some(at),
+                }) => {
+                    self.report_scoped_type_escape(at, &param, &ty, ScopedTypeEscapeKind::Inferred);
+                }
+                Some(unify::Bound { ty, anchor: None }) => {
+                    self.anchorless_escapes.push((param, ty));
+                }
+                None => self.anchorless_escapes.push((param, solution)),
+            }
+            self.refuse_with_error_fill(var);
+            return true;
+        }
         self.table.solve(var, solution);
         true
     }
@@ -10768,7 +12582,7 @@ impl<'db> InferenceContext<'db> {
     /// diagnostic).
     fn structurally_resolve(&mut self, ty: &Ty) -> Ty {
         let resolved = self.table.resolve_completely(ty);
-        let mut resolved = if let TyKind::Infer { var: Some(var), .. } = resolved.kind() {
+        let mut resolved = if let InferTy::InferVar { var, .. } = resolved.kind() {
             let var = *var;
             let bounds = self.table.var_bounds(var);
             if self.try_solve_bounded_var(var, &bounds) {
@@ -10796,15 +12610,17 @@ impl<'db> InferenceContext<'db> {
         // wherever a consumer demands shape. Var-carrying projections
         // stay (the oracle's plain conversion erases inference vars);
         // they relate lazily through the deferred residue instead.
-        if resolved.has_projection() && !resolved.has_infer() {
+        if resolved.has_projection()
+            && let Ok(closed) = ClosedTy::try_from(&resolved)
+        {
             // One spelling, one verdict: reduce over the canonical form.
             // Forcing can ground a syntactic union `union_of` deferred
             // while a member carried a variable, and the oracle reads the
             // spelling it is given - a member-identical union like
             // `list<int> | list<int>` must collapse before a projection
             // over it can reduce (B-1576).
-            let resolved = self.canonicalize_unions(&resolved);
-            let reduced = self.reduce_projections(&resolved, PROJECTION_FINALIZE_FUEL);
+            let canonical = self.canonicalize_unions(&closed);
+            let reduced = self.reduce_projections(&canonical, PROJECTION_FINALIZE_FUEL);
             return self.expand_alias_ty(&reduced);
         }
         // WEAK aliases normalize here too (rustc's `Alias::Weak` in
@@ -10812,7 +12628,7 @@ impl<'db> InferenceContext<'db> {
         // sees the nominal wrapper, so no consumer can forget to
         // expand. Recorded types keep the written name - this is the
         // demanded STRUCTURE, not the render.
-        if matches!(resolved.kind(), TyKind::TypeAlias(..)) {
+        if matches!(resolved.kind(), InferTy::TypeAlias(..)) {
             return self.expand_alias_ty(&resolved);
         }
         resolved
@@ -10858,13 +12674,16 @@ impl<'db> InferenceContext<'db> {
     ) -> Option<baml_type::Name> {
         let function = self.body_owner?;
         let data = baml_compiler2_ppir::item_data::function_data(self.db, function);
-        for (index, param_ty) in self.param_tys.iter().enumerate() {
+        let param_tys = self.param_tys.clone();
+        for (index, param_ty) in param_tys.iter().enumerate() {
             let resolved = self.table.resolve_completely(param_ty);
-            let Some(TyKind::Function { throws, .. }) = callback_root_fn(&resolved).map(Ty::kind)
-            else {
+            let Some(callback) = self.callback_root_fn(&resolved) else {
                 continue;
             };
-            if matches!(throws.kind(), TyKind::TypeVar(p, _) if p == effect) {
+            let InferTy::Function { throws, .. } = callback.kind() else {
+                unreachable!("callback_root_fn returns a function type")
+            };
+            if matches!(throws.kind(), InferTy::TypeVar(p, _) if p == effect) {
                 return data.params.get(index).map(|param| param.name.clone());
             }
         }
@@ -10909,15 +12728,14 @@ impl<'db> InferenceContext<'db> {
         if actual.has_infer() || expected.has_infer() {
             return None;
         }
-        let file = self.owner_file?;
-        let info = baml_compiler2_hir::file_package::file_package(self.db, file);
-        let pkg = baml_compiler2_hir::package::PackageId::new(self.db, info.package);
+        let info = baml_compiler2_hir::file_package::file_package(self.db, self.owner_file);
+        let pkg = info.root;
         let aliases = self.overlap_alias_map();
         crate::interfaces::first_failing_impl_bound(
             self.db,
             pkg,
-            &actual.to_plain(),
-            &expected.to_plain(),
+            &rendered_plain(actual),
+            &rendered_plain(expected),
             aliases,
             |a, b| baml_type::normalize::is_subtype(a, b, &self.facts),
         )
@@ -10931,7 +12749,7 @@ impl<'db> InferenceContext<'db> {
     ) -> baml_type::unify::Overlap {
         use baml_type::normalize::TypeContext as _;
         let aliases = self.overlap_alias_map();
-        let enum_variants = |qtn: &baml_type::QualifiedTypeName| self.facts.enum_variants(qtn);
+        let enum_variants = |qtn: &baml_type::DeclName| self.facts.enum_variants(qtn);
         let implements = |ty: &baml_type::Ty, iface: &baml_type::Interface| {
             self.facts.implements_interface(ty, iface)
         };
@@ -10942,6 +12760,7 @@ impl<'db> InferenceContext<'db> {
                 vars: self.lower.generic_params(),
                 bounds: self.facts.bounds(),
                 aliases,
+                lang: self.lang(),
                 enum_variants: &enum_variants,
                 implements: &implements,
             },
@@ -10952,18 +12771,13 @@ impl<'db> InferenceContext<'db> {
     /// (own plus dependency closure), bodies pre-folded to `nf`'s canonical
     /// union form - see `baml_type::unify` for why raw bodies mis-decide
     /// alias-obscured unions at invariant positions.
-    fn overlap_alias_map(
-        &self,
-    ) -> &std::collections::HashMap<baml_type::QualifiedTypeName, baml_type::Ty> {
+    fn overlap_alias_map(&self) -> &std::collections::HashMap<baml_type::DeclName, baml_type::Ty> {
         self.overlap_aliases.get_or_init(|| {
             use baml_compiler2_hir::contributions::Definition;
             use baml_type::normalize::TypeContext as _;
             let mut aliases = std::collections::HashMap::new();
-            let Some(file) = self.owner_file else {
-                return aliases;
-            };
-            let info = baml_compiler2_hir::file_package::file_package(self.db, file);
-            let pkg = baml_compiler2_hir::package::PackageId::new(self.db, info.package);
+            let info = baml_compiler2_hir::file_package::file_package(self.db, self.owner_file);
+            let pkg = info.root;
             let mut packages = vec![pkg];
             packages.extend(baml_compiler2_hir::package::package_dependency_closure(
                 self.db, pkg,
@@ -10979,18 +12793,18 @@ impl<'db> InferenceContext<'db> {
                             self.db,
                             loc.file(self.db),
                         );
-                        let qtn = baml_type::QualifiedTypeName::new(
-                            def_info.package,
+                        let qtn = baml_type::DeclName::in_root(
+                            def_info.root,
                             def_info.namespace_path,
                             name.clone(),
                         );
-                        aliases.entry(qtn).or_insert_with(|| {
-                            crate::lower::type_alias_value(self.db, *loc).to_plain()
-                        });
+                        aliases
+                            .entry(qtn)
+                            .or_insert_with(|| crate::lower::type_alias_value(self.db, *loc));
                     }
                 }
             }
-            let enum_variants = |qtn: &baml_type::QualifiedTypeName| self.facts.enum_variants(qtn);
+            let enum_variants = |qtn: &baml_type::DeclName| self.facts.enum_variants(qtn);
             for body in aliases.values_mut() {
                 *body = baml_type::unify::nf(body, &enum_variants);
             }
@@ -11010,11 +12824,15 @@ impl<'db> InferenceContext<'db> {
         let mut progressed = false;
         for (solution, bounds) in solved {
             for lower in bounds.lowers {
-                let _ = self.sub(&lower, &solution);
+                let saved_anchor = std::mem::replace(&mut self.obligation_anchor, lower.anchor);
+                let _ = self.sub(&lower.ty, &solution);
+                self.obligation_anchor = saved_anchor;
                 progressed = true;
             }
             for upper in bounds.uppers {
-                let _ = self.sub(&solution, &upper);
+                let saved_anchor = std::mem::replace(&mut self.obligation_anchor, upper.anchor);
+                let _ = self.sub(&solution, &upper.ty);
+                self.obligation_anchor = saved_anchor;
                 progressed = true;
             }
         }
@@ -11041,13 +12859,14 @@ impl<'db> InferenceContext<'db> {
             }
             if !actual.has_infer() && !expected.has_infer() {
                 // A failed post-hoc bound reports at the expr that
-                // deposited it (check_expr's anchor rides the pair):
-                // `let m = []; m = {}` retires `map <: list` here, the
-                // only place both sides are ground. Anchorless pairs
-                // (the VarBounds flush) still drop - threading THEIR
-                // provenance is VarBounds' business. The quiescence
-                // tiering makes a failure here reachable only for
-                // genuinely ill-typed programs.
+                // deposited it (check_expr's anchor rides the pair, and
+                // a bound flushed from a class's ledger carries the
+                // anchor it was deposited with): `let m = []; m = {}`
+                // retires `map <: list` here, the only place both sides
+                // are ground. A pair a pattern walk deposited has no
+                // anchor and still drops. The quiescence tiering makes
+                // a failure here reachable only for genuinely ill-typed
+                // programs.
                 if !self.cached_subtype(&actual, &expected)
                     && let Some(anchor) = anchor
                 {
@@ -11081,14 +12900,16 @@ fn skolemize_infer(ty: &Ty) -> Ty {
     if !ty.has_infer() {
         return ty.clone();
     }
-    if let TyKind::Infer {
-        var: Some(var),
-        attr,
-    } = ty.kind()
-    {
-        return Ty::intern(TyKind::TypeVar(
+    if let InferTy::InferVar { var, attr } = ty.kind() {
+        return Ty::intern(InferTy::TypeVar(
             baml_type::ParamTy::new(
-                u32::MAX - var.index(),
+                // Counted DOWN from the top of the declared space, below
+                // `SCOPED_PARAM_BIT`: a skolem is neither a declared frame
+                // position nor a block-scoped binding, and letting it carry
+                // the scoped bit would make `ParamTy::is_scoped` - and so the
+                // escape checks and the relaxation - answer for a placeholder
+                // no block ever bound.
+                (SCOPED_PARAM_BIT - 1) - var.index(),
                 baml_type::Name::new(format!("?{}", var.index())),
             ),
             attr.clone(),
@@ -11103,7 +12924,7 @@ fn collect_infer_vars(ty: &Ty, out: &mut Vec<baml_type::interned::InferVar>) {
     if !ty.has_infer() {
         return;
     }
-    if let TyKind::Infer { var: Some(var), .. } = ty.kind() {
+    if let InferTy::InferVar { var, .. } = ty.kind() {
         out.push(*var);
     }
     baml_type::interned::for_each_child(ty.kind(), |child| collect_infer_vars(child, out));
@@ -11114,20 +12935,20 @@ fn collect_infer_vars(ty: &Ty, out: &mut Vec<baml_type::interned::InferVar>) {
 /// (only pairs plain unification could relate member-wise).
 fn same_head_constructor(source: &Ty, target: &Ty) -> bool {
     match (source.kind(), target.kind()) {
-        (TyKind::List(..), TyKind::List(..))
-        | (TyKind::Map { .. }, TyKind::Map { .. })
-        | (TyKind::Future(..), TyKind::Future(..)) => true,
-        (TyKind::Class(a, a_args, _), TyKind::Class(b, b_args, _)) => {
+        (InferTy::List(..), InferTy::List(..))
+        | (InferTy::Map { .. }, InferTy::Map { .. })
+        | (InferTy::Future(..), InferTy::Future(..)) => true,
+        (InferTy::Class(a, a_args, _), InferTy::Class(b, b_args, _)) => {
             a == b && a_args.len() == b_args.len()
         }
-        (TyKind::Interface(a, a_args, _, _), TyKind::Interface(b, b_args, _, _)) => {
+        (InferTy::Interface(a, a_args, _, _), InferTy::Interface(b, b_args, _, _)) => {
             a == b && a_args.len() == b_args.len()
         }
         (
-            TyKind::Function {
+            InferTy::Function {
                 params: a_params, ..
             },
-            TyKind::Function {
+            InferTy::Function {
                 params: b_params, ..
             },
         ) => a_params.len() == b_params.len(),
@@ -11141,13 +12962,14 @@ fn same_head_constructor(source: &Ty, target: &Ty) -> bool {
 /// (`Type.method`) keep the full signature; there the receiver arrives
 /// as the written first argument. Non-methods pass through untouched.
 /// Whether `param` occurs anywhere inside `ty` (the phantom-param test
-/// for constructor inference slots).
-fn ty_mentions_param(ty: &Ty, param: &baml_type::ParamTy) -> bool {
+/// for constructor inference slots, and for `impl_facts`' poisoned-header
+/// gate).
+pub(crate) fn ty_mentions_param(ty: &Ty, param: &baml_type::ParamTy) -> bool {
     fn walk(ty: &Ty, param: &baml_type::ParamTy, found: &mut bool) {
         if *found {
             return;
         }
-        if matches!(ty.kind(), TyKind::TypeVar(p, _) if p == param) {
+        if matches!(ty.kind(), InferTy::TypeVar(p, _) if p == param) {
             *found = true;
             return;
         }
@@ -11160,44 +12982,45 @@ fn ty_mentions_param(ty: &Ty, param: &baml_type::ParamTy) -> bool {
     found
 }
 
-fn external_bounds_map(
-    external: &crate::callable::ExternalCallable,
-) -> FxHashMap<baml_type::ParamTy, Vec<InterfaceRef>> {
-    external
-        .owner_generic_params
-        .iter()
-        .zip(&external.owner_generic_param_bounds)
-        .chain(
-            external
-                .generic_params
-                .iter()
-                .zip(&external.generic_param_bounds),
-        )
-        .map(|(param, bounds)| {
-            (
-                param.clone(),
-                bounds.iter().map(InterfaceRef::from_constraint).collect(),
-            )
-        })
-        .collect()
+/// The user-written portion of a function's flattened generic frame. Owner
+/// parameters precede it and compiler-created callback-effect parameters
+/// follow it, so neither group should make a function value require explicit
+/// specialization.
+fn function_user_generic_params<'a, 'db>(
+    db: &'db dyn baml_compiler2_ppir::Db,
+    function: baml_compiler2_hir::loc::FunctionLoc<'db>,
+    signature: &'a crate::lower::FunctionSignature,
+) -> &'a [baml_type::ParamTy] {
+    let data = baml_compiler2_ppir::item_data::elaborated_function_data(db, function);
+    let end = signature
+        .generic_params
+        .len()
+        .checked_sub(data.synthetic_effect_params.len())
+        .expect("synthetic effect parameters are a suffix of the generic frame");
+    let start = end
+        .checked_sub(data.user_generic_params.len())
+        .expect("user parameters precede synthetic effects in the generic frame");
+    &signature.generic_params[start..end]
+}
+
+fn function_signature_mentions_param(
+    signature: &crate::lower::FunctionSignature,
+    param: &baml_type::ParamTy,
+) -> bool {
+    signature.params.iter().any(|function_param| {
+        ty_mentions_param(&crate::impls::interned_ty(&function_param.ty), param)
+    }) || ty_mentions_param(&crate::impls::interned_ty(&signature.ret), param)
+        || ty_mentions_param(&crate::impls::interned_ty(&signature.throws), param)
 }
 
 fn external_type_position(
+    lang: baml_base::LangRoots,
     target: &crate::callable::ExternalCallTarget,
 ) -> crate::lower::TypePosition {
     match target {
-        crate::callable::ExternalCallTarget::Method {
-            package,
-            namespace,
-            class,
-            name,
-        } if package.as_str() == "baml"
-            && namespace
-                .iter()
-                .map(baml_type::Name::as_str)
-                .eq(["reflect"])
-            && class.as_str() == "Package"
-            && name.as_str() == "get_function" =>
+        crate::callable::ExternalCallTarget::Method { class, name }
+            if class.is_lang_root_type(lang, baml_base::LangPackage::Reflect, "Package")
+                && name.as_str() == "get_function" =>
         {
             crate::lower::TypePosition::ExtractionContract
         }
@@ -11205,129 +13028,209 @@ fn external_type_position(
     }
 }
 
-fn external_target_path(target: &crate::callable::ExternalCallTarget) -> baml_type::Name {
+fn external_target_path(
+    vp: &crate::render::Viewpoint<'_>,
+    target: &crate::callable::ExternalCallTarget,
+) -> baml_type::Name {
     let path = match target {
-        crate::callable::ExternalCallTarget::Free {
-            package,
-            namespace,
-            name,
-        } => std::iter::once(package)
-            .chain(namespace)
-            .chain(std::iter::once(name))
-            .map(baml_type::Name::as_str)
-            .collect::<Vec<_>>()
-            .join("."),
-        crate::callable::ExternalCallTarget::Method {
-            package,
-            namespace,
-            class,
-            name,
-        } => std::iter::once(package)
-            .chain(namespace)
-            .chain([class, name])
-            .map(baml_type::Name::as_str)
-            .collect::<Vec<_>>()
-            .join("."),
+        crate::callable::ExternalCallTarget::Free { function } => function.spell(vp),
+        crate::callable::ExternalCallTarget::Method { class, name } => {
+            format!("{}.{}", class.spell(vp), name)
+        }
         crate::callable::ExternalCallTarget::Interface { interface, method } => {
-            format!("{}.{}", interface.render_dotted(true), method)
+            format!("{}.{}", interface.spell(vp), method)
         }
     };
     baml_type::Name::new(path)
 }
 
-fn interface_mentions_param(interface: &InterfaceRef, param: &baml_type::ParamTy) -> bool {
-    interface
-        .generics
-        .iter()
-        .chain(interface.associated_types.iter().map(|(_, ty)| ty))
-        .any(|ty| ty_mentions_param(ty, param))
-}
-
-/// Does a call-scoped runtime parameter survive into a type the call
-/// `published` (its result, or the error it can throw) as more than that type
-/// itself? See [`InferCtx::report_runtime_type_escape`] for why the bare
-/// parameter is the one shape that does not escape.
-fn runtime_param_escapes(published: &Ty, param: &baml_type::ParamTy) -> bool {
-    if matches!(published.kind(), TyKind::TypeVar(candidate, _) if candidate == param) {
-        return false;
-    }
-    ty_mentions_param(published, param)
-}
-
-fn interface_occurrence_ty(interface: &InterfaceRef) -> Ty {
-    Ty::intern(TyKind::Interface(
-        interface.name.clone(),
-        interface.generics.clone(),
-        interface.associated_types.clone(),
-        TyAttr::default(),
-    ))
-}
-
-/// Substitute every solved/static call parameter while deliberately retaining
-/// runtime parameters as rigid variables. The resulting template is what the
-/// VM specializes after loading runtime type values.
-fn substitute_static_call_params(
-    ty: &Ty,
-    args: &[Ty],
-    runtime_params: &[baml_type::ParamTy],
-) -> Ty {
-    if let TyKind::TypeVar(param, _) = ty.kind() {
-        if runtime_params.contains(param) {
-            return ty.clone();
-        }
-        if let Some(replacement) = args.get(param.index() as usize) {
-            return replacement.clone();
+/// The one type a `throws` clause must name to cover `facts`, in the order
+/// given, or `None` when nothing is thrown.
+///
+/// A message quotes this SINGLE type rather than joining the members'
+/// renderings, because a joined union does not read back as the type it was
+/// built from: a bare function type in a non-first member has its arrow
+/// swallowed by the member before it, so `string | () -> unknown throws never`
+/// parses as `string | unknown`. Rendering one union lets the renderer
+/// parenthesize what needs it - which matters most where the message asks the
+/// author to WRITE what it prints.
+fn throws_clause_union(facts: impl IntoIterator<Item = baml_type::Ty>) -> Option<baml_type::Ty> {
+    let mut members: Vec<baml_type::Ty> = Vec::new();
+    for fact in facts {
+        if !members.contains(&fact) {
+            members.push(fact);
         }
     }
-    if !ty.has_typevar() {
-        return ty.clone();
+    match members.len() {
+        0 => None,
+        1 => members.pop(),
+        _ => Some(baml_type::Ty::Union(
+            members.into(),
+            baml_type::TyAttr::default(),
+        )),
     }
-    Ty::intern(
-        ty.kind()
-            .map_children(|child| substitute_static_call_params(child, args, runtime_params)),
+}
+
+/// Whether a finalized (plain) type names a block-scoped parameter.
+fn mentions_scoped_param(ty: &baml_type::Ty) -> bool {
+    baml_type::contains_ty_where(
+        ty,
+        &|candidate| matches!(candidate, baml_type::Ty::TypeVar(param, _) if param.index() & SCOPED_PARAM_BIT != 0),
     )
 }
 
-fn replace_rigid_param(ty: &Ty, param: &baml_type::ParamTy, replacement: &Ty) -> Ty {
-    if matches!(ty.kind(), TyKind::TypeVar(candidate, _) if candidate == param) {
-        return replacement.clone();
-    }
-    if !ty.has_typevar() {
-        return ty.clone();
-    }
-    Ty::intern(
-        ty.kind()
-            .map_children(|child| replace_rigid_param(child, param, replacement)),
-    )
+/// The direction a position relates to the value it describes, for
+/// [`nearest_scoped_relaxation`]: a `throws` clause (like a return) is a
+/// supertype of what is thrown; a function type's parameters flip it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaxationVariance {
+    Covariant,
+    Contravariant,
 }
 
-fn substitute_static_interface_params(
-    interface: &InterfaceRef,
-    args: &[Ty],
-    runtime_params: &[baml_type::ParamTy],
-) -> InterfaceRef {
-    InterfaceRef::new(
+impl RelaxationVariance {
+    fn flip(self) -> RelaxationVariance {
+        match self {
+            RelaxationVariance::Covariant => RelaxationVariance::Contravariant,
+            RelaxationVariance::Contravariant => RelaxationVariance::Covariant,
+        }
+    }
+
+    /// The type a bare block-scoped parameter relaxes to in this direction.
+    fn bound(self) -> baml_type::Ty {
+        match self {
+            RelaxationVariance::Covariant => baml_type::Ty::unknown(),
+            RelaxationVariance::Contravariant => baml_type::Ty::never(),
+        }
+    }
+}
+
+/// The nearest type free of block-scoped parameters that still relates to
+/// `ty` in `variance`'s direction - a supertype when covariant, a subtype
+/// when contravariant - following the subtyping rules: a bare parameter
+/// becomes the direction's bound (`unknown`, or `never` under a function
+/// parameter); a union relaxes its members and simplifies (`T | int` →
+/// `unknown`; under a parameter, `(T | int) -> void` → `(int) -> void`); a
+/// function flips the direction for its parameters and keeps it for the
+/// return and throws (`() -> T throws T` → `() -> unknown throws unknown`);
+/// an invariant constructor (classes, lists, maps, interfaces, futures,
+/// projections) has no nearer relative than the bound itself, so any
+/// mention inside collapses it whole (`T[]` → `unknown`).
+///
+/// This is what a clause outside the block may say about a value typed by
+/// the binding; it is never applied for the author - they write it.
+fn nearest_scoped_relaxation(ty: &baml_type::Ty, variance: RelaxationVariance) -> baml_type::Ty {
+    use baml_type::Ty as Plain;
+    if !mentions_scoped_param(ty) {
+        return ty.clone();
+    }
+    match ty {
+        Plain::TypeVar(..) => variance.bound(),
+        Plain::Union(members, attr) => {
+            let mut flat: Vec<Plain> = Vec::with_capacity(members.len());
+            let mut push = |member: Plain| {
+                if !flat.contains(&member) {
+                    flat.push(member);
+                }
+            };
+            for member in members {
+                let relaxed = nearest_scoped_relaxation(member, variance);
+                match relaxed {
+                    // The top type absorbs the union; the bottom type
+                    // vanishes from it.
+                    Plain::Unknown { .. } => return relaxed,
+                    Plain::Never { .. } => {}
+                    Plain::Union(inner, _) => inner.iter().cloned().for_each(&mut push),
+                    _ => push(relaxed),
+                }
+            }
+            match flat.len() {
+                0 => Plain::never(),
+                1 => flat.pop().unwrap_or_else(|| unreachable!("length checked")),
+                _ => Plain::Union(flat.into(), attr.clone()),
+            }
+        }
+        Plain::Function {
+            params,
+            ret,
+            throws,
+            attr,
+        } => Plain::Function {
+            params: params
+                .iter()
+                .map(|param| baml_type::FunctionParamTy {
+                    name: param.name.clone(),
+                    ty: nearest_scoped_relaxation(&param.ty, variance.flip()),
+                    mode: param.mode,
+                })
+                .collect(),
+            ret: Box::new(nearest_scoped_relaxation(ret, variance)),
+            throws: Box::new(nearest_scoped_relaxation(throws, variance)),
+            attr: attr.clone(),
+        },
+        Plain::Class(..)
+        | Plain::Interface(..)
+        | Plain::List(..)
+        | Plain::Map { .. }
+        | Plain::Future(..)
+        | Plain::AssociatedTypeProjection { .. } => variance.bound(),
+        // Leaves cannot mention a parameter; the guard above returns them.
+        Plain::Int { .. }
+        | Plain::Bigint { .. }
+        | Plain::Float { .. }
+        | Plain::String { .. }
+        | Plain::Bool { .. }
+        | Plain::Null { .. }
+        | Plain::Uint8Array { .. }
+        | Plain::Media(..)
+        | Plain::Literal(..)
+        | Plain::Enum(..)
+        | Plain::EnumVariant(..)
+        | Plain::RustType { .. }
+        | Plain::Type { .. }
+        | Plain::Resource { .. }
+        | Plain::PromptAst { .. }
+        | Plain::Void { .. }
+        | Plain::TypeAlias(..)
+        | Plain::Unknown { .. }
+        | Plain::Never { .. }
+        | Plain::Error { .. } => ty.clone(),
+    }
+}
+
+/// Every block-scoped parameter (`type T = …`, marked by
+/// [`SCOPED_PARAM_BIT`]) that `ty` mentions, in walk order.
+fn scoped_params_in(ty: &Ty, visit: &mut impl FnMut(&baml_type::ParamTy)) {
+    if !ty.has_typevar() {
+        return;
+    }
+    if let InferTy::TypeVar(param, _) = ty.kind()
+        && param.is_scoped()
+    {
+        visit(param);
+    }
+    baml_type::interned::for_each_child(ty.kind(), |child| scoped_params_in(child, visit));
+}
+
+/// [`substitute_params`] over every type an interface constraint carries.
+fn substitute_interface_params(interface: &InferInterface, args: &[Ty]) -> InferInterface {
+    InferInterface::new(
         interface.name.clone(),
         interface
             .generics
             .iter()
-            .map(|ty| substitute_static_call_params(ty, args, runtime_params))
+            .map(|ty| substitute_params(ty, args))
             .collect(),
         interface
             .associated_types
             .iter()
-            .map(|(name, ty)| {
-                (
-                    name.clone(),
-                    substitute_static_call_params(ty, args, runtime_params),
-                )
-            })
+            .map(|(name, ty)| (name.clone(), substitute_params(ty, args)))
             .collect(),
     )
 }
 
 fn bind_receiver(fn_ty: Ty) -> Ty {
-    let TyKind::Function {
+    let InferTy::Function {
         params,
         ret,
         throws,
@@ -11345,7 +13248,7 @@ fn bind_receiver(fn_ty: Ty) -> Ty {
     if !binds {
         return fn_ty;
     }
-    Ty::intern(TyKind::Function {
+    Ty::intern(InferTy::Function {
         params: params[1..].to_vec().into_boxed_slice(),
         ret: ret.clone(),
         throws: throws.clone(),
@@ -11357,12 +13260,12 @@ fn bind_receiver(fn_ty: Ty) -> Ty {
 /// into an interned function type. Shared by direct calls (turbofish-aware
 /// instantiation) and value-position references (fresh-var instantiation).
 fn function_value_ty(signature: &crate::lower::FunctionSignature, instantiation: &[Ty]) -> Ty {
-    let params: Box<[baml_type::interned::FunctionParam]> = signature
+    let params: Box<[baml_type::interned::InferFunctionParamTy]> = signature
         .params
         .iter()
-        .map(|param| baml_type::interned::FunctionParam {
+        .map(|param| baml_type::interned::InferFunctionParamTy {
             name: Some(param.name.clone()),
-            ty: substitute_params(&param.ty, instantiation),
+            ty: substitute_params(&crate::impls::interned_ty(&param.ty), instantiation),
             mode: if param.has_default {
                 baml_type::FunctionParamMode::Optional
             } else {
@@ -11370,24 +13273,453 @@ fn function_value_ty(signature: &crate::lower::FunctionSignature, instantiation:
             },
         })
         .collect();
-    Ty::intern(TyKind::Function {
+    Ty::intern(InferTy::Function {
         params,
-        ret: substitute_params(&signature.ret, instantiation),
-        throws: substitute_params(&signature.throws, instantiation),
+        ret: substitute_params(&crate::impls::interned_ty(&signature.ret), instantiation),
+        throws: substitute_params(&crate::impls::interned_ty(&signature.throws), instantiation),
         attr: TyAttr::default(),
     })
 }
 
+impl<'db> InferenceContext<'db> {
+    /// Inference finalize's exit through the
+    /// [`baml_type::interned::ClosedTy`] boundary, TOTAL: a finalized
+    /// (closed) value materializes directly; a value that arrives still
+    /// open is finalized on the spot, so the conversion IS the finalize
+    /// boundary and no field enumeration elsewhere has to be exhaustive
+    /// for soundness. `finish`'s writeback pass remains the semantic
+    /// enumeration - a value it missed arriving open here is drift,
+    /// asserted in debug. Boundaries that can legitimately meet an OPEN
+    /// type mid-inference must not use this (finalizing there would erase
+    /// a variable that could still solve): they construct `ClosedTy`
+    /// themselves and pick a disposition on `Err` (defer, suppress, or
+    /// rename-for-rendering).
+    fn materialize_ty(&mut self, ty: &Ty) -> baml_type::Ty {
+        match ClosedTy::try_from(ty) {
+            Ok(closed) => closed.to_plain(),
+            Err(_) => {
+                debug_assert!(
+                    false,
+                    "a type reached the plain boundary without passing finalize"
+                );
+                self.plain_finalized(ty)
+            }
+        }
+    }
+
+    /// [`materialize_ty`](Self::materialize_ty)'s satellite twin, for
+    /// interface constraints - total field-by-field through the same edge.
+    fn materialize_interface(&mut self, iface: &InferInterface) -> baml_type::Interface {
+        baml_type::Interface::new(
+            iface.name.clone(),
+            iface
+                .generics
+                .iter()
+                .map(|ty| self.materialize_ty(ty))
+                .collect(),
+            iface
+                .associated_types
+                .iter()
+                .map(|(name, ty)| (name.clone(), self.materialize_ty(ty)))
+                .collect(),
+        )
+    }
+
+    /// Materialize the finalized working result into the public plain
+    /// artifact - the LAST step of `finish`. Every value conversion routes
+    /// through the total boundary edge
+    /// ([`materialize_ty`](Self::materialize_ty) /
+    /// [`materialize_interface`](Self::materialize_interface)), so no
+    /// interned handle escapes inference; every struct converts by
+    /// exhaustive match/field-list, so a new type-carrying field cannot be
+    /// added without its materialization appearing here.
+    fn materialize_result(&mut self, working: WorkingResult<'db>) -> InferenceResult<'db> {
+        let InferenceResult {
+            type_of_expr,
+            type_of_pat,
+            throws,
+            type_mismatches,
+            non_exhaustive_matches,
+            diagnostics,
+            member_resolutions,
+            path_resolutions,
+            call_plans,
+            type_bindings,
+            expr_adjustments,
+            desugared_callees,
+        } = working;
+        InferenceResult {
+            type_of_expr: type_of_expr
+                .into_iter()
+                .map(|(expr, ty)| (expr, self.materialize_ty(&ty)))
+                .collect(),
+            type_of_pat: type_of_pat
+                .into_iter()
+                .map(|(pat, ty)| (pat, self.materialize_ty(&ty)))
+                .collect(),
+            throws: self.materialize_ty(&throws),
+            type_mismatches: type_mismatches
+                .into_iter()
+                .map(|(expr, (expected, actual))| {
+                    (
+                        expr,
+                        (self.materialize_ty(&expected), self.materialize_ty(&actual)),
+                    )
+                })
+                .collect(),
+            non_exhaustive_matches,
+            diagnostics,
+            member_resolutions: member_resolutions
+                .into_iter()
+                .map(|(expr, resolution)| (expr, self.materialize_member_resolution(resolution)))
+                .collect(),
+            path_resolutions: path_resolutions
+                .into_iter()
+                .map(|(expr, path)| {
+                    (
+                        expr,
+                        ResolvedPath {
+                            segments: path
+                                .segments
+                                .into_iter()
+                                .map(|segment| ResolvedPathSegment {
+                                    ty: self.materialize_ty(&segment.ty),
+                                    resolution: segment.resolution.map(|resolution| {
+                                        self.materialize_member_resolution(resolution)
+                                    }),
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect(),
+            call_plans: call_plans
+                .into_iter()
+                .map(|(expr, plan)| (expr, self.materialize_call_plan(plan)))
+                .collect(),
+            type_bindings: type_bindings
+                .into_iter()
+                .map(|(stmt, binding)| (stmt, self.materialize_scoped_binding(binding)))
+                .collect(),
+            expr_adjustments: expr_adjustments
+                .into_iter()
+                .map(|(expr, adjustments)| {
+                    (
+                        expr,
+                        adjustments
+                            .into_iter()
+                            .map(|adjustment| Adjustment {
+                                kind: adjustment.kind,
+                                target: self.materialize_ty(&adjustment.target),
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            desugared_callees,
+        }
+    }
+
+    fn materialize_member_resolution(
+        &mut self,
+        resolution: MemberResolution<'db, Ty>,
+    ) -> MemberResolution<'db> {
+        match resolution {
+            MemberResolution::Field { class, field } => MemberResolution::Field { class, field },
+            MemberResolution::Variant { enum_loc, variant } => {
+                MemberResolution::Variant { enum_loc, variant }
+            }
+            MemberResolution::Free { func } => MemberResolution::Free { func },
+            MemberResolution::BoundMethod { class, func } => {
+                MemberResolution::BoundMethod { class, func }
+            }
+            MemberResolution::UnboundMethod { class, func } => {
+                MemberResolution::UnboundMethod { class, func }
+            }
+            MemberResolution::InterfaceVirtualMethod { interface, method } => {
+                MemberResolution::InterfaceVirtualMethod { interface, method }
+            }
+            MemberResolution::InterfaceConcreteMethod {
+                impl_block,
+                func,
+                frame_type_args,
+                from_interface_default,
+            } => MemberResolution::InterfaceConcreteMethod {
+                impl_block,
+                func,
+                frame_type_args: frame_type_args
+                    .iter()
+                    .map(|ty| self.materialize_ty(ty))
+                    .collect(),
+                from_interface_default,
+            },
+            MemberResolution::InterfaceVirtualField {
+                interface,
+                view,
+                field_index,
+                field,
+            } => MemberResolution::InterfaceVirtualField {
+                interface,
+                view: self.materialize_ty(&view),
+                field_index,
+                field,
+            },
+            MemberResolution::External(callable) => MemberResolution::External(callable),
+            MemberResolution::ExternalField { class, field } => {
+                MemberResolution::ExternalField { class, field }
+            }
+            MemberResolution::ExternalVariant { enum_name, variant } => {
+                MemberResolution::ExternalVariant { enum_name, variant }
+            }
+            MemberResolution::ExternalInterfaceVirtualField {
+                interface,
+                view,
+                field_index,
+                field,
+            } => MemberResolution::ExternalInterfaceVirtualField {
+                interface,
+                view: self.materialize_ty(&view),
+                field_index,
+                field,
+            },
+        }
+    }
+
+    fn materialize_call_plan(&mut self, plan: CallPlan<Ty>) -> CallPlan {
+        let CallPlan {
+            bindings,
+            argument_layout,
+            type_args,
+            own_offset,
+            explicit,
+            slots,
+            runtime_id,
+            target,
+        } = plan;
+        CallPlan {
+            bindings,
+            argument_layout,
+            type_args: type_args.iter().map(|ty| self.materialize_ty(ty)).collect(),
+            own_offset,
+            explicit,
+            slots: slots
+                .into_iter()
+                .map(|CallTypeArgPlan { ty, emission_ty }| CallTypeArgPlan {
+                    ty: self.materialize_ty(&ty),
+                    emission_ty: self.materialize_ty(&emission_ty),
+                })
+                .collect(),
+            runtime_id,
+            target,
+        }
+    }
+
+    fn materialize_scoped_binding(&mut self, binding: ScopedTypeBinding<Ty>) -> ScopedTypeBinding {
+        let ScopedTypeBinding {
+            name,
+            parameter,
+            source,
+        } = binding;
+        ScopedTypeBinding {
+            name,
+            parameter,
+            source: match source {
+                ScopedTypeSource::Runtime(operand) => ScopedTypeSource::Runtime(operand),
+                ScopedTypeSource::Static(ty) => ScopedTypeSource::Static(self.materialize_ty(&ty)),
+            },
+        }
+    }
+}
+
+fn generic_function_value_shape(
+    vp: &crate::render::Viewpoint<'_>,
+    signature: &crate::lower::FunctionSignature,
+    user_params: &[baml_type::ParamTy],
+    receiver_is_bound: bool,
+    concrete_example: bool,
+) -> Option<String> {
+    let mut instantiation: Vec<Ty> = signature
+        .generic_params
+        .iter()
+        .map(|param| {
+            Ty::intern(InferTy::TypeVar(
+                param.clone(),
+                baml_type::TyAttr::default(),
+            ))
+        })
+        .collect();
+    if concrete_example {
+        for param in user_params {
+            if let Some(slot) = instantiation.get_mut(param.index() as usize) {
+                *slot = Ty::int();
+            }
+        }
+    }
+    let ty = function_value_ty(signature, &instantiation);
+    let ty = if receiver_is_bound {
+        bind_receiver(ty)
+    } else {
+        ty
+    };
+    vp.source_text(&rendered_plain(&ty)).ok()
+}
+
+fn external_generic_function_value_ty(
+    function: &crate::package_interface::ResolvedFunction,
+    user_params: &[baml_type::ParamTy],
+    receiver_is_bound: bool,
+    concrete_example: bool,
+) -> Ty {
+    let mut instantiation: Vec<Ty> = function
+        .generic_params
+        .iter()
+        .map(|param| {
+            Ty::intern(InferTy::TypeVar(
+                param.clone(),
+                baml_type::TyAttr::default(),
+            ))
+        })
+        .collect();
+    if concrete_example {
+        for param in user_params {
+            if let Some(slot) = instantiation.get_mut(param.index() as usize) {
+                *slot = Ty::int();
+            }
+        }
+    }
+    let ty = crate::method_resolution::instantiate_external_signature(function, &instantiation);
+    if receiver_is_bound {
+        bind_receiver(ty)
+    } else {
+        ty
+    }
+}
+
+fn initializer_binding_name(body: &ExprBody, initializer: ExprId) -> Option<baml_type::Name> {
+    body.stmts.iter().find_map(|(_, stmt)| {
+        let Stmt::Let {
+            pattern,
+            initializer: Some(candidate),
+            ..
+        } = stmt
+        else {
+            return None;
+        };
+        if *candidate != initializer {
+            return None;
+        }
+        match &body.patterns[*pattern] {
+            Pattern::Bind { name, .. } => Some(name.clone()),
+            _ => None,
+        }
+    })
+}
+
+/// Turn a finalized, partially inferred type into a concrete diagnostic
+/// example without discarding the slots inference did solve. `int` is only a
+/// placeholder for still-unknown, unbounded slots; bounded generics never use
+/// this example path.
+fn diagnostic_example_ty(ty: &Ty) -> Ty {
+    match ty.kind() {
+        InferTy::Error { .. } | InferTy::InferVar { .. } => Ty::int(),
+        kind => Ty::intern(kind.map_children(diagnostic_example_ty)),
+    }
+}
+
+/// Finalize every type a recorded member resolution carries. Both writeback
+/// sites (the expression table and each path-ladder segment) go through this,
+/// so a resolution variant that gains a type-carrying field is finalized in
+/// one place rather than two that can drift.
+fn finalize_member_resolution(
+    ctx: &mut InferenceContext<'_>,
+    resolution: &mut MemberResolution<'_, Ty>,
+) {
+    match resolution {
+        MemberResolution::InterfaceVirtualField { view, .. }
+        | MemberResolution::ExternalInterfaceVirtualField { view, .. } => {
+            *view = ctx.finalize_ty(view).into_ty();
+        }
+        MemberResolution::InterfaceConcreteMethod {
+            frame_type_args, ..
+        } => {
+            for ty in frame_type_args.iter_mut() {
+                *ty = ctx.finalize_ty(ty).into_ty();
+            }
+        }
+        MemberResolution::Field { .. }
+        | MemberResolution::Variant { .. }
+        | MemberResolution::Free { .. }
+        | MemberResolution::BoundMethod { .. }
+        | MemberResolution::UnboundMethod { .. }
+        | MemberResolution::InterfaceVirtualMethod { .. }
+        | MemberResolution::External(_)
+        | MemberResolution::ExternalField { .. }
+        | MemberResolution::ExternalVariant { .. } => {}
+    }
+}
+
 /// Replaces every `Infer` node (unsolved variable or hole) with the Error
 /// sentinel, in place - the finalize half of rulings 2/3.
-fn erase_infer(ty: &Ty) -> Ty {
+///
+// BUG: this erases UNCONDITIONALLY, but the matching diagnostic only covers
+// the `hole_vars` subset (a written `_`, reported as E0147 in `finalize`). An
+// unsolved variable is an unsolved variable whether its `_` was written or
+// implicit, so every one of them owes a diagnostic; the ones that do not get
+// one become an `Error` nothing accounts for, breaking the invariant `Error`
+// carries ("a hard error was already reported here, do not cascade").
+// `ResolvedAliases::convert` relies on that invariant and panics on an `Error`
+// reaching runtime lowering, so MIR launders every `Error` to the top type to
+// stay alive - which defuses the guard on every MIR path (see
+// `erase_compiler_only_ty`).
+//
+// The known undiagnosed producer is a generic call made in the scope of a
+// `type T = unreflect(expr)` binding, whose slots go unsolved (corpus:
+// `ns_runtime_type_binding_generic_calls`). That source is ILLEGAL, not
+// well-typed: the call needs type arguments it cannot get. Report every
+// unsolved variable and it is rejected at compile time, compilation stops
+// before MIR, and the laundering can go.
+fn erase_infer(ty: &Ty) -> ClosedTy {
+    fn erase(ty: &Ty) -> Ty {
+        if !ty.has_infer() {
+            return ty.clone();
+        }
+        if matches!(ty.kind(), InferTy::InferVar { .. }) {
+            return Ty::error();
+        }
+        Ty::intern(ty.kind().map_children(erase))
+    }
+    // The function's own postcondition, checked in O(1): every variable
+    // was just replaced.
+    ClosedTy::try_from(erase(ty))
+        .unwrap_or_else(|_| unreachable!("erase_infer replaced every inference node"))
+}
+
+/// The rename-for-rendering edge for `&self` diagnostic helpers, which
+/// have no table access to finalize: a closed value materializes; a live
+/// variable renders as the user-denotable top type
+/// ([`infer_to_diagnostic_unknown`]).
+fn rendered_plain(ty: &Ty) -> baml_type::Ty {
+    ClosedTy::try_from(ty)
+        .unwrap_or_else(|_| {
+            ClosedTy::try_from(infer_to_diagnostic_unknown(ty)).unwrap_or_else(|_| {
+                unreachable!("infer_to_diagnostic_unknown closes every variable")
+            })
+        })
+        .to_plain()
+}
+
+/// Replaces every unresolved inference node with the user-denotable top type
+/// while preserving the surrounding shape for diagnostics.
+fn infer_to_diagnostic_unknown(ty: &Ty) -> Ty {
     if !ty.has_infer() {
         return ty.clone();
     }
-    if matches!(ty.kind(), TyKind::Infer { .. }) {
-        return Ty::error();
+    if matches!(ty.kind(), InferTy::InferVar { .. }) {
+        return Ty::intern(InferTy::Unknown {
+            attr: TyAttr::default(),
+        });
     }
-    Ty::intern(ty.kind().map_children(erase_infer))
+    Ty::intern(ty.kind().map_children(infer_to_diagnostic_unknown))
 }
 
 /// A fresh literal widens to its base primitive at binding sites (the spec's
@@ -11395,7 +13727,7 @@ fn erase_infer(ty: &Ty) -> Ty {
 /// only - container-element widening arrives with the join machinery.
 fn widen_fresh_literal(ty: &Ty) -> Ty {
     match ty.kind() {
-        TyKind::Literal(literal, Freshness::Fresh, attr) => {
+        InferTy::Literal(literal, Freshness::Fresh, attr) => {
             Ty::intern(literal_base(literal, attr.clone()))
         }
         _ => ty.clone(),
@@ -11403,38 +13735,38 @@ fn widen_fresh_literal(ty: &Ty) -> Ty {
 }
 
 /// The base primitive a literal type belongs to.
-pub(crate) fn literal_base(literal: &Literal, attr: TyAttr) -> TyKind {
+pub(crate) fn literal_base(literal: &Literal, attr: TyAttr) -> InferTy {
     match literal {
-        Literal::Int(_) => TyKind::Int { attr },
-        Literal::Bigint(_) => TyKind::Bigint { attr },
-        Literal::Float(_) => TyKind::Float { attr },
-        Literal::String(_) => TyKind::String { attr },
-        Literal::Bool(_) => TyKind::Bool { attr },
+        Literal::Int(_) => InferTy::Int { attr },
+        Literal::Bigint(_) => InferTy::Bigint { attr },
+        Literal::Float(_) => InferTy::Float { attr },
+        Literal::String(_) => InferTy::String { attr },
+        Literal::Bool(_) => InferTy::Bool { attr },
     }
 }
 
 /// An operand's union alternatives for operator dispatch, literals widened
 /// to their bases regardless of freshness (dispatch is by base type; every
 /// alternative must support the operator).
-fn operand_members(ty: &Ty) -> Vec<Ty> {
-    fn widen(ty: &Ty) -> Ty {
+fn operand_members(lang: baml_base::LangRoots, ty: &Ty) -> Vec<Ty> {
+    fn widen(lang: baml_base::LangRoots, ty: &Ty) -> Ty {
         match ty.kind() {
-            TyKind::Literal(literal, _, attr) => Ty::intern(literal_base(literal, attr.clone())),
+            InferTy::Literal(literal, _, attr) => Ty::intern(literal_base(literal, attr.clone())),
             // A builtin primitive-companion class receiver (`self` inside
             // `class Float`) IS its primitive for dispatch - the single
-            // collapse rule (`baml_type::QualifiedTypeName::builtin_primitive`).
-            TyKind::Class(qtn, args, attr) if args.is_empty() => {
+            // collapse rule (`baml_type::DeclName::builtin_primitive`).
+            InferTy::Class(qtn, args, attr) if args.is_empty() => {
                 use baml_type::PrimitiveType;
-                match qtn.builtin_primitive() {
-                    Some(PrimitiveType::Int) => Ty::intern(TyKind::Int { attr: attr.clone() }),
+                match qtn.builtin_primitive(lang) {
+                    Some(PrimitiveType::Int) => Ty::intern(InferTy::Int { attr: attr.clone() }),
                     Some(PrimitiveType::Bigint) => {
-                        Ty::intern(TyKind::Bigint { attr: attr.clone() })
+                        Ty::intern(InferTy::Bigint { attr: attr.clone() })
                     }
-                    Some(PrimitiveType::Float) => Ty::intern(TyKind::Float { attr: attr.clone() }),
+                    Some(PrimitiveType::Float) => Ty::intern(InferTy::Float { attr: attr.clone() }),
                     Some(PrimitiveType::String) => {
-                        Ty::intern(TyKind::String { attr: attr.clone() })
+                        Ty::intern(InferTy::String { attr: attr.clone() })
                     }
-                    Some(PrimitiveType::Bool) => Ty::intern(TyKind::Bool { attr: attr.clone() }),
+                    Some(PrimitiveType::Bool) => Ty::intern(InferTy::Bool { attr: attr.clone() }),
                     _ => ty.clone(),
                 }
             }
@@ -11442,8 +13774,8 @@ fn operand_members(ty: &Ty) -> Vec<Ty> {
         }
     }
     match ty.kind() {
-        TyKind::Union(members, _) => members.iter().map(widen).collect(),
-        _ => vec![widen(ty)],
+        InferTy::Union(members, _) => members.iter().map(|member| widen(lang, member)).collect(),
+        _ => vec![widen(lang, ty)],
     }
 }
 
@@ -11475,49 +13807,5 @@ mod syntactic_union_tests {
         let nested = union(&[Ty::int(), Ty::string()]);
         let flat = syntactic_union(&[nested, Ty::int()]);
         assert_eq!(flat, union(&[Ty::int(), Ty::string()]));
-    }
-}
-
-#[cfg(test)]
-mod runtime_param_escape_tests {
-    use super::*;
-
-    fn param() -> baml_type::ParamTy {
-        baml_type::ParamTy::new(0x8000_0001, baml_type::Name::new("Out"))
-    }
-
-    fn var(param: &baml_type::ParamTy) -> Ty {
-        Ty::intern(TyKind::TypeVar(param.clone(), TyAttr::default()))
-    }
-
-    /// The whole rule is one boundary: the parameter ITSELF is a value's type
-    /// and does not escape; one constructor deeper it is an assertion about a
-    /// value, and does.
-    #[test]
-    fn the_bare_parameter_is_the_only_shape_that_does_not_escape() {
-        let param = param();
-        assert!(!runtime_param_escapes(&var(&param), &param));
-        assert!(!runtime_param_escapes(&Ty::int(), &param));
-        assert!(!runtime_param_escapes(&Ty::never(), &param));
-        assert!(runtime_param_escapes(
-            &Ty::intern(TyKind::List(var(&param), TyAttr::default())),
-            &param
-        ));
-        assert!(runtime_param_escapes(
-            &syntactic_union(&[var(&param), Ty::null()]),
-            &param
-        ));
-    }
-
-    /// A different parameter is a different name: an occurs-check that keyed on
-    /// shape alone would refuse every generic result.
-    #[test]
-    fn another_parameter_is_not_this_one() {
-        let other = baml_type::ParamTy::new(0x8000_0002, baml_type::Name::new("Other"));
-        assert!(!runtime_param_escapes(&var(&other), &param()));
-        assert!(!runtime_param_escapes(
-            &Ty::intern(TyKind::List(var(&other), TyAttr::default())),
-            &param()
-        ));
     }
 }

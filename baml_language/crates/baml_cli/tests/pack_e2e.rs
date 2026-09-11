@@ -127,7 +127,7 @@ function Plan(state: AgentState) -> string {
 
 function main() -> string throws unknown {
   let skill = reflect.Package.compile(
-    { "skill.baml": #"
+    { "skill.baml": `
 class PlanThenAct {
   summary string
   steps string[]
@@ -137,7 +137,7 @@ class PlanThenAct {
 function Run(state: app.AgentState) -> PlanThenAct {
   PlanThenAct { summary: app.Plan(state), steps: [] }
 }
-"# },
+` },
     packages = { "app": reflect.Package.current() },
   )
   let run = skill.get_function<(AgentState) -> AgentAction>("root.Run")
@@ -178,6 +178,7 @@ fn pack_e2e_omits_compile_file_status() {
         // Pin the human preset so inherited agent env (CLAUDECODE/AI_AGENT/…)
         // cannot flip `--output-preset auto` to `agent` and hide progress lines.
         .env("BAML_OUTPUT_PRESET", "human")
+        .env("BAML_AGENT_SKILL_CHECK", "off")
         .env("BAML_CACHE_DIR", common::shared_cache_dir())
         .arg("pack")
         .arg("--from")

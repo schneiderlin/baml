@@ -1,76 +1,103 @@
-// Streaming: the raw text-delta stream of one model turn (TurnStream), the
-// typed partial-value stream returned to BAML and host SDKs (Stream), and the
-// one-turn streaming runner (from_spec). Streaming is a client capability: a
-// client that can stream implements StreamingClient; `Fn$stream` companions
-// call from_spec.
-//
-// Phase 1 scope: one model turn, no tool loop. A spec whose toolbox is not
-// empty is rejected with baml.errors.InvalidArgument.
-//
-// ─── Stream termination contract ─────────────────────────────────────────────
-//
-// A TurnStream can end two ways, and they are NOT the same event:
-//
-//   1. TERMINAL EVENT. The decoder yields `TurnDone` because the provider sent
-//      its explicit end-of-turn marker — OpenAI `[DONE]` / `response.completed`,
-//      Anthropic `message_stop`, Gemini a chunk carrying `finishReason`.
-//      The turn is complete and everything the model produced was received.
-//   2. SOCKET CLOSE. `SseStream.next()` returns null: the connection ended.
-//      With no terminal event before it, that is a TRUNCATED turn — a proxy
-//      timing out, a dropped connection, a provider killing the response
-//      mid-generation. The text received so far is a PREFIX of the answer.
-//
-// By default a TurnStream treats (2) as (1): the stream completes and
-// `final_turn()` reports `StopReason.Complete`. That default exists for
-// protocols with no terminal sentinel at all, and it is unsafe for every
-// protocol that HAS one — a mid-stream disconnect is silently reported to the
-// caller as a successful, complete turn carrying truncated text.
-//
-// A decoder whose protocol has a terminal event therefore opts in to strict
-// termination by passing its provider id as `from_sse`'s `require_terminal`:
-//
-//     ai.stream.TurnStream.from_sse(sse, decode, require_terminal = "anthropic")
-//
-// A strict stream that reaches end-of-connection without ever having decoded a
-// `TurnDone` throws `ai.errors.NetworkFailure` ("stream ended before the
-// provider's terminal event") from `next()` / `final_turn()` instead of
-// fabricating a completed turn. `NetworkFailure.retry_safety()` is `Safe`, and
-// that is honest here: the streaming path runs one turn with no tool loop, and
-// a turn that never finished is never committed to the journal, so nothing
-// local advanced and re-issuing the request replays no effects.
-//
-// Opting in is per call site and additive: a `from_sse` call that omits
-// `require_terminal` keeps the historical close-completes-the-turn behavior,
-// and `from_chunks` (scripted, no wire) is never strict.
+//! Streaming: the raw text-delta stream of one model turn (TurnStream), the
+//! typed partial-value stream returned to BAML and host SDKs (Stream), and the
+//! one-turn streaming runner (from_spec). Streaming is a client capability: a
+//! client that can stream implements StreamingClient; the compiler-private
+//! `Fn@stream` entry binds the authored function's spec and calls from_spec.
+//!
+//! Phase 1 scope: one model turn, no tool loop. A spec whose toolbox is not
+//! empty is rejected with baml.errors.InvalidArgument.
+//!
+//! ─── Stream termination contract ─────────────────────────────────────────────
+//!
+//! A TurnStream can end two ways, and they are NOT the same event:
+//!
+//!   1. TERMINAL EVENT. The decoder yields `TurnDone` because the provider sent
+//!      its explicit end-of-turn marker — OpenAI `[DONE]` / `response.completed`,
+//!      Anthropic `message_stop`, Gemini a chunk carrying `finishReason`.
+//!      The turn is complete and everything the model produced was received.
+//!   2. SOCKET CLOSE. `SseStream.next()` returns null: the connection ended.
+//!      With no terminal event before it, that is a TRUNCATED turn — a proxy
+//!      timing out, a dropped connection, a provider killing the response
+//!      mid-generation. The text received so far is a PREFIX of the answer.
+//!
+//! By default a TurnStream treats (2) as (1): the stream completes and
+//! `final_turn()` reports `StopReason.Complete`. That default exists for
+//! protocols with no terminal sentinel at all, and it is unsafe for every
+//! protocol that HAS one — a mid-stream disconnect is silently reported to the
+//! caller as a successful, complete turn carrying truncated text.
+//!
+//! A decoder whose protocol has a terminal event therefore opts in to strict
+//! termination by passing its provider id as `from_sse`'s `require_terminal`:
+//!
+//!     ai.stream.TurnStream.from_sse(sse, decode, require_terminal = "anthropic")
+//!
+//! A strict stream that reaches end-of-connection without ever having decoded a
+//! `TurnDone` throws `ai.errors.NetworkFailure` ("stream ended before the
+//! provider's terminal event") from `next()` / `final_turn()` instead of
+//! fabricating a completed turn. `NetworkFailure.retry_safety()` is `Safe`, and
+//! that is honest here: the streaming path runs one turn with no tool loop, and
+//! a turn that never finished is never committed to the journal, so nothing
+//! local advanced and re-issuing the request replays no effects.
+//!
+//! Opting in is per call site and additive: a `from_sse` call that omits
+//! `require_terminal` keeps the historical close-completes-the-turn behavior,
+//! and `from_chunks` (scripted, no wire) is never strict.
 
-// A client that can render the same request as `invoke` but streamed.
-// Implementors must also implement Client (`requires`).
+/// A client that can render the same request as `invoke` but streamed.
+/// Implementors must also implement Client (`requires`).
 interface StreamingClient requires root.Client {
-    // InvokeError, not just Failure | UnknownError: a streaming invocation
-    // preserves Timeout/Cancelled/CompilationError exactly like Client.invoke.
-    function invoke_stream(self, input: root.ModelTurnInput) -> TurnStream throws root.errors.InvokeError
+    /// InvokeError, not just Failure | UnknownError: a streaming invocation
+    /// preserves Timeout/Cancelled/CompilationError exactly like Client.invoke.
+    function invoke_stream(
+        self,
+        input: root.ModelTurnInput,
+    ) -> TurnStream throws root.errors.InvokeError;
 }
 
-// One decoded raw SSE event, as produced by `baml.http.SseStream.next()`:
-// the batch string is a JSON array of these objects.
+/// One decoded raw SSE event, as produced by `baml.http.SseStream.next()`:
+/// the batch string is a JSON array of these objects.
 class SseEvent {
     event: string?,
     data: string?,
     id: string?,
 }
 
-// One `SseStream.next()` batch -> the raw SSE events it contains. Provider
-// decoders parse each event's `data` payload with their own envelope classes.
+/// One `SseStream.next()` batch -> the raw SSE events it contains. Provider
+/// decoders parse each event's `data` payload with their own envelope classes.
 function decode_sse_batch(batch: string) -> SseEvent[] {
     baml.json.from_string<SseEvent[]>(batch)
 }
 
 // The provider-agnostic events a decoder yields from one SSE batch.
 
-// One incremental piece of assistant text. The delta contract: the chunk is
-// NOT the accumulated text so far, it is only the newly arrived piece.
+/// One incremental piece of assistant text. The delta contract: the chunk is
+/// NOT the accumulated text so far, it is only the newly arrived piece.
 class TextDelta {
     text: string,
+}
+
+// One incremental piece of model reasoning. Reasoning is separate from answer
+// text: typed function streams must never feed it to SAP, while runners and UI
+// projections still need it for activity and observability.
+class ReasoningDelta {
+    summary: string,
+}
+
+// One incremental tool-call wire fragment, normalized just enough to correlate
+// fragments across providers. `arguments` is a JSON STRING FRAGMENT and is not
+// required to parse until the provider emits ToolUseDone.
+class ToolUseDelta {
+    index: int,
+    id: string?,
+    name: string?,
+    arguments: string?,
+}
+
+// A provider decoder emits this after it has assembled and validated one whole
+// tool call. TurnStream folds these canonical blocks into final_turn(); callers
+// may use ToolUseDelta for live activity without needing provider wire details.
+class ToolUseDone {
+    tool_use: root.content.ToolUse,
 }
 
 // Turn metadata as it arrives on the wire. Providers send stop_reason and
@@ -80,57 +107,73 @@ class TurnMeta {
     stop_reason: root.content.StopReason?,
     input_tokens: int?,
     output_tokens: int?,
+    cached_input_tokens: int?,
+    reasoning_tokens: int?,
 }
 
-// The provider's explicit end-of-turn marker — the decoded form of `[DONE]`,
-// `response.completed`, `message_stop`, a chunk with `finishReason`, …
-//
-// A decoder for a protocol that HAS such a marker must yield TurnDone when it
-// sees it AND its `from_sse` call must pass `require_terminal` (see the
-// termination contract at the top of this file); the stream then reports a
-// connection that closed early as a failure instead of a complete turn. For a
-// protocol with no terminal marker, TurnDone is optional and a socket close
-// still completes the turn.
+/// The provider's explicit end-of-turn marker — the decoded form of `[DONE]`,
+/// `response.completed`, `message_stop`, a chunk with `finishReason`, …
+///
+/// A decoder for a protocol that HAS such a marker must yield TurnDone when it
+/// sees it AND its `from_sse` call must pass `require_terminal` (see the
+/// termination contract at the top of this file); the stream then reports a
+/// connection that closed early as a failure instead of a complete turn. For a
+/// protocol with no terminal marker, TurnDone is optional and a socket close
+/// still completes the turn.
 class TurnDone {
 }
 
-type StreamEvent = TextDelta | TurnMeta | TurnDone;
+/// One provider-agnostic event decoded from an SSE batch: a piece of
+/// assistant text or reasoning, tool activity, turn metadata, or the
+/// provider's end-of-turn marker.
+type Event = TextDelta | ReasoningDelta | ToolUseDelta | ToolUseDone | TurnMeta | TurnDone;
 
-// The single end-of-stream marker returned by both raw turn streams and typed
-// function streams. A nominal sentinel is required because null may itself be
-// a valid partial value.
+/// The single end-of-stream marker returned by both raw turn streams and typed
+/// function streams. A nominal sentinel is required because null may itself be
+/// a valid partial value.
 class Done {
 }
 
-type EventSource = () -> StreamEvent | Done throws root.errors.InvokeError;
+/// Pulls the next normalized event, or `Done` once the turn is over.
+///
+/// The callback behind `TurnStream.from_event_source`: it lets a composite
+/// client relay a member's events without exposing that member's wire
+/// format.
+type EventSource = () -> Event | Done throws root.errors.InvokeError;
 
-// The raw text-delta stream of ONE model turn. Pull-based: nothing is read
-// from the wire until `next()` or `final_turn()` is called.
+// The raw content-event stream of ONE model turn. Pull-based: nothing is read
+// from the wire until `next_event()`, `next()`, or `final_turn()` is called.
 //
-// `next()` yields DELTA chunks (each item is only the newly arrived text,
-// never the accumulated prefix) and returns Done when the turn is over.
+// `next_event()` yields every normalized provider event. `next()` is the
+// backwards-compatible text-only view: it yields TextDelta strings and folds
+// reasoning, tool, and metadata events silently.
 // `final_turn()` drains the rest of the stream and returns the completed
-// turn: the accumulated text as one Text block, the folded stop_reason, and
-// usage where the wire provided token counts.
+// turn: accumulated reasoning/text, completed tool uses, folded stop_reason,
+// and usage where the wire provided token counts.
 class TurnStream {
     // callback-backed streams: composite clients use this to relay normalized
     // events from a selected member without exposing provider wire details.
     _event_source: EventSource?,
+    _close_source: (() -> void throws never)?,
     // wire-backed streams: the SSE connection plus a per-provider decoder
-    // that turns one `SseStream.next()` batch into StreamEvents.
+    // that turns one `SseStream.next()` batch into Events.
     _sse: baml.http.SseStream?,
-    _decode: ((string) -> StreamEvent[] throws root.errors.InvokeError)?,
+    _decode: ((string) -> Event[] throws root.errors.InvokeError)?,
     // scripted streams (tests): literal delta chunks, no network.
     _chunks: string[],
     _cursor: int,
     // decoded events not yet delivered.
-    _pending: StreamEvent[],
+    _pending: Event[],
     _pcursor: int,
     // folded state.
     _text: string,
+    _reasoning: string,
+    _tool_uses: root.content.ToolUse[],
     _stop_reason: root.content.StopReason?,
     _input_tokens: int?,
     _output_tokens: int?,
+    _cached_input_tokens: int?,
+    _reasoning_tokens: int?,
     _done: bool,
     // strict termination (see the contract at the top of this file): the
     // provider id when this stream requires an explicit TurnDone, null when a
@@ -138,25 +181,38 @@ class TurnStream {
     _require_terminal: string?,
     // whether a TurnDone was actually decoded before the stream ended.
     _saw_terminal: bool,
+    // Wire telemetry (LLMCall records), surfaced by final_turn().calls.
+    // _calls is the full oldest-first list; composite relays share it by
+    // reference to prepend failed legs. _wire_call is THIS stream's own
+    // exchange record (set by provider invoke_stream implementations), which
+    // ttft/duration stamping and SSE capture mutate in place.
+    _calls: root.events.LLMCall[],
+    _wire_call: root.events.LLMCall?,
+    _call_started: baml.time.Instant?,
+    // TTFT base: stamped when the SSE response opened (legacy TTFT semantics);
+    // falls back to _call_started when a provider did not set it.
+    _ttft_from: baml.time.Instant?,
+    _capture_sse: bool,
 
-    // A turn stream over a live SSE connection. `decode` receives the raw
-    // batch string from `sse.next()` (a JSON array of SseEvent objects; see
-    // decode_sse_batch) and yields the events it contains.
-    //
-    // `require_terminal` opts into the strict termination contract: pass the
-    // provider id (`"anthropic"`, `"openai"`, …) when the protocol has an
-    // explicit end-of-turn event that the decoder yields as `TurnDone`. The
-    // stream then throws `ai.errors.NetworkFailure` if the connection ends
-    // before that event arrives, rather than reporting the truncated text as a
-    // completed turn. Leave it null (the default) only for a protocol whose
-    // sole end-of-turn signal IS the socket closing.
+    /// A turn stream over a live SSE connection. `decode` receives the raw
+    /// batch string from `sse.next()` (a JSON array of SseEvent objects; see
+    /// decode_sse_batch) and yields the events it contains.
+    ///
+    /// `require_terminal` opts into the strict termination contract: pass the
+    /// provider id (`"anthropic"`, `"openai"`, …) when the protocol has an
+    /// explicit end-of-turn event that the decoder yields as `TurnDone`. The
+    /// stream then throws `ai.errors.NetworkFailure` if the connection ends
+    /// before that event arrives, rather than reporting the truncated text as a
+    /// completed turn. Leave it null (the default) only for a protocol whose
+    /// sole end-of-turn signal IS the socket closing.
     function from_sse(
         sse: baml.http.SseStream,
-        decode: (string) -> StreamEvent[] throws root.errors.InvokeError,
+        decode: (string) -> Event[] throws root.errors.InvokeError,
         require_terminal: string? = null,
     ) -> TurnStream {
         TurnStream {
             _event_source: null,
+            _close_source: null,
             _sse: sse,
             _decode: decode,
             _chunks: [],
@@ -164,22 +220,32 @@ class TurnStream {
             _pending: [],
             _pcursor: 0,
             _text: "",
+            _reasoning: "",
+            _tool_uses: [],
             _stop_reason: null,
             _input_tokens: null,
             _output_tokens: null,
+            _cached_input_tokens: null,
+            _reasoning_tokens: null,
             _done: false,
             _require_terminal: require_terminal,
             _saw_terminal: false,
+            _calls: [],
+            _wire_call: null,
+            _call_started: null,
+            _ttft_from: null,
+            _capture_sse: false,
         }
     }
 
-    // A turn stream fed from literal delta chunks — the scripted counterpart
-    // of a live stream, for tests. There is no wire to be cut, so a scripted
-    // stream is never strict: the turn completes as StopReason.Complete after
-    // the last chunk.
+    /// A turn stream fed from literal delta chunks — the scripted counterpart
+    /// of a live stream, for tests. There is no wire to be cut, so a scripted
+    /// stream is never strict: the turn completes as StopReason.Complete after
+    /// the last chunk.
     function from_chunks(chunks: string[]) -> TurnStream {
         TurnStream {
             _event_source: null,
+            _close_source: null,
             _sse: null,
             _decode: null,
             _chunks: chunks,
@@ -187,12 +253,21 @@ class TurnStream {
             _pending: [],
             _pcursor: 0,
             _text: "",
+            _reasoning: "",
+            _tool_uses: [],
             _stop_reason: null,
             _input_tokens: null,
             _output_tokens: null,
+            _cached_input_tokens: null,
+            _reasoning_tokens: null,
             _done: false,
             _require_terminal: null,
             _saw_terminal: false,
+            _calls: [],
+            _wire_call: null,
+            _call_started: null,
+            _ttft_from: null,
+            _capture_sse: false,
         }
     }
 
@@ -201,9 +276,13 @@ class TurnStream {
     // retaining TurnStream's ordinary accumulation and termination behavior.
     // The source itself owns any retry/fallback policy; once it returns a
     // TextDelta, that delta is immediately visible to the caller.
-    function from_event_source(next_event: EventSource) -> TurnStream {
+    function from_event_source(
+        next_event: EventSource,
+        close: (() -> void throws never)? = null,
+    ) -> TurnStream {
         TurnStream {
             _event_source: next_event,
+            _close_source: close,
             _sse: null,
             _decode: null,
             _chunks: [],
@@ -211,26 +290,80 @@ class TurnStream {
             _pending: [],
             _pcursor: 0,
             _text: "",
+            _reasoning: "",
+            _tool_uses: [],
             _stop_reason: null,
             _input_tokens: null,
             _output_tokens: null,
+            _cached_input_tokens: null,
+            _reasoning_tokens: null,
             _done: false,
             _require_terminal: null,
             _saw_terminal: false,
+            _calls: [],
+            _wire_call: null,
+            _call_started: null,
+            _ttft_from: null,
+            _capture_sse: false,
         }
     }
 
+    /// (internal) Stamp time-to-first-token on this stream's wire record, once.
+    function _stamp_first_delta(self) -> void {
+        if let call: root.events.LLMCall = self._wire_call {
+            if (call.timing.ttft_ms == null) {
+                if let base: baml.time.Instant = self._ttft_from ?? self._call_started {
+                    call.timing.ttft_ms = base.elapsed().to_milliseconds();
+                }
+            }
+        }
+    }
+
+    /// (internal) Append a raw SSE batch to the wire record when capture is on. Telemetry
+    /// must never fail the stream, so a malformed batch is skipped.
+    function _capture_batch(self, batch: string) -> void {
+        if (!self._capture_sse) {
+            return;
+        }
+        if let call: root.events.LLMCall = self._wire_call {
+            let none: SseEvent[] = [];
+            let decoded = decode_sse_batch(batch) catch_all (e) {
+                _ => none,
+            };
+            let records = call.sse_responses ?? [];
+            for (let e in decoded) {
+                records.push(root.events.SseEventRecord { event: e.event, data: e.data, id: e.id });
+            }
+            call.sse_responses = records;
+        }
+    }
+
+    /// (internal) Marks the turn over and releases the SSE connection
+    /// behind it, if this stream has one.
     function _finish(self) -> void {
+        if (self._done) {
+            return;
+        }
         self._done = true;
         if let sse: baml.http.SseStream = self._sse {
             sse.close();
         }
+        if let close: () -> void throws never = self._close_source {
+            close();
+        }
     }
 
-    // The strict-termination check: a no-op unless this stream required an
-    // explicit terminal event and the stream ended without one, in which case
-    // the truncated turn is reported as the transport failure it is instead of
-    // being passed off as complete. Called on every end-of-stream path.
+    // Stop pulling and close the underlying SSE connection. Idempotent and
+    // public so a runner can cancel a stream when its own idle/overall budget
+    // expires instead of leaving the model request detached.
+    function close(self) -> void {
+        self._finish()
+    }
+
+    /// (internal) The strict-termination check: a no-op unless this stream required an
+    /// explicit terminal event and the stream ended without one, in which case
+    /// the truncated turn is reported as the transport failure it is instead of
+    /// being passed off as complete. Called on every end-of-stream path.
     function _check_terminal(self) -> void {
         if let provider: string = self._require_terminal {
             if (!self._saw_terminal) {
@@ -239,7 +372,7 @@ class TurnStream {
                 } else {
                     self._text
                 };
-                throw root.errors.NetworkFailure {
+                throw root.errors.NetworkFailure { status_code: null,
                     provider: provider,
                     detail: `stream ended before the provider's terminal event: the connection closed after ${self._text.length()} characters of assistant text with no end-of-turn event, so the turn is truncated`,
                     raw_body: partial,
@@ -248,21 +381,33 @@ class TurnStream {
         }
     }
 
-    // The next text DELTA, or Done when the turn is over. Metadata events are
-    // folded silently; calling next() after Done keeps returning Done.
-    function next(self) -> string | Done {
+    // The next normalized provider event, or Done after the turn is over.
+    // Every returned event has already been folded into final_turn() state.
+    function next_event(self) -> Event | Done {
         while (true) {
             if (self._done) {
                 return Done {  };
             }
-            // deliver decoded events before pulling more from the wire
-            if (self._pcursor < self._pending.length()) {
+            // deliver every decoded event before pulling more from the wire
+            while (self._pcursor < self._pending.length()) {
                 let e = self._pending.at(self._pcursor);
                 self._pcursor += 1;
                 match (e) {
                     let d: TextDelta => {
+                        self._stamp_first_delta();
                         self._text = `${self._text}${d.text}`;
-                        return d.text;
+                        return d;
+                    },
+                    let d: ReasoningDelta => {
+                        self._reasoning = `${self._reasoning}${d.summary}`;
+                        return d;
+                    },
+                    let d: ToolUseDelta => {
+                        return d;
+                    },
+                    let d: ToolUseDone => {
+                        self._tool_uses.push(d.tool_use);
+                        return d;
                     },
                     let m: TurnMeta => {
                         if let s: root.content.StopReason = m.stop_reason {
@@ -274,20 +419,25 @@ class TurnStream {
                         if let o: int = m.output_tokens {
                             self._output_tokens = o;
                         }
-                        null
+                        if let c: int = m.cached_input_tokens {
+                            self._cached_input_tokens = c;
+                        }
+                        if let r: int = m.reasoning_tokens {
+                            self._reasoning_tokens = r;
+                        }
+                        return m;
                     },
                     let d: TurnDone => {
                         self._saw_terminal = true;
                         self._finish();
-                        return Done {  };
+                        return d;
                     },
                     null => null,
                 };
-                continue;
             }
             if let source: EventSource = self._event_source {
                 match (source()) {
-                    let event: StreamEvent => {
+                    let event: Event => {
                         self._pending.push(event);
                         null
                     },
@@ -310,7 +460,8 @@ class TurnStream {
                             return Done {  };
                         },
                         let batch: string => {
-                            if let decode: (string) -> StreamEvent[] throws root.errors.InvokeError = self._decode {
+                            self._capture_batch(batch);
+                            if let decode: (string) -> Event[] throws root.errors.InvokeError = self._decode {
                                 for (let e in decode(batch)) {
                                     self._pending.push(e);
                                 }
@@ -327,9 +478,10 @@ class TurnStream {
                     // scripted: each chunk is one delta
                     match (self._chunks.at(self._cursor)) {
                         let c: string => {
+                            self._stamp_first_delta();
                             self._cursor += 1;
                             self._text = `${self._text}${c}`;
-                            return c;
+                            return TextDelta { text: c };
                         },
                         null => {
                             self._finish();
@@ -338,6 +490,122 @@ class TurnStream {
                     }
                 },
             };
+        }
+        baml.sys.panic("unreachable")
+    }
+
+    // All READY text deltas, or Done when the turn is over. Non-text events
+    // are folded silently; calling next() after Done keeps returning Done.
+    // Every event already decoded is folded before the wire is pulled again,
+    // preserving the drain-ready batching contract for typed streams.
+    function next(self) -> string[] | Done {
+        let ready: string[] = [];
+        while (true) {
+            if (self._done) {
+                return Done {  };
+            }
+            while (self._pcursor < self._pending.length()) {
+                let e = self._pending.at(self._pcursor);
+                self._pcursor += 1;
+                match (e) {
+                    let d: TextDelta => {
+                        self._stamp_first_delta();
+                        self._text = `${self._text}${d.text}`;
+                        ready.push(d.text);
+                        null
+                    },
+                    let d: ReasoningDelta => {
+                        self._reasoning = `${self._reasoning}${d.summary}`;
+                        null
+                    },
+                    let d: ToolUseDelta => null,
+                    let d: ToolUseDone => {
+                        self._tool_uses.push(d.tool_use);
+                        null
+                    },
+                    let m: TurnMeta => {
+                        if let s: root.content.StopReason = m.stop_reason {
+                            self._stop_reason = s;
+                        }
+                        if let i: int = m.input_tokens {
+                            self._input_tokens = i;
+                        }
+                        if let o: int = m.output_tokens {
+                            self._output_tokens = o;
+                        }
+                        if let c: int = m.cached_input_tokens {
+                            self._cached_input_tokens = c;
+                        }
+                        if let r: int = m.reasoning_tokens {
+                            self._reasoning_tokens = r;
+                        }
+                        null
+                    },
+                    let d: TurnDone => {
+                        self._saw_terminal = true;
+                        self._finish();
+                        if (ready.length() > 0) {
+                            return ready;
+                        }
+                        return Done {  };
+                    },
+                    null => null,
+                };
+            }
+            if (ready.length() > 0) {
+                return ready;
+            }
+            if let source: EventSource = self._event_source {
+                match (source()) {
+                    let event: Event => {
+                        self._pending.push(event);
+                        null
+                    },
+                    let done: Done => {
+                        self._finish();
+                        return done;
+                    },
+                };
+                continue;
+            }
+            match (self._sse) {
+                let sse: baml.http.SseStream => {
+                    match (sse.next()) {
+                        null => {
+                            self._finish();
+                            self._check_terminal();
+                            return Done {  };
+                        },
+                        let batch: string => {
+                            self._capture_batch(batch);
+                            if let decode: (string) -> Event[] throws root.errors.InvokeError = self._decode {
+                                for (let e in decode(batch)) {
+                                    self._pending.push(e);
+                                }
+                                null
+                            } else {
+                                null
+                            };
+                            null
+                        },
+                    };
+                    null
+                },
+                null => {
+                    match (self._chunks.at(self._cursor)) {
+                        let c: string => {
+                            self._stamp_first_delta();
+                            self._cursor += 1;
+                            self._text = `${self._text}${c}`;
+                            return [c];
+                        },
+                        null => {
+                            self._finish();
+                            return Done {  };
+                        },
+                    }
+                },
+            }
         }
         baml.sys.panic("unreachable")
     }
@@ -351,7 +619,7 @@ class TurnStream {
     // truncated stream into a `StopReason.Complete` answer.
     function final_turn(self) -> root.ModelTurn {
         while (true) {
-            match (self.next()) {
+            match (self.next_event()) {
                 let d: Done => {
                     break;
                 },
@@ -362,30 +630,54 @@ class TurnStream {
         // covers a stream finished by some other route (a Done delivered from
         // an already-closed stream) before the terminal event was seen.
         self._check_terminal();
-        let usage: root.events.Usage? = if (self._input_tokens != null || self._output_tokens != null) {
+        let usage: root.events.Usage? = if (
+            self._input_tokens != null
+                || self._output_tokens != null
+                || self._cached_input_tokens != null
+                || self._reasoning_tokens != null
+        ) {
             root.events.Usage {
                 input_tokens: self._input_tokens ?? 0,
                 output_tokens: self._output_tokens ?? 0,
-                cached_input_tokens: null,
-                reasoning_tokens: null,
+                cached_input_tokens: self._cached_input_tokens,
+                reasoning_tokens: self._reasoning_tokens,
             }
         } else {
             null
         };
+        if let call: root.events.LLMCall = self._wire_call {
+            if (call.timing.duration_ms == null) {
+                if let started: baml.time.Instant = self._call_started {
+                    call.timing.duration_ms = started.elapsed().to_milliseconds();
+                }
+            }
+        }
+        let content: root.content.ModelBlock[] = [];
+        if (self._reasoning != "") {
+            content.push(root.content.Reasoning { summary: self._reasoning });
+        }
+        // Preserve the historical final_turn shape: even an empty stream has
+        // one Text block, and terminal_text() therefore returns "" rather than
+        // null. Reasoning never enters this block or typed SAP parsing.
+        content.push(root.content.Text { text: self._text });
+        for (let tool_use in self._tool_uses) {
+            content.push(tool_use);
+        }
         root.ModelTurn {
-            content: [root.content.Text { text: self._text }],
+            content: content,
             stop_reason: self._stop_reason ?? root.content.StopReason.Complete,
             usage: usage,
+            calls: self._calls,
         }
     }
 }
 
-// The typed partial-value stream returned by an LLM function's `$stream`
-// companion. This is the one canonical host-stream class; tagged handles carry
-// its FQN across FFI so host bridges do not need to hardcode a namespace.
+/// The typed partial-value stream returned by an LLM function's `@stream`
+/// projection. This is the one canonical host-stream class; tagged handles carry
+/// its FQN across FFI so host bridges do not need to hardcode a namespace.
 class Stream<TStream, TFinal> {
     _next_text: () -> string? throws root.errors.InvokeError,
-    _cache: baml.sap.ParseCache<TStream, TFinal>,
+    _cache: baml.sap._ParseCache<TStream, TFinal>,
     _text: string,
     _finished: bool,
 
@@ -402,9 +694,9 @@ class Stream<TStream, TFinal> {
                 },
                 let s: string => {
                     self._text = self._text + s;
-                    let parsed: TStream | baml.sap.NoYield = baml.sap.__parse_partial<TStream, TFinal>(self._text, self._cache);
+                    let parsed: TStream | baml.sap._NoYield = self._cache._parse_partial(self._text);
                     match (parsed) {
-                        baml.sap.NoYield => {},
+                        baml.sap._NoYield => {},
                         let p: TStream => {
                             return p;
                         },
@@ -427,23 +719,25 @@ class Stream<TStream, TFinal> {
                 },
             }
         }
-        baml.sap.__parse_final<TStream, TFinal>(self._text, self._cache)
+        self._cache._parse_final(self._text)
     }
 }
 
-// One-turn streaming over a spec: render the spec's prompt exactly as the
-// default runner's first turn would, require a streaming-capable client, and
-// return the typed partial stream. `Fn$stream(...)` desugars to
-// `ai.stream.from_spec<Out$stream, Out>(Fn$spec(...), client)`.
-//
-// Streaming does not run the tool loop yet: a spec with a non-empty toolbox
-// is rejected. The client override is typed as the capability, so passing a
-// non-streaming client fails at the call site; the spec's DEFAULT client is
-// only checked at runtime (root.errors.StreamingUnsupported when it cannot
-// stream).
+/// One-turn streaming over a spec: render the spec's prompt exactly as the
+/// default runner's first turn would, require a streaming-capable client, and
+/// return the typed partial stream. The compiler-private `Fn@stream` entry
+/// calls this function with the `Out$stream` partial schema; host stream
+/// helpers reach that companion through the normal bridge.
+///
+/// Streaming does not run the tool loop yet: a spec with a non-empty toolbox
+/// is rejected. The client override is typed as the capability, so passing a
+/// non-streaming client fails at the call site; the spec's DEFAULT client is
+/// only checked at runtime (ai.errors.StreamingUnsupported when it cannot
+/// stream).
 function from_spec<TStream, TFinal>(
     spec: root.FunctionSpec<TFinal>,
     client: StreamingClient? = null,
+    on_event: ((root.events.Event) -> void)? = null,
 ) -> Stream<TStream, TFinal> {
     if (!spec.tools().is_empty()) {
         throw baml.errors.InvalidArgument {
@@ -467,6 +761,11 @@ function from_spec<TStream, TFinal>(
     let provider = match (selected) {
         let c: root.Client => c.id(),
     };
+    let emit = root.events.guard(on_event);
+    let settled = false;
+    if let cb: (root.events.Event) -> void throws never = emit {
+        cb(root.events.RunStarted { spec_name: spec.name(), arguments: spec.arguments() });
+    }
     let turns = selected.invoke_stream(
         root.ModelTurnInput {
             prompt: spec.prompt_template,
@@ -477,17 +776,41 @@ function from_spec<TStream, TFinal>(
     );
     // The host-facing stream is `ai.stream.Stream`. It is provider-agnostic:
     // all it needs is a way to pull the next text delta from TurnStream.
-    let _ = provider;
     Stream {
         _next_text: () -> {
             match (turns.next()) {
-                let d: Done => null,
-                let s: string => s,
+                let d: Done => {
+                    // Settle: fold the completed turn (this is where the
+                    // previously-discarded streamed usage is recovered) and
+                    // emit the same events the Agent path emits. The flag
+                    // guards re-entry: a listener that pulls this same stream
+                    // (e.g. calls final() mid-callback) must not re-settle.
+                    if (!settled) {
+                        settled = true;
+                        if let cb: (root.events.Event) -> void throws never = emit {
+                            let turn = turns.final_turn();
+                            cb(
+                                root.events.AssistantMessage {
+                                    content: turn.content,
+                                    client_id: provider,
+                                },
+                            );
+                            if let u: root.events.Usage = turn.usage {
+                                cb(u);
+                            }
+                            for (let call in turn.calls) {
+                                cb(call);
+                            }
+                        }
+                    }
+                    null
+                },
+                let batch: string[] => batch.join(""),
             } catch_all (e) {
                 _ => throw root.errors.normalize(e),
             }
         },
-        _cache: baml.sap.__new_parse_cache<TStream, TFinal>(),
+        _cache: baml.sap._new_parse_cache<TStream, TFinal>(),
         _text: "",
         _finished: false,
     }

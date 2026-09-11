@@ -40,7 +40,7 @@ class MockRequest {
     body: string,
 
     // The request body parsed as JSON, for `baml.json.path<T>(req.json(), ".model")`.
-    // Throws `baml.json.JsonParseError` if the client did not send JSON.
+    // Throws `baml.json.ParseError` if the client did not send JSON.
     function json(self) -> json {
         baml.json.parse(self.body)
     }
@@ -147,8 +147,27 @@ class MockJsonServer {
                 let body = canned.body;
                 spawn {
                     baml.sys.sleep(delay);
-                    response.write(body.to_utf8());
-                    response.end();
+                    // The delayed write races the client: a request-timeout
+                    // test hangs up before `delay` elapses, and if teardown
+                    // loses the race to cancel this task, writing into the
+                    // closed stream throws the hangup `Io` — the outcome the
+                    // test arranged, not a mock failure. Any OTHER I/O error
+                    // is a real mock failure and still propagates as an
+                    // unhandled spawn error (same filter as
+                    // `MockSseServer.handle`).
+                    {
+                        response.write(body.to_utf8());
+                        response.end();
+                        null
+                    } catch (e) {
+                        baml.errors.Io => {
+                            if (e.message == "streaming response could not be written: the client has hung up") {
+                                null
+                            } else {
+                                throw e
+                            }
+                        }
+                    };
                     null
                 };
                 response
@@ -410,4 +429,64 @@ function mock_sse_events_roundtrip() -> string {
 
 test "mock_sse_events_roundtrip" {
     assert.equal(mock_sse_events_roundtrip(), "event: a\ndata: 1 / event: b\ndata: 2")
+}
+
+// ─── shared journal fixture: media in tool results and user turns ────────────
+
+/// The seed for every client's Accept / Degrade / Reject test: one assistant
+/// turn issuing two tool calls, a text-only result for the first (`call_text`,
+/// tool `lookup`), a result carrying text plus `media` for the second
+/// (`call_media`, tool `capture`), then a user turn carrying text plus the
+/// same `media`. Each client test asserts where the media landed on the wire
+/// and that the text-only result kept its plain-string shape.
+function media_journal(client_id: string, media: image | audio | video | pdf) -> ai.Journal {
+    let args: map<string, unknown> = {};
+    ai.Journal {
+        log: [
+            ai.events.AssistantMessage {
+                content: [
+                    ai.content.ToolUse { id: "call_text", name: "lookup", args: args },
+                    ai.content.ToolUse { id: "call_media", name: "capture", args: args },
+                ],
+                client_id: client_id,
+            },
+            ai.events.ToolCompleted.new("call_text", "sunny in SF"),
+            ai.events.ToolCompleted.of("call_media", ["captured:", media]),
+            ai.events.UserMessage.of(["Screenshot after the tool ran:", media]),
+        ],
+    }
+}
+
+/// Two results for one assistant turn where the media-only result comes
+/// FIRST: a Degrade must still keep both results contiguous and attach the
+/// media after the second one, and the media-only result must not lower to an
+/// empty tool result.
+function parallel_media_journal(client_id: string, media: image | audio | video | pdf) -> ai.Journal {
+    let args: map<string, unknown> = {};
+    ai.Journal {
+        log: [
+            ai.events.AssistantMessage {
+                content: [
+                    ai.content.ToolUse { id: "call_media", name: "capture", args: args },
+                    ai.content.ToolUse { id: "call_text", name: "lookup", args: args },
+                ],
+                client_id: client_id,
+            },
+            ai.events.ToolCompleted.of("call_media", [media]),
+            ai.events.ToolCompleted.new("call_text", "sunny in SF"),
+        ],
+    }
+}
+
+/// The one-line note a Degrade moves media behind.
+function degrade_note(tool: string) -> string {
+    "attached from the result of tool `" + tool + "`"
+}
+
+function media_png() -> image {
+    baml.media.Image.from_base64("SGVsbG8=", "image/png")
+}
+
+function media_mp3() -> audio {
+    baml.media.Audio.from_base64("QUJD", "audio/mp3")
 }

@@ -1,11 +1,11 @@
 // R2 (S15 residue): `catch (e, ctx)`: the AST field says "stack trace", but the binding
-// is the full error CONTEXT (TIR resolves `baml.errors.ErrorContext`);
+// is the full error CONTEXT (TIR resolves `baml.errors.Context`);
 // S12 typed it `string`.
 class Boom {
     m string
 }
 
-function boom() -> string throws user.Boom {
+function boom() -> string throws root.Boom {
     throw Boom { m: "x" }
 }
 

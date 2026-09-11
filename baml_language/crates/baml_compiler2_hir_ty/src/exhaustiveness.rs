@@ -28,51 +28,10 @@
 use std::fmt;
 
 use baml_base::Literal;
-use baml_type::{PrimitiveType, QualifiedTypeName, Ty, TyAttr};
+use baml_type::{DeclName, PrimitiveType, Ty, TyAttr, contains_error_recovery};
 use rustc_hash::FxHashSet;
 
-/// Does `ty` carry an error-recovery sentinel (`Ty::Error` or `Ty::Unknown`)
-/// anywhere in its structure? Inlined from TIR's `generics.rs` - the one
-/// crate-internal dependency the lifted algorithm had.
-fn contains_error_recovery(ty: &Ty) -> bool {
-    if matches!(ty, Ty::Error { .. } | Ty::Unknown { .. }) {
-        return true;
-    }
-    match ty {
-        Ty::AssociatedTypeProjection {
-            base, interface, ..
-        } => contains_error_recovery(base) || interface.tys().any(contains_error_recovery),
-        Ty::List(inner, _) | Ty::EvolvingList(inner, _) => contains_error_recovery(inner),
-        Ty::Map {
-            key: k, value: v, ..
-        }
-        | Ty::EvolvingMap(k, v, _) => contains_error_recovery(k) || contains_error_recovery(v),
-        Ty::Union(tys, _) => tys.iter().any(contains_error_recovery),
-        Ty::Future(value, error, _) => {
-            contains_error_recovery(value) || contains_error_recovery(error)
-        }
-        Ty::Function {
-            params,
-            ret,
-            throws,
-            ..
-        } => {
-            params
-                .iter()
-                .any(|param| contains_error_recovery(&param.ty))
-                || contains_error_recovery(ret)
-                || contains_error_recovery(throws)
-        }
-        Ty::Class(_, type_args, _) => type_args.iter().any(contains_error_recovery),
-        Ty::Interface(_, type_args, associated_bindings, _) => {
-            type_args.iter().any(contains_error_recovery)
-                || associated_bindings
-                    .iter()
-                    .any(|(_, ty)| contains_error_recovery(ty))
-        }
-        _ => false,
-    }
-}
+use crate::render::{Spell, Viewpoint};
 
 // ── Constructors ─────────────────────────────────────────────────────────────
 
@@ -95,7 +54,7 @@ pub enum Ctor {
     Slice(SliceShape),
     /// Class destructure. Sub-patterns' types come from the class's fields,
     /// with generic substitution applied.
-    Class(QualifiedTypeName, Vec<Ty>),
+    Class(DeclName, Box<[Ty]>),
     /// Interface destructure. Sub-patterns' types come from the interface's
     /// field view, with generic substitution applied.
     Interface(Ty),
@@ -276,10 +235,10 @@ fn class_args_have_recovery(args: &[Ty]) -> bool {
     args.iter().any(contains_error_recovery)
 }
 
-fn class_ty_for_ctor(qtn: &QualifiedTypeName, args: &[Ty], fallback: &Ty) -> Ty {
+fn class_ty_for_ctor(qtn: &DeclName, args: &[Ty], fallback: &Ty) -> Ty {
     match fallback {
         Ty::Class(fallback_qtn, _, _) if fallback_qtn == qtn => fallback.clone(),
-        _ => Ty::Class(qtn.clone(), args.to_vec(), TyAttr::default()),
+        _ => Ty::Class(qtn.clone(), args.into(), TyAttr::default()),
     }
 }
 
@@ -316,13 +275,39 @@ pub struct CtorIdentity(String);
 
 /// Compute the [`CtorIdentity`] for a type. This is what `Ctor::Single` uses
 /// for `Eq`/`Hash`. Two types with the same identity are the same ctor.
-pub fn ty_ctor_identity(ty: &Ty) -> CtorIdentity {
+pub fn ty_ctor_identity<N: baml_type::Head + CtorHead>(ty: &Ty<N>) -> CtorIdentity {
     let mut s = String::new();
     write_ty_identity(&mut s, ty);
     CtorIdentity(s)
 }
 
-fn write_ty_identity(out: &mut String, ty: &Ty) {
+/// A head's identity for a ctor key. Never shown; the key only has to be
+/// injective within one compile — a compile-time head keys by its root's id
+/// and path, a wire head by its spelling.
+pub trait CtorHead {
+    fn ctor_identity(&self) -> String;
+}
+
+impl CtorHead for DeclName {
+    fn ctor_identity(&self) -> String {
+        let mut out = format!("{:?}", self.root());
+        for segment in self.namespace() {
+            out.push('.');
+            out.push_str(segment.as_str());
+        }
+        out.push('.');
+        out.push_str(self.name().as_str());
+        out
+    }
+}
+
+impl CtorHead for baml_type::TypeName {
+    fn ctor_identity(&self) -> String {
+        self.render_dotted(false)
+    }
+}
+
+fn write_ty_identity<N: baml_type::Head + CtorHead>(out: &mut String, ty: &Ty<N>) {
     use std::fmt::Write;
     match ty {
         Ty::Literal(lit, _, _) => {
@@ -330,13 +315,13 @@ fn write_ty_identity(out: &mut String, ty: &Ty) {
             write_literal_identity(out, lit);
         }
         Ty::EnumVariant(qtn, name, _) => {
-            let _ = write!(out, "EV:{qtn}::{name}");
+            let _ = write!(out, "EV:{}::{name}", qtn.ctor_identity());
         }
         Ty::Enum(qtn, _) => {
-            let _ = write!(out, "E:{qtn}");
+            let _ = write!(out, "E:{}", qtn.ctor_identity());
         }
         Ty::Class(qtn, args, _) => {
-            let _ = write!(out, "C:{qtn}<");
+            let _ = write!(out, "C:{}<", qtn.ctor_identity());
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
@@ -346,7 +331,7 @@ fn write_ty_identity(out: &mut String, ty: &Ty) {
             out.push('>');
         }
         Ty::Interface(qtn, args, associated_bindings, _) => {
-            let _ = write!(out, "I:{qtn}<");
+            let _ = write!(out, "I:{}<", qtn.ctor_identity());
             let mut wrote_any = false;
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
@@ -397,31 +382,28 @@ fn write_ty_identity(out: &mut String, ty: &Ty) {
             }
             out.push(']');
         }
-        Ty::List(elem, _) | Ty::EvolvingList(elem, _) => {
+        Ty::List(elem, _) => {
             out.push_str("Lst:");
             write_ty_identity(out, elem);
         }
         Ty::Map {
             key: k, value: v, ..
-        }
-        | Ty::EvolvingMap(k, v, _) => {
+        } => {
             out.push_str("M:");
             write_ty_identity(out, k);
             out.push(',');
             write_ty_identity(out, v);
         }
         Ty::TypeAlias(qtn, _) => {
-            let _ = write!(out, "A:{qtn}");
+            let _ = write!(out, "A:{}", qtn.ctor_identity());
         }
         Ty::TypeVar(name, _) => {
             let _ = write!(out, "V:{name}");
         }
         Ty::Never { .. } => out.push_str("Never"),
         Ty::Void { .. } => out.push_str("Void"),
-        Ty::BuiltinUnknown { .. } => out.push_str("BUnk"),
-        Ty::Unknown { .. } => out.push_str("Unk"),
+        Ty::Unknown { .. } => out.push_str("BUnk"),
         Ty::Error { .. } => out.push_str("Err"),
-        Ty::Infer { .. } => out.push_str("Inf"),
         Ty::RustType { .. } => out.push_str("Rust"),
         Ty::Type { .. } => out.push_str("Type"),
         Ty::Function {
@@ -514,15 +496,15 @@ impl DPat {
             ty: scrutinee_ty,
         }
     }
-    pub fn class(qtn: QualifiedTypeName, fields: Vec<DPat>, ty: Ty) -> Self {
+    pub fn class(qtn: DeclName, fields: Vec<DPat>, ty: Ty) -> Self {
         Self {
-            ctor: Ctor::Class(qtn, Vec::new()),
+            ctor: Ctor::Class(qtn, Box::new([])),
             arity: fields.len(),
             fields,
             ty,
         }
     }
-    pub fn class_inst(qtn: QualifiedTypeName, args: Vec<Ty>, fields: Vec<DPat>, ty: Ty) -> Self {
+    pub fn class_inst(qtn: DeclName, args: Box<[Ty]>, fields: Vec<DPat>, ty: Ty) -> Self {
         Self {
             ctor: Ctor::Class(qtn, args),
             arity: fields.len(),
@@ -601,16 +583,16 @@ impl WitnessPat {
 /// carry their field NAMES (declaration order via ppir), union members
 /// cascade so nested classes keep labels, everything else takes the
 /// standard `Display`.
-pub fn render_witness_pat(db: &dyn baml_compiler2_ppir::Db, w: &WitnessPat) -> String {
+pub fn render_witness_pat(
+    db: &dyn baml_compiler2_ppir::Db,
+    vp: &Viewpoint<'_>,
+    w: &WitnessPat,
+) -> String {
     use std::fmt::Write as _;
     match &w.ctor {
         Ctor::Class(qtn, args) => {
             let names: Vec<baml_type::Name> = {
-                let package =
-                    baml_compiler2_hir::package::PackageId::new(db, qtn.package().clone());
-                match baml_compiler2_ppir::package_items(db, package)
-                    .lookup_type(qtn.namespace(), qtn.name())
-                {
+                match crate::facts::definition_of(db, qtn) {
                     Some(baml_compiler2_hir::contributions::Definition::Class(class_loc)) => {
                         baml_compiler2_ppir::item_data::class_data(db, class_loc)
                             .fields
@@ -621,7 +603,7 @@ pub fn render_witness_pat(db: &dyn baml_compiler2_ppir::Db, w: &WitnessPat) -> S
                     _ => Vec::new(),
                 }
             };
-            let qtn_str = class_witness_head(qtn, args);
+            let qtn_str = class_witness_head(vp, qtn, args);
             if w.fields.is_empty() {
                 return format!("{qtn_str} {{}}");
             }
@@ -630,7 +612,7 @@ pub fn render_witness_pat(db: &dyn baml_compiler2_ppir::Db, w: &WitnessPat) -> S
                 if i > 0 {
                     out.push_str(", ");
                 }
-                let rendered = render_witness_pat(db, fld);
+                let rendered = render_witness_pat(db, vp, fld);
                 if let Some(name) = names.get(i) {
                     let _ = write!(out, "{name}: {rendered}");
                 } else {
@@ -642,16 +624,16 @@ pub fn render_witness_pat(db: &dyn baml_compiler2_ppir::Db, w: &WitnessPat) -> S
         }
         Ctor::UnionMember(_) => match w.fields.first() {
             Some(inner) => {
-                let s = render_witness_pat(db, inner);
+                let s = render_witness_pat(db, vp, inner);
                 if matches!(s.as_str(), "_") {
-                    w.to_string()
+                    w.render(vp)
                 } else {
                     s
                 }
             }
-            None => w.to_string(),
+            None => w.render(vp),
         },
-        _ => w.to_string(),
+        _ => w.render(vp),
     }
 }
 
@@ -663,115 +645,126 @@ pub fn render_witness_pat(db: &dyn baml_compiler2_ppir::Db, w: &WitnessPat) -> S
 /// can each produce a witness. Omitting the arguments would render those two
 /// identically and tell the reader to add one arm where two distinct ones are
 /// missing. A non-generic class renders as the bare name, exactly as before.
-pub(crate) fn class_witness_head(qtn: &QualifiedTypeName, args: &[Ty]) -> String {
-    let name = qtn.render_user_facing();
+pub(crate) fn class_witness_head(vp: &Viewpoint<'_>, qtn: &DeclName, args: &[Ty]) -> String {
+    let name = qtn.spell(vp);
     if args.is_empty() {
         return name;
     }
     let args = args
         .iter()
-        .map(Ty::render_user_facing)
+        .map(|ty| ty.spell(vp))
         .collect::<Vec<_>>()
         .join(", ");
     format!("{name}<{args}>")
 }
 
-impl fmt::Display for WitnessPat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.ctor {
-            Ctor::Wildcard | Ctor::NonExhaustive | Ctor::Missing => write!(f, "_"),
-            // Or never appears in witnesses (apply for Or is a no-op).
-            // Render defensively as `_` if ever produced.
-            Ctor::Or => write!(f, "_"),
-            // UnionMember is a "which branch" tag. When the inner pat
-            // carries a concrete witness (literal, enum variant, class
-            // ctor, etc.), render that — it's the most informative form.
-            // When the inner collapses to a placeholder (`_` from
-            // Wildcard / NonExhaustive / Missing), render the member
-            // type name instead so diagnostics like
-            // `non-exhaustive match; missing: Mixed { value: int }` say
-            // `int` rather than `_`.
-            Ctor::UnionMember(member_ty) => match self.fields.first() {
-                Some(inner)
-                    if !matches!(
-                        inner.ctor,
-                        Ctor::Wildcard | Ctor::NonExhaustive | Ctor::Missing
-                    ) =>
-                {
-                    write!(f, "{inner}")
-                }
-                _ => write_member_ty_witness(f, member_ty),
-            },
-            Ctor::Single(ty) => write_single_witness(f, ty),
-            Ctor::Class(qtn, args) => {
-                let qtn = class_witness_head(qtn, args);
-                if self.fields.is_empty() {
-                    return write!(f, "{qtn} {{}}");
-                }
-                write!(f, "{qtn} {{ ")?;
-                for (i, fld) in self.fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
+impl WitnessPat {
+    /// The witness as source-like text, with every type spelled from `vp`.
+    pub fn render(&self, vp: &Viewpoint<'_>) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        let f = &mut out;
+        let written: fmt::Result = (|| -> fmt::Result {
+            match &self.ctor {
+                Ctor::Wildcard | Ctor::NonExhaustive | Ctor::Missing => write!(f, "_"),
+                // Or never appears in witnesses (apply for Or is a no-op).
+                // Render defensively as `_` if ever produced.
+                Ctor::Or => write!(f, "_"),
+                // UnionMember is a "which branch" tag. When the inner pat
+                // carries a concrete witness (literal, enum variant, class
+                // ctor, etc.), render that — it's the most informative form.
+                // When the inner collapses to a placeholder (`_` from
+                // Wildcard / NonExhaustive / Missing), render the member
+                // type name instead so diagnostics like
+                // `non-exhaustive match; missing: Mixed { value: int }` say
+                // `int` rather than `_`.
+                Ctor::UnionMember(member_ty) => match self.fields.first() {
+                    Some(inner)
+                        if !matches!(
+                            inner.ctor,
+                            Ctor::Wildcard | Ctor::NonExhaustive | Ctor::Missing
+                        ) =>
+                    {
+                        write!(f, "{}", inner.render(vp))
                     }
-                    write!(f, "{fld}")?;
-                }
-                write!(f, " }}")
-            }
-            Ctor::Interface(ty) => {
-                let ty = ty.render_user_facing();
-                if self.fields.is_empty() {
-                    return write!(f, "{ty} {{}}");
-                }
-                write!(f, "{ty} {{ ")?;
-                for (i, fld) in self.fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
+                    _ => write_member_ty_witness(f, vp, member_ty),
+                },
+                Ctor::Single(ty) => write_single_witness(f, vp, ty),
+                Ctor::Class(qtn, args) => {
+                    let qtn = class_witness_head(vp, qtn, args);
+                    if self.fields.is_empty() {
+                        return write!(f, "{qtn} {{}}");
                     }
-                    write!(f, "{fld}")?;
-                }
-                write!(f, " }}")
-            }
-            Ctor::Slice(shape) => {
-                write!(f, "[")?;
-                match shape {
-                    SliceShape::Fixed(_) => {
-                        for (i, fld) in self.fields.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, ", ")?;
-                            }
-                            write!(f, "{fld}")?;
+                    write!(f, "{qtn} {{ ")?;
+                    for (i, fld) in self.fields.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
                         }
+                        write!(f, "{}", fld.render(vp))?;
                     }
-                    SliceShape::Variable { prefix, suffix: _ } => {
-                        for (i, fld) in self.fields.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, ", ")?;
-                            }
-                            if i == *prefix {
-                                write!(f, "..")?;
-                                if !self.fields[i..].is_empty() {
+                    write!(f, " }}")
+                }
+                Ctor::Interface(ty) => {
+                    let ty = ty.spell(vp);
+                    if self.fields.is_empty() {
+                        return write!(f, "{ty} {{}}");
+                    }
+                    write!(f, "{ty} {{ ")?;
+                    for (i, fld) in self.fields.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", fld.render(vp))?;
+                    }
+                    write!(f, " }}")
+                }
+                Ctor::Slice(shape) => {
+                    write!(f, "[")?;
+                    match shape {
+                        SliceShape::Fixed(_) => {
+                            for (i, fld) in self.fields.iter().enumerate() {
+                                if i > 0 {
                                     write!(f, ", ")?;
                                 }
+                                write!(f, "{}", fld.render(vp))?;
                             }
-                            write!(f, "{fld}")?;
                         }
-                        if self.fields.len() == *prefix {
-                            // Trailing `..` (suffix is 0). Separate from
-                            // any rendered prefix fields with a comma.
-                            if !self.fields.is_empty() {
-                                write!(f, ", ")?;
+                        SliceShape::Variable { prefix, suffix: _ } => {
+                            for (i, fld) in self.fields.iter().enumerate() {
+                                if i > 0 {
+                                    write!(f, ", ")?;
+                                }
+                                if i == *prefix {
+                                    write!(f, "..")?;
+                                    if !self.fields[i..].is_empty() {
+                                        write!(f, ", ")?;
+                                    }
+                                }
+                                write!(f, "{}", fld.render(vp))?;
                             }
-                            write!(f, "..")?;
+                            if self.fields.len() == *prefix {
+                                // Trailing `..` (suffix is 0). Separate from
+                                // any rendered prefix fields with a comma.
+                                if !self.fields.is_empty() {
+                                    write!(f, ", ")?;
+                                }
+                                write!(f, "..")?;
+                            }
                         }
                     }
+                    write!(f, "]")
                 }
-                write!(f, "]")
             }
-        }
+        })();
+        written.unwrap_or_else(|never| unreachable!("writing to a String cannot fail: {never}"));
+        out
     }
 }
 
-fn write_single_witness(f: &mut fmt::Formatter<'_>, ty: &Ty) -> fmt::Result {
+fn write_single_witness(f: &mut String, vp: &Viewpoint<'_>, ty: &Ty) -> fmt::Result {
+    use std::fmt::Write as _;
+
     match ty {
         Ty::Literal(lit, _, _) => match lit {
             Literal::Int(v) => write!(f, "{v}"),
@@ -780,7 +773,7 @@ fn write_single_witness(f: &mut fmt::Formatter<'_>, ty: &Ty) -> fmt::Result {
             Literal::String(v) => write!(f, "{v:?}"),
             Literal::Float(s) => write!(f, "{s}"),
         },
-        Ty::EnumVariant(qtn, variant, _) => write!(f, "{qtn}.{variant}"),
+        Ty::EnumVariant(qtn, variant, _) => write!(f, "{}.{variant}", qtn.spell(vp)),
         Ty::Null { .. } => write!(f, "null"),
         _ => write!(f, "{ty:?}"),
     }
@@ -789,7 +782,9 @@ fn write_single_witness(f: &mut fmt::Formatter<'_>, ty: &Ty) -> fmt::Result {
 /// Render a `UnionMember` witness's member type when the inner pat is a
 /// placeholder (no concrete value to print). Surfaces the member's runtime
 /// shape — `int`, `string`, `Foo`, etc. — rather than `_`.
-fn write_member_ty_witness(f: &mut fmt::Formatter<'_>, ty: &Ty) -> fmt::Result {
+fn write_member_ty_witness(f: &mut String, vp: &Viewpoint<'_>, ty: &Ty) -> fmt::Result {
+    use std::fmt::Write as _;
+
     match ty {
         Ty::Int { .. } => write!(f, "{}", PrimitiveType::Int),
         Ty::Bigint { .. } => write!(f, "{}", PrimitiveType::Bigint),
@@ -802,10 +797,10 @@ fn write_member_ty_witness(f: &mut fmt::Formatter<'_>, ty: &Ty) -> fmt::Result {
         // Interfaces are open-world, so a union-member witness names the
         // uncovered interface (`Animal`, `Slot<int>`) rather than collapsing to
         // a bare `_`. Rendered user-facing (no `user.` package prefix).
-        Ty::Interface(_, _, _, _) => write!(f, "{}", ty.render_user_facing()),
-        Ty::Class(qtn, _, _) | Ty::Enum(qtn, _) => write!(f, "{}", qtn.render_user_facing()),
-        Ty::EnumVariant(qtn, variant, _) => write!(f, "{}.{variant}", qtn.render_user_facing()),
-        Ty::Literal(_, _, _) => write_single_witness(f, ty),
+        Ty::Interface(_, _, _, _) => write!(f, "{}", ty.spell(vp)),
+        Ty::Class(qtn, _, _) | Ty::Enum(qtn, _) => write!(f, "{}", qtn.spell(vp)),
+        Ty::EnumVariant(qtn, variant, _) => write!(f, "{}.{variant}", qtn.spell(vp)),
+        Ty::Literal(_, _, _) => write_single_witness(f, vp, ty),
         _ => write!(f, "_"),
     }
 }
@@ -828,7 +823,7 @@ pub trait PatCtx {
     /// For a class ctor applied at column type `ty` (which may carry generic
     /// type arguments), return the ordered field types after substitution. The
     /// `Vec` length is the class's field count.
-    fn class_field_types(&self, qtn: &QualifiedTypeName, ty: &Ty) -> Vec<Ty>;
+    fn class_field_types(&self, qtn: &DeclName, ty: &Ty) -> Vec<Ty>;
 
     /// For an interface ctor, return the ordered field-view types after
     /// substitution. Test contexts that do not model interfaces can use the
@@ -843,7 +838,7 @@ pub trait PatCtx {
     fn interface_field_projection_for_class(
         &self,
         _iface_ty: &Ty,
-        _class_qtn: &QualifiedTypeName,
+        _class_qtn: &DeclName,
         _class_type_args: &[Ty],
     ) -> Option<Vec<usize>> {
         None
@@ -888,7 +883,7 @@ pub trait PatCtx {
 fn is_inhabited_default<C: PatCtx + ?Sized>(
     ty: &Ty,
     cx: &C,
-    seen: &mut FxHashSet<QualifiedTypeName>,
+    seen: &mut FxHashSet<DeclName>,
 ) -> bool {
     match ty {
         Ty::Never { .. } => false,
@@ -907,7 +902,7 @@ fn is_inhabited_default<C: PatCtx + ?Sized>(
         }
         Ty::Union(members, _) => members.iter().any(|m| is_inhabited_default(m, cx, seen)),
         // `T[]` always inhabits `[]`, so it is inhabited regardless of T.
-        Ty::List(_, _) | Ty::EvolvingList(_, _) => true,
+        Ty::List(_, _) => true,
         _ => true,
     }
 }
@@ -1413,7 +1408,7 @@ fn split_ctors(cx: &dyn PatCtx, col_ty: &Ty, matrix: &Matrix<'_>) -> CtorSplit {
         // returns empty (slice splitting normally handles it). Without
         // this short-circuit, the empty result would incorrectly mark the
         // list as vacuously exhaustive.
-        if matches!(col_ty, Ty::List(_, _) | Ty::EvolvingList(_, _)) {
+        if matches!(col_ty, Ty::List(_, _)) {
             return CtorSplit::alphabet(
                 vec![Ctor::Missing],
                 vec![Ctor::Slice(SliceShape::Variable {
@@ -1444,7 +1439,7 @@ fn split_ctors(cx: &dyn PatCtx, col_ty: &Ty, matrix: &Matrix<'_>) -> CtorSplit {
 
     // Slice types need a special split that treats variable-length patterns
     // as covering open-ended length classes — set membership isn't enough.
-    if matches!(col_ty, Ty::List(_, _) | Ty::EvolvingList(_, _)) {
+    if matches!(col_ty, Ty::List(_, _)) {
         return split_slice_ctors(&present_no_wild, has_wildcard);
     }
 
@@ -1715,13 +1710,13 @@ mod tests {
             }
         }
 
-        fn class_field_types(&self, _qtn: &QualifiedTypeName, _ty: &Ty) -> Vec<Ty> {
+        fn class_field_types(&self, _qtn: &DeclName, _ty: &Ty) -> Vec<Ty> {
             vec![]
         }
 
         fn list_element_type(&self, ty: &Ty) -> Ty {
             match ty {
-                Ty::List(elem, _) | Ty::EvolvingList(elem, _) => (**elem).clone(),
+                Ty::List(elem, _) => (**elem).clone(),
                 _ => ty.clone(),
             }
         }
@@ -1896,7 +1891,7 @@ mod tests {
                     _ => vec![Ctor::NonExhaustive],
                 }
             }
-            fn class_field_types(&self, _q: &QualifiedTypeName, _t: &Ty) -> Vec<Ty> {
+            fn class_field_types(&self, _q: &DeclName, _t: &Ty) -> Vec<Ty> {
                 vec![]
             }
             fn list_element_type(&self, ty: &Ty) -> Ty {
@@ -1910,7 +1905,11 @@ mod tests {
         let report = compute_match_usefulness(&ArrayCtx, &[arm1, arm2], array_bool);
         // Many length-classes are still missing (length 0, 1, 3, variable),
         // but `[false, false]` must be among them.
-        let missing_strings: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let missing_strings: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert!(
             missing_strings.iter().any(|s| s.contains("false, false")),
             "expected `[false, false]` in missing, got {:?}",
@@ -1973,7 +1972,7 @@ mod tests {
                     _ => vec![Ctor::NonExhaustive],
                 }
             }
-            fn class_field_types(&self, _q: &QualifiedTypeName, _t: &Ty) -> Vec<Ty> {
+            fn class_field_types(&self, _q: &DeclName, _t: &Ty) -> Vec<Ty> {
                 vec![]
             }
             fn list_element_type(&self, ty: &Ty) -> Ty {
@@ -1991,7 +1990,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -2005,10 +2004,10 @@ mod tests {
     // splitting is handled in `split_ctors` (which special-cases List).
 
     struct TestingCtx {
-        classes: std::collections::HashMap<QualifiedTypeName, Vec<Ty>>,
+        classes: std::collections::HashMap<DeclName, Vec<Ty>>,
         /// Type alias map: `Ty::TypeAlias(qtn)` resolves to the target Ty.
         /// Mirrors the real builder's `expand_alias_chains` behaviour.
-        aliases: std::collections::HashMap<QualifiedTypeName, Ty>,
+        aliases: std::collections::HashMap<DeclName, Ty>,
     }
     impl TestingCtx {
         fn new() -> Self {
@@ -2017,18 +2016,17 @@ mod tests {
                 aliases: std::collections::HashMap::new(),
             }
         }
-        fn register(&mut self, qtn: QualifiedTypeName, fields: Vec<Ty>) {
+        fn register(&mut self, qtn: DeclName, fields: Vec<Ty>) {
             self.classes.insert(qtn, fields);
         }
-        fn register_alias(&mut self, qtn: QualifiedTypeName, target: Ty) {
+        fn register_alias(&mut self, qtn: DeclName, target: Ty) {
             self.aliases.insert(qtn, target);
         }
         /// Walk through `Ty::TypeAlias` chains to a non-alias type. Cycles
         /// fall through to the original (caller treats as opaque).
         fn expand_alias(&self, ty: &Ty) -> Ty {
             let mut current = ty.clone();
-            let mut seen: std::collections::HashSet<QualifiedTypeName> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<DeclName> = std::collections::HashSet::new();
             while let Ty::TypeAlias(qtn, _) = &current {
                 if !seen.insert(qtn.clone()) {
                     return current;
@@ -2062,28 +2060,28 @@ mod tests {
                 // For slices, split_ctors handles enumeration via slice splitting;
                 // returning NonExhaustive here is OK because the slice path is taken
                 // before this is consulted.
-                Ty::List(_, _) | Ty::EvolvingList(_, _) => vec![Ctor::NonExhaustive],
+                Ty::List(_, _) => vec![Ctor::NonExhaustive],
                 Ty::Never { .. } => vec![],
                 Ty::TypeVar(_, _) => vec![Ctor::NonExhaustive],
                 _ => vec![Ctor::NonExhaustive],
             }
         }
-        fn class_field_types(&self, qtn: &QualifiedTypeName, _ty: &Ty) -> Vec<Ty> {
+        fn class_field_types(&self, qtn: &DeclName, _ty: &Ty) -> Vec<Ty> {
             self.classes.get(qtn).cloned().unwrap_or_default()
         }
         fn list_element_type(&self, ty: &Ty) -> Ty {
             match self.expand_alias(ty) {
-                Ty::List(e, _) | Ty::EvolvingList(e, _) => (*e).clone(),
+                Ty::List(e, _) => (*e).clone(),
                 t => t,
             }
         }
     }
 
-    fn qtn(name: &str) -> QualifiedTypeName {
-        QualifiedTypeName::new(Name::new("user"), vec![], Name::new(name))
+    fn qtn(name: &str) -> DeclName {
+        crate::test_heads::new(Name::new("user"), vec![], Name::new(name))
     }
-    fn class_ty(q: &QualifiedTypeName) -> Ty {
-        Ty::Class(q.clone(), vec![], Default::default())
+    fn class_ty(q: &DeclName) -> Ty {
+        Ty::Class(q.clone(), Box::new([]), Default::default())
     }
     fn list_of(elem: Ty) -> Ty {
         Ty::List(Box::new(elem), Default::default())
@@ -2092,7 +2090,7 @@ mod tests {
         Ty::optional(t)
     }
     fn union_of(ts: Vec<Ty>) -> Ty {
-        Ty::Union(ts, Default::default())
+        Ty::Union(ts.into(), Default::default())
     }
     fn null_ty() -> Ty {
         Ty::Null {
@@ -2126,9 +2124,8 @@ mod tests {
         cx.register(b.clone(), vec![bool_ty()]);
         cx.register(pair.clone(), vec![e_ty.clone(), e_ty.clone()]);
 
-        let variant = |q: &QualifiedTypeName| {
-            DPat::class(q.clone(), vec![DPat::wildcard(bool_ty())], class_ty(q))
-        };
+        let variant =
+            |q: &DeclName| DPat::class(q.clone(), vec![DPat::wildcard(bool_ty())], class_ty(q));
         let mk_pair =
             |left: DPat, right: DPat| DPat::class(pair.clone(), vec![left, right], pair_ty.clone());
 
@@ -2200,7 +2197,11 @@ mod tests {
             |left: DPat, right: DPat| DPat::class(pair.clone(), vec![left, right], pair_ty.clone());
 
         let report = compute_match_usefulness(&cx, &[], pair_ty.clone());
-        let witnesses: Vec<String> = report.missing.iter().map(ToString::to_string).collect();
+        let witnesses: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert_eq!(
             witnesses.len(),
             1,
@@ -2217,7 +2218,11 @@ mod tests {
             DPat::single(bool_lit(false), opt_bool.clone()),
         );
         let report = compute_match_usefulness(&cx, &[false_false], pair_ty.clone());
-        let witnesses: Vec<String> = report.missing.iter().map(ToString::to_string).collect();
+        let witnesses: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
 
         assert_eq!(
             witnesses.len(),
@@ -2245,7 +2250,11 @@ mod tests {
             DPat::single(bool_lit(false), opt_bool.clone()),
         );
         let report = compute_match_usefulness(&cx, &[any_false], pair_ty);
-        let witnesses: Vec<String> = report.missing.iter().map(ToString::to_string).collect();
+        let witnesses: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert_eq!(
             witnesses.len(),
             2,
@@ -2287,7 +2296,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(ToString::to_string)
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
@@ -2311,7 +2320,11 @@ mod tests {
     fn rustc_port_bool_empty_match_witnesses() {
         let cx = TestingCtx::new();
         let report = compute_match_usefulness(&cx, &[], bool_ty());
-        let witnesses: Vec<String> = report.missing.iter().map(ToString::to_string).collect();
+        let witnesses: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert_eq!(witnesses, vec!["true", "false"]);
     }
 
@@ -2407,7 +2420,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
@@ -2421,7 +2434,7 @@ mod tests {
         }
         let report = compute_match_usefulness(&cx, &arms, qty.clone());
         assert_eq!(report.missing.len(), 1, "expected one missing case");
-        let w = report.missing[0].to_string();
+        let w = report.missing[0].render(&crate::test_heads::viewpoint());
         assert!(
             w.contains("true") && w.contains("false"),
             "witness should mention both truth values, got {}",
@@ -2464,7 +2477,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -2504,7 +2517,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
         assert!(
@@ -2559,7 +2572,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
@@ -2658,7 +2671,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
@@ -2669,7 +2682,11 @@ mod tests {
             !report.missing.is_empty(),
             "expected missing when len-1 false-ok arm dropped"
         );
-        let strs: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let strs: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert!(
             strs.iter().any(|s| s.contains("false")),
             "witness should mention the missing false-ok class case, got {:?}",
@@ -2722,7 +2739,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
@@ -2767,7 +2784,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
         // The duplicate-null arm `inner_null` covering the same case as
@@ -2807,7 +2824,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
         assert!(
@@ -2853,13 +2870,17 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
         // (b) Drop `Ok{val:false}` → witness mentions Ok and false.
         let report = compute_match_usefulness(&cx, &[mk_ok(true), any_err], scrut);
-        let strs: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let strs: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert!(
             strs.iter().any(|s| s.contains("Ok") && s.contains("false")),
             "expected `Ok {{ val: false }}` in missing, got {:?}",
@@ -2895,7 +2916,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
@@ -2920,7 +2941,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -2944,7 +2965,11 @@ mod tests {
             pty.clone(),
         );
         let report = compute_match_usefulness(&cx, &[arm], pty);
-        let strs: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let strs: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         // Three missing combos: (T,F), (F,T), (F,F). Just check rendering
         // includes the class name and both bool words.
         assert_eq!(strs.len(), 3, "expected 3 missing combos, got {:?}", strs);
@@ -3081,7 +3106,11 @@ mod tests {
         );
 
         let report = compute_match_usefulness(&cx, &[pre, suf], arr);
-        let strs: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let strs: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert!(
             strs.iter().any(|s| s == "[]"),
             "expected `[]` missing, got {:?}",
@@ -3111,7 +3140,11 @@ mod tests {
             arr.clone(),
         );
         let report = compute_match_usefulness(&cx, &[arm], arr);
-        let strs: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let strs: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert!(
             strs.iter().any(|s| s == "[]"),
             "expected `[]` missing for `[_, ..rest]` only, got {:?}",
@@ -3135,7 +3168,11 @@ mod tests {
             arr.clone(),
         );
         let report = compute_match_usefulness(&cx, &[arm], arr);
-        let strs: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let strs: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert!(
             strs.iter().any(|s| s == "[]"),
             "expected `[]` missing, got {:?}",
@@ -3230,7 +3267,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -3282,7 +3319,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
         assert!(
@@ -3347,13 +3384,17 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
         // Drop length-1-a=false: missing length-1 with a=false.
         let report = compute_match_usefulness(&cx, &[len0, len1_true, len2plus], arr);
-        let strs: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let strs: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert!(
             strs.iter().any(|s| s.contains("false")),
             "expected witness mentioning `false` (the missing pair), got {:?}",
@@ -3392,7 +3433,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -3508,7 +3549,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -3588,13 +3629,17 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
         // Drop `some_any` → witness must mention the Node class.
         let report = compute_match_usefulness(&cx, &[null_top], scrut);
-        let strs: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let strs: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert!(
             strs.iter().any(|s| s.contains("Node")),
             "expected Node-related witness, got {:?}",
@@ -3657,7 +3702,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
@@ -3668,7 +3713,7 @@ mod tests {
             1,
             "exactly one missing — the inner-false case"
         );
-        let s = report.missing[0].to_string();
+        let s = report.missing[0].render(&crate::test_heads::viewpoint());
         assert!(
             s.contains("A")
                 && s.contains("B")
@@ -3722,7 +3767,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
         assert!(report.unreachable_arms.is_empty());
@@ -3776,7 +3821,7 @@ mod tests {
         let report =
             compute_match_usefulness(&cx, &[a_true_any.clone(), any_b_false.clone()], pty.clone());
         assert_eq!(report.missing.len(), 1);
-        let s = report.missing[0].to_string();
+        let s = report.missing[0].render(&crate::test_heads::viewpoint());
         assert!(s.contains("false") && s.contains("true"), "got {}", s);
 
         // (b) Adding `(T, F)` is subsumed by both prior arms — redundant.
@@ -3827,7 +3872,7 @@ mod tests {
             .collect();
         let report = compute_match_usefulness(&cx, &arms, scrut);
         assert_eq!(report.missing.len(), 1);
-        let s = report.missing[0].to_string();
+        let s = report.missing[0].render(&crate::test_heads::viewpoint());
         assert!(s.contains("G"), "expected G in missing witness, got {}", s);
     }
 
@@ -3899,7 +3944,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -3940,7 +3985,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -4000,7 +4045,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -4177,7 +4222,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -4206,10 +4251,13 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(report.missing[0].to_string(), "null");
+        assert_eq!(
+            report.missing[0].render(&crate::test_heads::viewpoint()),
+            "null"
+        );
     }
 
     // ── 46. Transitively-uninhabited class is exhaustive with zero arms ─
@@ -4238,7 +4286,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(ToString::to_string)
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -4275,7 +4323,7 @@ mod tests {
     /// Helper: a `testingCtx`-style ctx that enumerates Union members as
     /// `UnionMember` ctors. Mirrors what the real builder does.
     struct UnionCtx {
-        classes: std::collections::HashMap<QualifiedTypeName, Vec<Ty>>,
+        classes: std::collections::HashMap<DeclName, Vec<Ty>>,
     }
     impl UnionCtx {
         fn new() -> Self {
@@ -4283,7 +4331,7 @@ mod tests {
                 classes: std::collections::HashMap::new(),
             }
         }
-        fn register(&mut self, qtn: QualifiedTypeName, fields: Vec<Ty>) {
+        fn register(&mut self, qtn: DeclName, fields: Vec<Ty>) {
             self.classes.insert(qtn, fields);
         }
     }
@@ -4304,18 +4352,18 @@ mod tests {
                     vec![Ctor::Single(ty.clone())]
                 }
                 Ty::Class(qtn, args, _) => vec![Ctor::Class(qtn.clone(), args.clone())],
-                Ty::List(_, _) | Ty::EvolvingList(_, _) => vec![],
+                Ty::List(_, _) => vec![],
                 Ty::Never { .. } => vec![],
                 Ty::TypeVar(_, _) => vec![Ctor::NonExhaustive],
                 _ => vec![Ctor::NonExhaustive],
             }
         }
-        fn class_field_types(&self, qtn: &QualifiedTypeName, _ty: &Ty) -> Vec<Ty> {
+        fn class_field_types(&self, qtn: &DeclName, _ty: &Ty) -> Vec<Ty> {
             self.classes.get(qtn).cloned().unwrap_or_default()
         }
         fn list_element_type(&self, ty: &Ty) -> Ty {
             match ty {
-                Ty::List(e, _) | Ty::EvolvingList(e, _) => (**e).clone(),
+                Ty::List(e, _) => (**e).clone(),
                 _ => ty.clone(),
             }
         }
@@ -4360,7 +4408,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -4445,7 +4493,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -4538,7 +4586,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
 
@@ -4547,9 +4595,11 @@ mod tests {
         let report = compute_match_usefulness(&cx, &arms, alias_ty);
         assert_eq!(report.missing.len(), 1);
         assert!(
-            report.missing[0].to_string().contains("false"),
-            "missing witness should mention `false`, got {}",
             report.missing[0]
+                .render(&crate::test_heads::viewpoint())
+                .contains("false"),
+            "missing witness should mention `false`, got {}",
+            report.missing[0].render(&crate::test_heads::viewpoint())
         );
     }
 
@@ -4577,7 +4627,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -4610,7 +4660,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
     }
@@ -4635,7 +4685,10 @@ mod tests {
             arr,
         );
 
-        assert_eq!(witness.to_string(), "[_, _, ..]");
+        assert_eq!(
+            witness.render(&crate::test_heads::viewpoint()),
+            "[_, _, ..]"
+        );
     }
 
     // ── 26. Or-pattern shared arm-id useful tracking ────────────────────
@@ -4670,8 +4723,8 @@ mod tests {
     /// `{ a: false, b: true }` should report missing `{ a: false, b: false }`.
     #[test]
     fn class_pair_missing_one_combo() {
-        let qtn = QualifiedTypeName::new(Name::new("user"), vec![], Name::new("Pair"));
-        let pair_ty = Ty::Class(qtn.clone(), vec![], Default::default());
+        let qtn = crate::test_heads::new(Name::new("user"), vec![], Name::new("Pair"));
+        let pair_ty = Ty::Class(qtn.clone(), Box::new([]), Default::default());
 
         let arm1 = DPat::class(
             qtn.clone(),
@@ -4690,7 +4743,7 @@ mod tests {
             pair_ty.clone(),
         );
 
-        struct PairCtx(QualifiedTypeName);
+        struct PairCtx(DeclName);
         impl PatCtx for PairCtx {
             fn enumerate_ctors(&self, ty: &Ty) -> Vec<Ctor> {
                 match ty {
@@ -4711,7 +4764,7 @@ mod tests {
                     _ => vec![Ctor::NonExhaustive],
                 }
             }
-            fn class_field_types(&self, _q: &QualifiedTypeName, _t: &Ty) -> Vec<Ty> {
+            fn class_field_types(&self, _q: &DeclName, _t: &Ty) -> Vec<Ty> {
                 vec![
                     Ty::Bool {
                         attr: Default::default(),
@@ -4728,7 +4781,11 @@ mod tests {
 
         let cx = PairCtx(qtn);
         let report = compute_match_usefulness(&cx, &[arm1, arm2], pair_ty);
-        let missing_strings: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let missing_strings: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert_eq!(
             report.missing.len(),
             1,
@@ -4752,9 +4809,9 @@ mod tests {
         Ty::AssociatedTypeProjection {
             base: Box::new(base),
             interface: Box::new(baml_type::Interface::new(
-                baml_type::TypeName::local(Name::new(iface)),
-                vec![],
-                vec![],
+                crate::test_heads::local(Name::new(iface)),
+                Box::new([]),
+                Box::new([]),
             )),
             member: Name::new(member),
             attr: Default::default(),
@@ -4862,12 +4919,16 @@ mod tests {
         let mut cx = TestingCtx::new();
         let box_q = qtn("Box");
         cx.register(box_q.clone(), vec![int_ty()]);
-        let box_int = Ty::Class(box_q.clone(), vec![int_ty()], Default::default());
-        let box_t = Ty::Class(box_q.clone(), vec![type_var_ty("T")], Default::default());
+        let box_int = Ty::Class(box_q.clone(), Box::new([int_ty()]), Default::default());
+        let box_t = Ty::Class(
+            box_q.clone(),
+            Box::new([type_var_ty("T")]),
+            Default::default(),
+        );
 
         let rigid_row = DPat::class_inst(
             box_q.clone(),
-            vec![type_var_ty("T")],
+            Box::new([type_var_ty("T")]),
             vec![DPat::wildcard(int_ty())],
             box_int.clone(),
         );
@@ -4893,7 +4954,7 @@ mod tests {
         // Reflexive: same rigid args on both sides — a definite cover.
         let reflexive_row = DPat::class_inst(
             box_q.clone(),
-            vec![type_var_ty("T")],
+            Box::new([type_var_ty("T")]),
             vec![DPat::wildcard(int_ty())],
             box_t.clone(),
         );
@@ -4904,7 +4965,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
         assert!(report.unreachable_arms.is_empty());
@@ -4920,17 +4981,17 @@ mod tests {
         let mut cx = TestingCtx::new();
         let box_q = qtn("Box");
         cx.register(box_q.clone(), vec![int_ty()]);
-        let box_int = Ty::Class(box_q.clone(), vec![int_ty()], Default::default());
+        let box_int = Ty::Class(box_q.clone(), Box::new([int_ty()]), Default::default());
 
         let rigid_refutable = DPat::class_inst(
             box_q.clone(),
-            vec![type_var_ty("T")],
+            Box::new([type_var_ty("T")]),
             vec![DPat::single(int_lit(1), int_ty())],
             box_int.clone(),
         );
         let concrete_cover = DPat::class_inst(
             box_q.clone(),
-            vec![int_ty()],
+            Box::new([int_ty()]),
             vec![DPat::wildcard(int_ty())],
             box_int.clone(),
         );
@@ -4945,7 +5006,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
         assert!(
@@ -4958,7 +5019,11 @@ mod tests {
         // reported exactly once — the reachability-only branch does not
         // duplicate the alphabet branch's witness.
         let report = compute_match_usefulness(&cx, &[rigid_refutable], box_int);
-        let missing: Vec<String> = report.missing.iter().map(|w| w.to_string()).collect();
+        let missing: Vec<String> = report
+            .missing
+            .iter()
+            .map(|w| w.render(&crate::test_heads::viewpoint()))
+            .collect();
         assert_eq!(missing.len(), 1, "one witness, reported once: {missing:?}");
         assert!(report.unreachable_arms.is_empty());
     }
@@ -4977,7 +5042,7 @@ mod tests {
             attr: Default::default(),
         });
         cx.register(holder_q.clone(), vec![strings.clone(), int_ty()]);
-        let holder = Ty::Class(holder_q.clone(), vec![], Default::default());
+        let holder = Ty::Class(holder_q.clone(), Box::new([]), Default::default());
 
         let rigid_row = DPat::class(
             holder_q.clone(),
@@ -5009,7 +5074,7 @@ mod tests {
             report
                 .missing
                 .iter()
-                .map(|w| w.to_string())
+                .map(|w| w.render(&crate::test_heads::viewpoint()))
                 .collect::<Vec<_>>()
         );
         assert!(

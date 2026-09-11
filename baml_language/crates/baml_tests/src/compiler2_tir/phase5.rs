@@ -1,18 +1,22 @@
 //! Phase 5 tests: `.baml` builtin stub files and HIR integration.
 //!
 //! Verifies that the builtin stub files are correctly loaded into the compiler2
-//! HIR pipeline. After `set_project_root`, `package_items(db, "baml")` should
+//! HIR pipeline. After `ensure_stdlib_sources`, `package_items(db, "baml")` should
 //! contain `Array`, `Map`, `String`, `Media`, `Request`, `Response`, and the
 //! function declarations in `env`, `math`, and `sys` namespaces.
 
 use std::fmt::Write;
+
+use baml_compiler2_hir_ty::render::Viewpoint;
+
+use crate::engine::TestDbExt;
 
 /// Lower a raw AST type expression through hir's scratch store and
 /// hir_ty's one lowering road (the MIR pattern), to a plain type plus
 /// the sink's lowering diagnostics. Resolution context comes from
 /// `file`'s package/namespace.
 fn lower_type_expr_hir_in(
-    db: &baml_project::ProjectDatabase,
+    db: &baml_db::ProjectDatabase,
     file: baml_base::SourceFile,
     expr: &baml_compiler2_ast::TypeExpr,
 ) -> (
@@ -22,13 +26,13 @@ fn lower_type_expr_hir_in(
     let mut builder = baml_compiler2_hir::type_ref::TypeRefBuilder::new();
     let id = builder.lower(expr);
     let (store, _spans) = builder.finish();
-    let ctx = baml_compiler2_hir_ty::lower::lower_ctx_for_file(db, file).with_diagnostics();
-    let ty = ctx.lower_type_ref(&store, id).to_plain();
-    (ty, ctx.take_diagnostics())
+    let ctx = baml_compiler2_hir_ty::lower::lower_ctx_for_file(db, file);
+    let (ty, diagnostics) = ctx.lower_type_ref_with_diagnostics(&store, id);
+    (baml_compiler2_hir_ty::lower::reject_holes(&ty), diagnostics)
 }
 
 fn lower_type_expr_hir(
-    db: &baml_project::ProjectDatabase,
+    db: &baml_db::ProjectDatabase,
     expr: &baml_compiler2_ast::TypeExpr,
 ) -> baml_type::Ty {
     let file = baml_compiler2_hir::compiler2_all_files(db)
@@ -39,17 +43,14 @@ fn lower_type_expr_hir(
 }
 
 use baml_base::Name;
-use baml_compiler2_hir::{
-    contributions::Definition,
-    package::{PackageId, package_items},
-};
-use baml_project::ProjectDatabase;
+use baml_compiler2_hir::{contributions::Definition, package::package_items};
+use baml_db::ProjectDatabase;
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
 fn make_db() -> ProjectDatabase {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(std::path::Path::new("."));
+    db.workspace(std::path::Path::new("."));
     db
 }
 
@@ -62,7 +63,9 @@ fn generic_param_names(params: &[baml_compiler2_ppir::item_data::GenericParamDat
 /// Build a sorted, human-readable summary of what `package_items(db, "baml")`
 /// contains, separated by namespace.
 fn render_baml_package_items(db: &ProjectDatabase) -> String {
-    let baml_pkg = PackageId::new(db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(db, baml_pkg);
 
     let mut output = String::new();
@@ -172,7 +175,9 @@ fn render_baml_package_items(db: &ProjectDatabase) -> String {
 #[test]
 fn baml_package_contains_array_and_map() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     // Root namespace should have Array, Map, String
@@ -209,7 +214,9 @@ fn baml_package_contains_array_and_map() {
 #[test]
 fn baml_package_contains_http_namespace() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     let http_ns_path = vec![Name::new("http")];
@@ -230,7 +237,9 @@ fn baml_package_contains_http_namespace() {
 #[test]
 fn baml_package_contains_env_functions() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     // baml.env has the low-level get ($rust_io_function)
@@ -251,7 +260,9 @@ fn baml_package_contains_env_functions() {
 #[test]
 fn baml_package_has_sys_but_not_math() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     // B-712 removed the `baml.math` namespace entirely: its aggregates moved to
@@ -289,7 +300,9 @@ fn baml_package_has_sys_but_not_math() {
 #[test]
 fn array_has_generic_param_t() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     let root_ns = items.namespaces.get(&vec![]).unwrap();
@@ -310,7 +323,9 @@ fn array_has_generic_param_t() {
 #[test]
 fn map_has_generic_params_k_v() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     let root_ns = items.namespaces.get(&vec![]).unwrap();
@@ -331,7 +346,9 @@ fn map_has_generic_params_k_v() {
 #[test]
 fn string_class_has_no_generic_params() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     let root_ns = items.namespaces.get(&vec![]).unwrap();
@@ -353,7 +370,9 @@ fn string_class_has_no_generic_params() {
 #[test]
 fn array_has_expected_methods() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     let root_ns = items.namespaces.get(&vec![]).unwrap();
@@ -388,7 +407,9 @@ fn array_has_expected_methods() {
 #[test]
 fn map_has_expected_methods() {
     let db = make_db();
-    let baml_pkg = PackageId::new(&db, Name::new("baml"));
+    let baml_pkg = baml_compiler2_hir::package::spelling(&db)
+        .root(&Name::new("baml"))
+        .unwrap();
     let items = package_items(&db, baml_pkg);
 
     let root_ns = items.namespaces.get(&vec![]).unwrap();
@@ -435,8 +456,8 @@ fn file_package_derives_correct_namespaces() {
 
     let db = make_db();
 
-    // The compiler2 extra files are NOT in project.files() (to avoid polluting
-    // the v1 compiler). Use compiler2_all_files() to get the combined view.
+    // The stdlib lives in its own `Stdlib` roots, not the workspace root:
+    // `compiler2_all_files()` is the combined, table-ordered view.
     let files = baml_compiler2_hir::compiler2_all_files(&db);
 
     let mut found_containers = false;
@@ -449,7 +470,12 @@ fn file_package_derives_correct_namespaces() {
         // containers.baml is at <builtin>/baml/containers.baml → namespace []
         if path_str == "<builtin>/baml/containers.baml" {
             let pkg_info = file_package(&db, *file);
-            assert_eq!(pkg_info.package.as_str(), "baml");
+            assert_eq!(
+                baml_compiler2_hir::package::spelling(&db)
+                    .of(pkg_info.root)
+                    .as_str(),
+                "baml"
+            );
             assert!(
                 pkg_info.namespace_path.is_empty(),
                 "containers.baml should be in root baml namespace, got {:?}",
@@ -460,7 +486,12 @@ fn file_package_derives_correct_namespaces() {
         // env.baml is at <builtin>/baml/ns_env/env.baml → namespace ["env"]
         if path_str == "<builtin>/baml/ns_env/env.baml" {
             let pkg_info = file_package(&db, *file);
-            assert_eq!(pkg_info.package.as_str(), "baml");
+            assert_eq!(
+                baml_compiler2_hir::package::spelling(&db)
+                    .of(pkg_info.root)
+                    .as_str(),
+                "baml"
+            );
             assert_eq!(
                 pkg_info.namespace_path,
                 vec![Name::new("env")],
@@ -471,7 +502,12 @@ fn file_package_derives_correct_namespaces() {
         // http.baml is at <builtin>/baml/ns_http/http.baml → namespace ["http"]
         if path_str == "<builtin>/baml/ns_http/http.baml" {
             let pkg_info = file_package(&db, *file);
-            assert_eq!(pkg_info.package.as_str(), "baml");
+            assert_eq!(
+                baml_compiler2_hir::package::spelling(&db)
+                    .of(pkg_info.root)
+                    .as_str(),
+                "baml"
+            );
             assert_eq!(
                 pkg_info.namespace_path,
                 vec![Name::new("http")],
@@ -482,7 +518,12 @@ fn file_package_derives_correct_namespaces() {
         // sys.baml is at <builtin>/baml/ns_sys/sys.baml → namespace ["sys"]
         if path_str == "<builtin>/baml/ns_sys/sys.baml" {
             let pkg_info = file_package(&db, *file);
-            assert_eq!(pkg_info.package.as_str(), "baml");
+            assert_eq!(
+                baml_compiler2_hir::package::spelling(&db)
+                    .of(pkg_info.root)
+                    .as_str(),
+                "baml"
+            );
             assert_eq!(
                 pkg_info.namespace_path,
                 vec![Name::new("sys")],
@@ -531,7 +572,7 @@ fn user_package_unaffected_by_builtins() {
     use super::support::{make_db as make_tir_db, render_tir};
 
     let mut db = make_tir_db();
-    let file = db.add_file("test.baml", "class Foo { name string }");
+    let file = db.file("test.baml", "class Foo { name string }");
 
     // Render should only show user.Foo, not any baml builtins
     let output = render_tir(&db, file);
@@ -552,10 +593,10 @@ fn cross_namespace_type_resolution_via_root() {
     let mut db = make_db();
 
     // Root namespace: defines Config
-    let _root_file = db.add_file("main.baml", "class Config { key string }");
+    let _root_file = db.file("main.baml", "class Config { key string }");
 
     // llm namespace: defines Response
-    let ns_file = db.add_file("ns_llm/models.baml", "class Response { text string }");
+    let ns_file = db.file("ns_llm/models.baml", "class Response { text string }");
 
     // From root namespace: resolve root.llm.Response
     let segments = vec![Name::new("root"), Name::new("llm"), Name::new("Response")];
@@ -576,8 +617,8 @@ fn cross_namespace_type_resolution_via_root() {
         diags
     );
     assert!(
-        !matches!(ty, baml_type::Ty::Unknown { .. }),
-        "root.llm.Response should not resolve to Unknown"
+        !matches!(ty, baml_type::Ty::Error { .. }),
+        "root.llm.Response should not resolve to an error sentinel"
     );
 
     // From llm namespace: resolve root.Config
@@ -599,8 +640,8 @@ fn cross_namespace_type_resolution_via_root() {
         diags
     );
     assert!(
-        !matches!(ty, baml_type::Ty::Unknown { .. }),
-        "root.Config should not resolve to Unknown from llm namespace"
+        !matches!(ty, baml_type::Ty::Error { .. }),
+        "root.Config should not resolve to an error sentinel from llm namespace"
     );
 }
 
@@ -610,8 +651,8 @@ fn same_namespace_resolution_no_prefix() {
     let mut db = make_db();
 
     // Both files in ns_llm namespace
-    let _f1 = db.add_file("ns_llm/types.baml", "class LLMConfig { model string }");
-    let _f2 = db.add_file("ns_llm/client.baml", "class LLMClient { name string }");
+    let _f1 = db.file("ns_llm/types.baml", "class LLMConfig { model string }");
+    let _f2 = db.file("ns_llm/client.baml", "class LLMClient { name string }");
 
     // From within llm namespace: resolve LLMConfig (no root. prefix)
     let segments = vec![Name::new("LLMConfig")];
@@ -633,8 +674,8 @@ fn same_namespace_resolution_no_prefix() {
         diags
     );
     assert!(
-        !matches!(ty, baml_type::Ty::Unknown { .. }),
-        "LLMConfig should not resolve to Unknown within same namespace"
+        !matches!(ty, baml_type::Ty::Error { .. }),
+        "LLMConfig should not resolve to an error sentinel within same namespace"
     );
 }
 
@@ -644,13 +685,13 @@ fn same_namespace_resolution_no_prefix() {
 fn nested_namespace_resolution() {
     let mut db = make_db();
 
-    let _root_file = db.add_file("main.baml", "class Config { key string }");
-    let _nested_file = db.add_file(
+    let _root_file = db.file("main.baml", "class Config { key string }");
+    let _nested_file = db.file(
         "ns_llm/ns_openai/client.baml",
         "class ResponsesClient { model string }",
     );
 
-    let pkg_id = PackageId::new(&db, Name::new("user"));
+    let pkg_id = db.workspace_root().unwrap();
     let pkg_items = package_items(&db, pkg_id);
 
     // Verify the nested namespace exists
@@ -685,8 +726,8 @@ fn nested_namespace_resolution() {
         diags
     );
     assert!(
-        !matches!(ty, baml_type::Ty::Unknown { .. }),
-        "root.llm.openai.ResponsesClient should not resolve to Unknown"
+        !matches!(ty, baml_type::Ty::Error { .. }),
+        "root.llm.openai.ResponsesClient should not resolve to an error sentinel"
     );
 }
 
@@ -695,8 +736,8 @@ fn bare_name_cross_namespace_rejected() {
     // Config is in root, but ns_context is ["llm"] — bare "Config" should not resolve
 
     let mut db = make_db();
-    let _root_file = db.add_file("main.baml", "class Config { key string }");
-    let _ns_file = db.add_file("ns_llm/models.baml", "class Response { text string }");
+    let _root_file = db.file("main.baml", "class Config { key string }");
+    let _ns_file = db.file("ns_llm/models.baml", "class Response { text string }");
 
     let segments = vec![Name::new("Config")];
     let (ty, diags) = lower_type_expr_hir_in(
@@ -720,7 +761,8 @@ fn bare_name_cross_namespace_rejected() {
         "should emit exactly one diagnostic, got: {:?}",
         diags
     );
-    let msg = baml_compiler2_hir_ty::lower::lowering_diag_error(&diags[0].kind).to_string();
+    let msg = baml_compiler2_hir_ty::lower::lowering_diag_error(&diags[0].kind)
+        .render(&Viewpoint::canonical(&db));
     assert!(
         msg.contains("root.Config"),
         "diagnostic should suggest `root.Config`, got: {msg}"
@@ -732,8 +774,8 @@ fn multi_segment_bare_path_rejected() {
     // "ns2.MyClass" from ns1 without root. prefix should fail
 
     let mut db = make_db();
-    let _f1 = db.add_file("ns_ns1/a.baml", "class Foo { x int }");
-    let _f2 = db.add_file("ns_ns2/b.baml", "class MyClass { y string }");
+    let _f1 = db.file("ns_ns1/a.baml", "class Foo { x int }");
+    let _f2 = db.file("ns_ns2/b.baml", "class MyClass { y string }");
 
     let segments = vec![Name::new("ns2"), Name::new("MyClass")];
     let (ty, diags) = lower_type_expr_hir_in(
@@ -753,7 +795,8 @@ fn multi_segment_bare_path_rejected() {
          is the diagnosed `!error` sentinel, never `unknown`)"
     );
     assert!(!diags.is_empty(), "should emit UnresolvedType diagnostic");
-    let msg = baml_compiler2_hir_ty::lower::lowering_diag_error(&diags[0].kind).to_string();
+    let msg = baml_compiler2_hir_ty::lower::lowering_diag_error(&diags[0].kind)
+        .render(&Viewpoint::canonical(&db));
     assert!(
         msg.contains("unresolved type: ns2.MyClass"),
         "diagnostic should mention ns2.MyClass, got: {msg}"

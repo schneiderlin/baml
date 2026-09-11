@@ -32,8 +32,8 @@ class ContractChunk {
 // The decoder handed to `TurnStream.from_sse`: one raw SSE batch -> events.
 // `[DONE]` is this protocol's terminal event, so it yields `TurnDone` — which
 // is exactly what makes `require_terminal` meaningful for it.
-function contract_decode(batch: string) -> ai.stream.StreamEvent[] throws ai.errors.InvokeError {
-    let out: ai.stream.StreamEvent[] = [];
+function contract_decode(batch: string) -> ai.stream.Event[] throws ai.errors.InvokeError {
+    let out: ai.stream.Event[] = [];
     let events = ai.stream.decode_sse_batch(batch) catch_all (e) {
         _ => throw ai.errors.normalize(e),
     };
@@ -59,6 +59,8 @@ function contract_decode(batch: string) -> ai.stream.StreamEvent[] throws ai.err
                     stop_reason: ai.content.StopReason.Complete,
                     input_tokens: 7,
                     output_tokens: 3,
+                    cached_input_tokens: null,
+                    reasoning_tokens: null,
                 },
             );
         }
@@ -225,8 +227,10 @@ function contract_deltas_then_outcome(base_url: string) -> string {
             let d: ai.stream.Done => {
                 break;
             },
-            let s: string => {
-                let _ = chunks.push(s);
+            let batch: string[] => {
+                for (let s in batch) {
+                    let _ = chunks.push(s);
+                }
                 null
             },
         };
@@ -272,4 +276,102 @@ function stream_contract_from_chunks_unchanged() -> string {
 
 test "stream_contract_from_chunks_unchanged" {
     assert.equal(stream_contract_from_chunks_unchanged(), "stop=Complete|text=ab")
+}
+
+// Rich content events remain observable while final_turn folds them into the
+// same canonical block types as a non-streaming client. The legacy next()
+// view still yields only answer text and never feeds reasoning into SAP.
+function stream_contract_rich_content() -> string {
+    let cursor = 0;
+    let events: ai.stream.Event[] = [
+        ai.stream.ReasoningDelta { summary: "think " },
+        ai.stream.ReasoningDelta { summary: "first" },
+        ai.stream.TextDelta { text: "an" },
+        ai.stream.ToolUseDelta {
+            index: 0,
+            id: "call_1",
+            name: "lookup",
+            arguments: "{\"q\":",
+        },
+        ai.stream.ToolUseDelta {
+            index: 0,
+            id: null,
+            name: null,
+            arguments: "\"BAML\"}",
+        },
+        ai.stream.ToolUseDone {
+            tool_use: ai.content.ToolUse { id: "call_1", name: "lookup", args: { "q": "BAML" } },
+        },
+        ai.stream.TextDelta { text: "swer" },
+        ai.stream.TurnMeta {
+            stop_reason: ai.content.StopReason.ToolUse,
+            input_tokens: 9,
+            output_tokens: 4,
+            cached_input_tokens: 3,
+            reasoning_tokens: 2,
+        },
+        ai.stream.TurnDone {  },
+    ];
+    let stream = ai.stream.TurnStream.from_event_source(() -> {
+        if let event: ai.stream.Event = events.at(cursor) {
+            cursor += 1;
+            event
+        } else {
+            ai.stream.Done {  }
+        }
+    });
+    let first_text = match (stream.next()) {
+        let batch: string[] => batch.join(""),
+        let done: ai.stream.Done => "done",
+    };
+    let second_text = match (stream.next()) {
+        let batch: string[] => batch.join(""),
+        let done: ai.stream.Done => "done",
+    };
+    let turn = stream.final_turn();
+    let reasoning = "";
+    for (let block in turn.content) {
+        if let thought: ai.content.Reasoning = block {
+            reasoning = thought.summary;
+        }
+    }
+    let tool = turn.tool_uses().at(0);
+    [
+        `text=${first_text}+${second_text}`,
+        `reasoning=${reasoning}`,
+        `tool=${tool?.id ?? "-"}/${tool?.name ?? "-"}/${baml.json.stringify(baml.json.to_json(tool?.args))}`,
+        `stop=${turn.stop_reason}`,
+        `usage=${turn.usage?.input_tokens ?? -1}/${turn.usage?.output_tokens ?? -1}/${turn.usage?.cached_input_tokens ?? -1}/${turn.usage?.reasoning_tokens ?? -1}`,
+    ].join("|")
+}
+
+test "stream_contract_rich_content" {
+    assert.equal(
+        stream_contract_rich_content(),
+        "text=an+swer|reasoning=think first|tool=call_1/lookup/{\"q\":\"BAML\"}|stop=ToolUse|usage=9/4/3/2",
+    )
+}
+
+function stream_contract_close_propagates() -> string {
+    let closed = false;
+    let pulls = 0;
+    let stream = ai.stream.TurnStream.from_event_source(
+        () -> {
+            pulls += 1;
+            ai.stream.TextDelta { text: "must-not-pull" }
+        },
+        close = () -> {
+            closed = true;
+        },
+    );
+    stream.close();
+    let outcome = match (stream.next_event()) {
+        let done: ai.stream.Done => "done",
+        _ => "event",
+    };
+    `${closed}|${pulls}|${outcome}`
+}
+
+test "stream_contract_close_propagates" {
+    assert.equal(stream_contract_close_propagates(), "true|0|done")
 }

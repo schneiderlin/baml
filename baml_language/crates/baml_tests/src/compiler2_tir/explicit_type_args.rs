@@ -9,7 +9,44 @@
 //! not the resolved arguments. Divergence from inference is therefore observed via the
 //! resulting expression *type*, not the call-site syntax.
 
-use super::support::{make_db, render_tir};
+use super::support::{make_db, render_ppir, render_tir};
+use crate::engine::TestDbExt;
+
+#[test]
+fn type_binding_renders_both_right_hand_side_kinds() {
+    let mut db = make_db();
+    let file = db.file(
+        "test.baml",
+        r#"
+class Wrapper<T> { value T }
+
+function caller(t: reflect.Type) -> bool {
+    type R = unreflect(t)
+    type S = Wrapper<string>
+    true
+}
+"#,
+    );
+
+    let tir = render_tir(&db, file);
+    assert!(
+        tir.contains("type R = unreflect(t) : reflect.Type"),
+        "typed rendering lost the runtime operand:\n{tir}"
+    );
+    assert!(
+        tir.contains("type S = Wrapper<string> : type"),
+        "typed rendering lost the static type:\n{tir}"
+    );
+    let ppir = render_ppir(&db, file);
+    assert!(
+        ppir.contains("type R = unreflect(t)"),
+        "HIR rendering lost the runtime operand:\n{ppir}"
+    );
+    assert!(
+        ppir.contains("type S = user.Wrapper<string>"),
+        "HIR rendering lost the static type:\n{ppir}"
+    );
+}
 
 /// Explicit type args bind T directly, distinct from what inference would produce.
 ///
@@ -19,7 +56,7 @@ use super::support::{make_db, render_tir};
 #[test]
 fn explicit_type_arg_binds_directly() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -50,7 +87,7 @@ function caller() -> string {
 #[test]
 fn bare_inference_picks_literal_type() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -80,7 +117,7 @@ function caller() -> string {
 #[test]
 fn wrong_type_arg_arity_nongeneric() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function no_generics(x: int) -> int { x }
@@ -112,7 +149,7 @@ function caller() -> int {
 #[test]
 fn wrong_type_arg_arity_too_many() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -141,7 +178,7 @@ function caller() -> int {
 #[test]
 fn generic_apply_value_is_specialized() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -173,7 +210,7 @@ function caller() -> string {
 #[test]
 fn generic_apply_value_rejects_wrong_arg() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -203,7 +240,7 @@ function caller() -> int {
 #[test]
 fn generic_apply_value_accepts_right_arg() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -233,7 +270,7 @@ function caller() -> int {
 #[test]
 fn generic_apply_value_arity_mismatch() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -259,44 +296,12 @@ function caller() -> string {
     "#);
 }
 
-/// A bare reference to a generic function (`let f = identity`, no type args and
-/// no expected type) is an *unrealized* function value, so it is rejected: a
-/// generic function is a type constructor and must be specialized (`identity<int>`)
-/// or inferable from context before it can be used as a value.
-#[test]
-fn bare_generic_function_ref_rejected() {
-    let mut db = make_db();
-    let file = db.add_file(
-        "test.baml",
-        r#"
-function identity<T>(x: T) -> T { x }
-function caller() -> string {
-    let f = identity;
-    f("string")
-}
-"#,
-    );
-    insta::assert_snapshot!(render_tir(&db, file), @r#"
-    function user.identity<T>(x: T) -> T throws never {
-      { : T
-        x : T
-      }
-    }
-    function user.caller() -> string throws never {
-      { : string
-        let f = identity : (x: string) -> string throws never
-        f("string") : string
-      }
-    }
-    "#);
-}
-
 /// Multiple bound type args as a *value*: `pair<int, string>` specializes BOTH
 /// params, yielding the concrete `(a: int, b: string) -> string`.
 #[test]
 fn generic_apply_two_type_args_specialized() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function pair<A, B>(a: A, b: B) -> string { "ok" }
@@ -327,7 +332,7 @@ function caller() -> string {
 #[test]
 fn generic_apply_two_type_args_rejects_wrong_arg() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function pair<A, B>(a: A, b: B) -> string { "ok" }
@@ -363,7 +368,7 @@ function caller() -> string {
 #[test]
 fn generic_apply_through_parenthesized_receiver() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -392,7 +397,7 @@ function caller() -> string {
 #[test]
 fn explicit_two_type_args() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function pair<A, B>(a: A, b: B) -> string { "ok" }
@@ -423,7 +428,7 @@ function caller() -> string {
 #[test]
 fn instantiation_value_call_keeps_ambient_typevar_rigid() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -457,7 +462,7 @@ function pd<T>(y: T) -> int {
 #[test]
 fn instantiation_value_call_preserves_valid_inference() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function identity<T>(x: T) -> T { x }
@@ -488,6 +493,7 @@ function uses() -> int {
         let g = identity : (x: int) -> int throws never
         g(5) : int
       }
+      !! 141..149: generic function `identity` needs concrete type arguments before it can be stored in `g`. Specialize it explicitly, for example `identity<int>`. Or write the concrete function type after the binding name: `let g: (x: int) -> int throws never = identity`. Calling `identity(...)` directly works only when that call's arguments or expected result determine every type argument
     }
     ");
 }
@@ -499,7 +505,7 @@ function uses() -> int {
 #[test]
 fn paren_generic_lambda_instantiation() {
     let mut db = make_db();
-    let file = db.add_file(
+    let file = db.file(
         "test.baml",
         r#"
 function caller() -> int {

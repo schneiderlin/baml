@@ -219,7 +219,7 @@ fn rename_typevars(ty: &Ty, renames: &HashMap<String, String>) -> Ty {
         | Ty::EnumVariant(..)
         | Ty::TypeAlias(..)
         | Ty::Media(..)
-        | Ty::BuiltinUnknown { .. }
+        | Ty::Unknown { .. }
         | Ty::Type { .. }
         | Ty::Resource { .. }
         | Ty::PromptAst { .. }
@@ -250,11 +250,11 @@ mod tests {
 
     fn callback_ty() -> Ty {
         Ty::Function {
-            params: vec![CallableParam {
+            params: Box::new([CallableParam {
                 name: Some(BaseName::new("value")),
                 ty: int(),
                 mode: baml_codegen_types::CodegenFunctionParamMode::Required,
-            }],
+            }]),
             ret: Box::new(int()),
             throws: Box::new(effect_var()),
             attr: TyAttr::EMPTY,
@@ -267,6 +267,7 @@ mod tests {
             generic_params: Vec::new(),
             docstring: None,
             arguments: vec![FunctionArgument {
+                injected: false,
                 name: BaseName::new(arg_name),
                 docstring: None,
                 ty,
@@ -292,12 +293,12 @@ mod tests {
     #[test]
     fn optional_callback_is_a_callback_root() {
         let optional = Ty::Union(
-            vec![
+            Box::new([
                 callback_ty(),
                 Ty::Null {
                     attr: TyAttr::EMPTY,
                 },
-            ],
+            ]),
             TyAttr::EMPTY,
         );
         assert!(matches!(
@@ -321,12 +322,12 @@ mod tests {
         assert_eq!(throws_name(&immediate), "CbError");
 
         let optional_ty = Ty::Union(
-            vec![
+            Box::new([
                 callback_ty(),
                 Ty::Null {
                     attr: TyAttr::EMPTY,
                 },
-            ],
+            ]),
             TyAttr::EMPTY,
         );
         let optional = rename_function(&function_taking("cb", optional_ty), &[]);

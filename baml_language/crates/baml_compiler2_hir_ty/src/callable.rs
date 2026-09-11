@@ -13,22 +13,41 @@ use baml_compiler2_hir::loc::FunctionLoc;
 /// its linked item reference; consumers must never fabricate a `FunctionLoc`
 /// for a source-less package.
 #[derive(Debug, Clone, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
-pub enum ExternalCallTarget {
-    Free {
-        package: baml_base::Name,
-        namespace: Vec<baml_base::Name>,
-        name: baml_base::Name,
-    },
-    Method {
-        package: baml_base::Name,
-        namespace: Vec<baml_base::Name>,
-        class: baml_base::Name,
-        name: baml_base::Name,
-    },
+pub enum ExternalCallTarget<N: baml_type::Head = baml_type::DeclName> {
+    /// A free function, named as an item: its package (the head's root at
+    /// compile time, a spelling on the wire), namespace, and name.
+    Free { function: N },
+    /// A class-inherent method: the owning class as a head, and the method.
+    Method { class: N, name: baml_base::Name },
+    /// An interface method: the interface as a head, and the method.
     Interface {
-        interface: baml_type::QualifiedTypeName,
+        interface: N,
         method: baml_base::Name,
     },
+}
+
+impl<N: baml_type::Head> ExternalCallTarget<N> {
+    /// This target with every head replaced by what `f` resolves it to: the
+    /// one operation that moves a target between the database's root-headed
+    /// form and the wire's name-headed form.
+    pub fn try_map_heads<M: baml_type::Head, E>(
+        &self,
+        f: &mut impl FnMut(&N) -> Result<M, E>,
+    ) -> Result<ExternalCallTarget<M>, E> {
+        Ok(match self {
+            Self::Free { function } => ExternalCallTarget::Free {
+                function: f(function)?,
+            },
+            Self::Method { class, name } => ExternalCallTarget::Method {
+                class: f(class)?,
+                name: name.clone(),
+            },
+            Self::Interface { interface, method } => ExternalCallTarget::Interface {
+                interface: f(interface)?,
+                method: method.clone(),
+            },
+        })
+    }
 }
 
 /// Whether an exported callable has a symbol that a source-less consumer may
@@ -70,7 +89,8 @@ impl ExternalCallable {
 
     pub fn display_name(&self) -> &baml_base::Name {
         match &self.target {
-            ExternalCallTarget::Free { name, .. } | ExternalCallTarget::Method { name, .. } => name,
+            ExternalCallTarget::Free { function } => function.name(),
+            ExternalCallTarget::Method { name, .. } => name,
             ExternalCallTarget::Interface { method, .. } => method,
         }
     }
@@ -127,17 +147,39 @@ pub fn callable_throws<'db>(
     // reuse plan proved unchanged). `by_path(db)` is a tracked read of the
     // `SeededCallableThrows` input, so a later seed invalidates this memo;
     // the lookup is skipped when no seeds were injected (LSP, cold CLI).
+    // Seeds are wire data: their heads are spelled, and resolve through the
+    // seeded function's own root. A seed naming a package that root cannot
+    // reach is not this compile's fact and is inferred honestly below.
     if let Some(seeds) = db.seeded_callable_throws() {
         let by_path = seeds.by_path(db);
         if !by_path.is_empty() {
-            let path = function.file(db).path(db).display().to_string();
+            let file = function.file(db);
+            let path = file.path(db).display().to_string();
             if let Some(ty) = by_path
                 .get(&path)
                 .and_then(|by_id| by_id.get(&function.id(db).as_u32()))
             {
-                return CallableThrows(ty.clone());
+                let root = baml_compiler2_hir::file_package::file_package(db, file).root;
+                let spelling = baml_compiler2_hir::package::spelling(db);
+                if let Ok(ty) = ty.try_map_heads::<_, (), _>(&mut |name| {
+                    spelling.resolve(db, root, name).ok_or(())
+                }) {
+                    return CallableThrows(ty);
+                }
             }
         }
+    }
+    // An interface method's contract is what its signature declares, never
+    // what a default body does: that body is an implementation kept alongside
+    // the interface, and no implementor is bound by it. Deferring to the one
+    // signature road also keeps this out of the fixpoint - `function_signature`
+    // does not call back here for an interface contract (same predicate).
+    if crate::lower::signature_is_interface_contract(db, function) {
+        return CallableThrows(
+            crate::lower::function_signature(db, function)
+                .throws
+                .clone(),
+        );
     }
     let data = baml_compiler2_ppir::item_data::elaborated_function_data(db, function);
     if let Some(throws_ref) = data.throws {
@@ -148,19 +190,20 @@ pub fn callable_throws<'db>(
         // inferring: fall through to the body run, whose finalize unions
         // the named members with the inferred set.
         if !crate::lower::throws_clause_parts(&lowered).1 {
-            return CallableThrows(crate::lower::reject_holes(&lowered).to_plain());
+            return CallableThrows(crate::lower::reject_holes(&lowered));
         }
     }
     let result = crate::infer::infer_body(
         db,
         baml_compiler2_hir::body::BodyOwnerId::Function(function),
     );
-    CallableThrows(result.throws.to_plain())
+    CallableThrows(result.throws.clone())
 }
 
 /// Declaration-site resolved signature of a function or method, as the
-/// tooling surface consumes it: plain types, OWN generic parameters only,
-/// the declared throws kept separate from the inferred effect.
+/// tooling surface consumes it: plain types, OWN generic parameters only
+/// (the effective error type is [`callable_throws`]' - total, whatever its
+/// provenance).
 ///
 /// A view over [`crate::lower::function_signature`] (the one signature
 /// road), so `Self`, projections, and bounds resolve exactly as the type
@@ -174,12 +217,9 @@ pub struct FunctionSignatureTy {
     pub params: Vec<baml_type::FunctionParamTy>,
     /// The declared return type; `Ty::Error` when unwritten.
     pub return_type: baml_type::Ty,
-    /// The written `throws` clause; `None` when omitted (the effective
-    /// contract is then [`callable_throws`]' inferred one).
-    pub declared_throws: Option<baml_type::Ty>,
     /// The function's OWN generic parameters: its frame minus the enclosing
-    /// type's prefix (class frame, interface frame incl. `Self` and the
-    /// associated slots, or free-impl frame).
+    /// type's prefix (class frame, `[Self, iface params..]` for an
+    /// interface, or the impl block's frame).
     pub generic_params: Vec<baml_type::ParamTy>,
     /// `Some` for builtin-bodied functions.
     pub builtin_kind: Option<baml_compiler2_ast::BuiltinKind>,
@@ -216,7 +256,7 @@ fn enclosing_param_count<'db>(
     match baml_compiler2_ppir::item_data::method_owner(db, function) {
         Some(MethodOwner::Class(class)) => crate::lower::class_generic_frame(db, class).len(),
         Some(MethodOwner::Interface(iface)) => crate::lower::interface_frame(db, iface).len(),
-        Some(MethodOwner::FreeImpl(imp)) => crate::lower::impl_frame(db, imp).len(),
+        Some(MethodOwner::Impl(imp)) => crate::lower::impl_frame(db, imp).len(),
         None => 0,
     }
 }
@@ -233,7 +273,7 @@ pub fn function_signature_ty<'db>(
         .iter()
         .map(|param| baml_type::FunctionParamTy {
             name: Some(param.name.clone()),
-            ty: param.ty.to_plain(),
+            ty: param.ty.clone(),
             mode: if param.has_default {
                 baml_type::FunctionParamMode::Optional
             } else {
@@ -245,10 +285,10 @@ pub fn function_signature_ty<'db>(
         baml_compiler2_hir::body::FunctionBody::Builtin(kind) => Some(*kind),
         _ => None,
     };
+    let return_type = sig.ret.clone();
     FunctionSignatureTy {
         params,
-        return_type: sig.ret.to_plain(),
-        declared_throws: sig.throws_declared.then(|| sig.throws.to_plain()),
+        return_type,
         generic_params: sig.generic_params[enclosing.min(sig.generic_params.len())..].to_vec(),
         builtin_kind,
     }

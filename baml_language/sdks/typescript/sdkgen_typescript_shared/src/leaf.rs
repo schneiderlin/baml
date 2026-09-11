@@ -20,7 +20,7 @@ use std::{
     fmt::Write as _,
 };
 
-use baml_base::qualified_name::AI_STREAM_STREAM;
+use baml_base::qualified_name::{AI_FUNCTION_SPEC, AI_STREAM_STREAM};
 use baml_codegen_types::FunctionArgumentDefault;
 
 use crate::{
@@ -104,6 +104,9 @@ const RUNTIME_OWNED_CLASS_REEXPORTS: &[(&str, &str)] = &[
     ("baml.media.Video", "BamlVideo"),
     ("baml.media.Pdf", "BamlPdf"),
     (AI_STREAM_STREAM, "BamlStream"),
+    (AI_FUNCTION_SPEC, "BamlFunctionSpec"),
+    ("ai.Prompt", "BamlPrompt"),
+    ("reflect.Type", "reflectType"),
 ];
 
 fn runtime_owned_reexport_name(c: &TypeScriptClass) -> Option<&'static str> {
@@ -593,7 +596,6 @@ fn write_preamble_ts(
             "import type {{ BamlHandle as _BamlHandle }} from \"{runtime_package}\";"
         );
     }
-    let is_reflect = body.leaf.segments == ["baml", "reflect"];
     if is_root {
         out.push_str(&runtime_import_line(
             state,
@@ -612,15 +614,10 @@ fn write_preamble_ts(
             out.push('\n');
             write_child_reexports(out, kids, callable_child_aliases);
         }
-        out.push_str("\nexport { reflect } from \"./baml/index.js\";\n");
     } else {
-        let extra: &[&str] = if is_reflect { &["reflectType"] } else { &[] };
-        out.push_str(&runtime_import_line(state, extra, runtime_package));
+        out.push_str(&runtime_import_line(state, &[], runtime_package));
         out.push_str(&cross_leaf_imports(state, &body.leaf));
         write_child_reexports(out, kids, callable_child_aliases);
-        if is_reflect {
-            out.push_str("const __baml_type = reflectType;\nexport { __baml_type as type };\n");
-        }
     }
 }
 
@@ -1335,7 +1332,7 @@ mod tests {
                     "r",
                     Ty::Class(
                         name("user", &["lorem"], "Resume"),
-                        vec![],
+                        Box::new([]),
                         baml_base::TyAttr::EMPTY,
                     ),
                 )],
@@ -1407,7 +1404,7 @@ mod tests {
                     vec![],
                     Ty::Class(
                         name("boundary", &[], "LocalId"),
-                        vec![],
+                        Box::new([]),
                         baml_base::TyAttr::EMPTY,
                     ),
                 ),
@@ -1418,7 +1415,7 @@ mod tests {
                     vec![],
                     Ty::Class(
                         name("boundary", &[], "LocalId"),
-                        vec![],
+                        Box::new([]),
                         baml_base::TyAttr::EMPTY,
                     ),
                 ),

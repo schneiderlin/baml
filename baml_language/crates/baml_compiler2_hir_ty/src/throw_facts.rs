@@ -15,7 +15,7 @@ use baml_base::Name;
 use baml_compiler2_ast::{AstSourceMap, BodyNode, Expr, ExprBody, Literal};
 use baml_compiler2_hir::{
     contributions::Definition,
-    package::{PackageId, PackageItems},
+    package::{PackageItems, accessible_package},
 };
 use baml_type::{Ty, TyAttr, throw_facts::FunctionThrowFacts};
 
@@ -57,7 +57,7 @@ unsafe impl salsa::Update for FileThrowFacts {
 /// This is the expensive half of throw inference (PPIR bodies + signature
 /// lowering), isolated per file so it can be (a) memoized at file
 /// granularity and (b) seeded from a previous compile: when the database
-/// carries [`baml_workspace::SeededThrowFacts`] for this file, the seeds are
+/// carries [`baml_compiler2_hir::inputs::SeededThrowFacts`] for this file, the seeds are
 /// returned verbatim and the body is never walked. Facts are a pure
 /// function of file content + name resolution; the bytecode cache only
 /// seeds files whose content is unchanged and whose resolution-relevant
@@ -72,20 +72,22 @@ pub fn file_throw_facts(
     // construction (empty until seeded), so this memo records a dependency on
     // the seed map and a later `set_seeded_throw_facts` reliably invalidates it.
     // An absent/empty map yields no hit and falls through to honest extraction.
-    if let Some(seeds) = db.seeded_throw_facts() {
-        if let Some(facts) = seeds.by_path(db).get(&file.path(db).display().to_string()) {
-            return FileThrowFacts(facts.clone());
-        }
+    let pkg_info = baml_compiler2_hir::file_package::file_package(db, file);
+    // Seeds are wire data: their heads are spelled, and resolve through the
+    // seeded file's own root. A seed naming a package this root cannot reach
+    // is not this compile's fact and is re-derived honestly below.
+    if let Some(seeds) = db.seeded_throw_facts()
+        && let Some(facts) = seeds.by_path(db).get(&file.path(db).display().to_string())
+        && let Some(facts) = respell_seeded_facts(db, pkg_info.root, facts)
+    {
+        return FileThrowFacts(facts);
     }
 
-    let pkg_info = baml_compiler2_hir::file_package::file_package(db, file);
-    let pkg_id = PackageId::new(db, pkg_info.package.clone());
-    let pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
+    let pkg_items = baml_compiler2_ppir::package_items(db, pkg_info.root);
     let func_ns = pkg_info.namespace_path;
 
-    // Class methods (including `implements`-block methods, which
-    // `class_data.methods` flattens in) and interface default methods are
-    // not top-level solver entries under their own names.
+    // Class methods, interface default methods, and `implements`-block
+    // methods are not top-level solver entries under their own names.
     let mut member_ids = std::collections::HashSet::new();
     for class_loc in baml_compiler2_ppir::item_data::file_classes(db, file) {
         let class_data = baml_compiler2_ppir::item_data::class_data(db, *class_loc);
@@ -95,11 +97,10 @@ pub fn file_throw_facts(
         let iface_data = baml_compiler2_ppir::item_data::interface_data(db, *iface_loc);
         member_ids.extend(iface_data.default_methods.iter().copied());
     }
-    // Out-of-body `implement<…> I for Y { … }` blocks: their methods dispatch
-    // through the interface registry and were never solver nodes under their
-    // bare names. (In-body `implements` methods are already covered above —
-    // `class_data.methods` flattens them in.)
-    for impl_loc in baml_compiler2_ppir::item_data::file_free_impls(db, file) {
+    // ALL `implements` blocks, in-body and out-of-body alike: their methods
+    // are Impl-owned (never in `class_data.methods`) and dispatch through the
+    // interface registry, so none is a solver node under its bare name.
+    for impl_loc in baml_compiler2_ppir::item_data::file_impls(db, file) {
         let block = baml_compiler2_ppir::item_data::impl_block_data(db, *impl_loc);
         member_ids.extend(block.methods.iter().copied());
     }
@@ -222,7 +223,7 @@ fn extract_direct_and_declared<'db>(
         let mut builder = baml_compiler2_hir::type_ref::TypeRefBuilder::new();
         let id = builder.lower(te);
         let (store, _spans) = builder.finish();
-        let lowered = scope_ctx().lower_type_ref(&store, id).to_plain();
+        let lowered = crate::lower::reject_holes(&scope_ctx().lower_type_ref(&store, id));
         flatten_declared_ty_to_facts(&lowered)
     });
 
@@ -309,7 +310,7 @@ fn lower_param_types(
         .iter()
         .filter_map(|param| {
             let type_ref = param.type_ref?;
-            let ty = ctx.lower_type_ref(type_refs, type_ref).to_plain();
+            let ty = crate::lower::reject_holes(&ctx.lower_type_ref(type_refs, type_ref));
             Some((param.name.clone(), ty))
         })
         .collect()
@@ -374,60 +375,49 @@ fn throw_fact_from_expr<'db>(
     body: &ExprBody,
 ) -> Ty {
     let fact = match &body.exprs[expr_id] {
-        Expr::Literal(Literal::String(_)) => Ty::String {
+        Expr::Literal(Literal::String(_)) => Some(Ty::String {
             attr: TyAttr::default(),
-        },
-        Expr::Literal(Literal::Int(_)) => Ty::Int {
+        }),
+        Expr::Literal(Literal::Int(_)) => Some(Ty::Int {
             attr: TyAttr::default(),
-        },
-        Expr::Literal(Literal::Float(_)) => Ty::Float {
+        }),
+        Expr::Literal(Literal::Float(_)) => Some(Ty::Float {
             attr: TyAttr::default(),
-        },
-        Expr::Literal(Literal::Bool(_)) => Ty::Bool {
+        }),
+        Expr::Literal(Literal::Bool(_)) => Some(Ty::Bool {
             attr: TyAttr::default(),
-        },
-        Expr::Null => Ty::Null {
+        }),
+        Expr::Null => Some(Ty::Null {
             attr: TyAttr::default(),
-        },
+        }),
         Expr::Path(segments) if !segments.is_empty() => {
             // A thrown bare identifier naming a parameter (`throw s`) carries
             // that parameter's declared type — it is a value, not a type path.
             if let [name] = segments.as_slice()
                 && let Some((_, ty)) = param_types.iter().find(|(param, _)| param == name)
             {
-                ty.clone()
+                Some(ty.clone())
             } else {
                 resolve_path_to_ty(db, pkg_items, ns_context, segments)
             }
         }
         Expr::MemberAccess { .. } => expr_to_path(expr_id, body)
-            .map(|segments| resolve_path_to_ty(db, pkg_items, ns_context, &segments))
-            .unwrap_or(Ty::Unknown {
-                attr: TyAttr::default(),
-            }),
+            .and_then(|segments| resolve_path_to_ty(db, pkg_items, ns_context, &segments)),
         Expr::Object {
             type_name: path, ..
         } => resolve_path_to_ty(db, pkg_items, ns_context, path.segments()),
-        _ => Ty::Unknown {
-            attr: TyAttr::default(),
-        },
+        _ => None,
     };
     // This lightweight, cycle-avoiding pass can't statically name every thrown
-    // value: a call/binary/array/conditional result, or an unresolved path,
-    // falls through to `Ty::Unknown`. `Unknown` is an inference-only sentinel
-    // with no runtime representation — emitting it as a throws fact would trip
-    // the `RuntimeTy` conversion boundary at codegen. Over-approximate to the
-    // top type `unknown` (`BuiltinUnknown`) instead: it is sound (a `catch` must
-    // handle the top type) and has a runtime representation. Full inference
-    // types these precisely for diagnostics; this set only feeds runtime
-    // throws metadata, where a conservative bound is correct.
-    if matches!(fact, Ty::Unknown { .. }) {
-        Ty::BuiltinUnknown {
-            attr: TyAttr::default(),
-        }
-    } else {
-        fact
-    }
+    // value: a call/binary/array/conditional result, or an unresolved path, has
+    // no name to give. Over-approximate to the top type `unknown`
+    // (`Unknown`): it is sound (a `catch` must handle the top type) and
+    // has a runtime representation. Full inference types these precisely for
+    // diagnostics; this set only feeds runtime throws metadata, where a
+    // conservative bound is correct.
+    fact.unwrap_or(Ty::Unknown {
+        attr: TyAttr::default(),
+    })
 }
 
 /// Rewrite a call target name from `self.X` to `ClassName.X`.
@@ -442,13 +432,14 @@ fn rewrite_self_target(target: &Name, class_name: &Name) -> Name {
 }
 
 /// Resolve a path like `["Status", "HttpError"]` or `["ns", "Status", "HttpError"]`
-/// or `["Status"]` to a `Ty`.
+/// or `["Status"]` to a `Ty`, or `None` when the path names nothing this pass
+/// can see (or names a non-type definition).
 fn resolve_path_to_ty<'db>(
     db: &'db dyn baml_compiler2_ppir::Db,
     pkg_items: &PackageItems<'db>,
     ns_context: &[Name],
     segments: &[Name],
-) -> Ty {
+) -> Option<Ty> {
     // Try treating the last segment as an enum variant and the prefix as
     // the enum path (e.g. `Status.HttpError` or `root.Status.Failed`).
     if segments.len() >= 2 {
@@ -460,30 +451,34 @@ fn resolve_path_to_ty<'db>(
             lookup_type_in_scope(db, pkg_items, ns_context, enum_ns, enum_name)
         {
             let qtn = qualify_def(db, def, enum_name);
-            return Ty::EnumVariant(qtn, variant.clone(), TyAttr::default());
+            return Some(Ty::EnumVariant(qtn, variant.clone(), TyAttr::default()));
         }
     }
 
     // Otherwise resolve the full path as a type.
     let name = segments.last().expect("segments is non-empty");
     let seg_ns = &segments[..segments.len() - 1];
-    if let Some(def) = lookup_type_in_scope(db, pkg_items, ns_context, seg_ns, name) {
-        return match def {
-            Definition::Class(_) => {
-                Ty::Class(qualify_def(db, def, name), vec![], TyAttr::default())
-            }
-            Definition::Enum(_) => Ty::Enum(qualify_def(db, def, name), TyAttr::default()),
-            Definition::TypeAlias(_) => {
-                Ty::TypeAlias(qualify_def(db, def, name), TyAttr::default())
-            }
-            _ => Ty::Unknown {
-                attr: TyAttr::default(),
-            },
-        };
-    }
-
-    Ty::Unknown {
-        attr: TyAttr::default(),
+    let def = lookup_type_in_scope(db, pkg_items, ns_context, seg_ns, name)?;
+    match def {
+        Definition::Class(_) => Some(Ty::Class(
+            qualify_def(db, def, name),
+            Box::new([]),
+            TyAttr::default(),
+        )),
+        Definition::Enum(_) => Some(Ty::Enum(qualify_def(db, def, name), TyAttr::default())),
+        Definition::TypeAlias(_) => {
+            Some(Ty::TypeAlias(qualify_def(db, def, name), TyAttr::default()))
+        }
+        // `lookup_type_in_scope` searches the type namespace, so these are
+        // unreachable for its results; either way they are not nameable as a
+        // thrown type. Spelled out rather than wildcarded so a new
+        // `Definition` variant has to be classified here.
+        Definition::Interface(_)
+        | Definition::Function(_)
+        | Definition::TemplateString(_)
+        | Definition::Client(_)
+        | Definition::RetryPolicy(_)
+        | Definition::Let(_) => None,
     }
 }
 
@@ -515,9 +510,8 @@ fn lookup_type_in_scope<'db>(
         if first.as_str() == "root" {
             pkg_items.lookup_type(rest, type_name)
         } else {
-            let pkg_id = PackageId::new(db, first.clone());
-            let pkg = baml_compiler2_ppir::package_items(db, pkg_id);
-            pkg.lookup_type(rest, type_name)
+            let package = accessible_package(db, pkg_items.root, first)?;
+            baml_compiler2_ppir::package_items(db, package).lookup_type(rest, type_name)
         }
     })
 }
@@ -604,9 +598,42 @@ fn collect_widened_leaf_types(ty: &Ty, out: &mut BTreeSet<Ty>) {
     }
 }
 
+/// Seeded facts re-spelled into `root`'s compile-time heads; `None` when a
+/// head names a package `root` cannot reach.
+fn respell_seeded_facts(
+    db: &dyn baml_compiler2_ppir::Db,
+    root: baml_base::SourceRoot,
+    facts: &[baml_type::throw_facts::FunctionThrowFacts<baml_type::TypeName>],
+) -> Option<Vec<baml_type::throw_facts::FunctionThrowFacts>> {
+    let spelling = baml_compiler2_hir::package::spelling(db);
+    facts
+        .iter()
+        .map(|fact| fact.try_map_heads(&mut |name| spelling.resolve(db, root, name).ok_or(())))
+        .collect::<Result<Vec<_>, ()>>()
+        .ok()
+}
+
+/// A file's throw facts spelled for the wire: every head by its root's
+/// spelling in this database. The dual of the seed re-spelling above, and
+/// what the incremental cache persists and compares.
+pub fn export_file_throw_facts(
+    db: &dyn baml_compiler2_ppir::Db,
+    file: baml_base::SourceFile,
+) -> Vec<baml_type::throw_facts::FunctionThrowFacts<baml_type::TypeName>> {
+    let spelling = baml_compiler2_hir::package::spelling(db);
+    file_throw_facts(db, file)
+        .0
+        .iter()
+        .map(|fact| {
+            fact.try_map_heads::<_, std::convert::Infallible>(&mut |decl| Ok(spelling.wire(decl)))
+                .unwrap_or_else(|never| match never {})
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use baml_compiler2_ast::{Pattern, Stmt, TypeArg};
+    use baml_compiler2_ast::{Stmt, TypeBindingValue};
 
     use super::*;
 
@@ -618,43 +645,27 @@ mod tests {
     }
 
     #[test]
-    fn hidden_runtime_operands_are_structural_throw_fact_nodes_once() {
+    fn a_type_binding_operand_is_a_structural_throw_fact_node_once() {
         let mut body = ExprBody::default();
-        let callee = body.exprs.alloc(Expr::Path(vec![Name::new("f")]));
-        let call_throw = throwing_expr(&mut body, "call");
-        let call = body.exprs.alloc(Expr::Call {
-            callee,
-            type_args: vec![TypeArg::Unreflect(call_throw)],
-            args: Vec::new(),
-        });
-        let call_stmt = body.stmts.alloc(Stmt::Expr(call));
-
         let binding_throw = throwing_expr(&mut body, "binding");
         let binding = body.stmts.alloc(Stmt::TypeBinding {
             name: Name::new("T"),
-            value: binding_throw,
+            value: TypeBindingValue::Runtime(binding_throw),
         });
-
-        let scrutinee = body.exprs.alloc(Expr::Literal(Literal::Int(1)));
-        let pattern_throw = throwing_expr(&mut body, "pattern");
-        let pattern = body.patterns.alloc(Pattern::Unreflect(pattern_throw));
-        let pattern_test = body.exprs.alloc(Expr::Is { scrutinee, pattern });
         let root = body.exprs.alloc(Expr::Block {
-            stmts: vec![call_stmt, binding],
-            tail_expr: Some(pattern_test),
+            stmts: vec![binding],
+            tail_expr: None,
         });
         body.root_expr = Some(root);
 
         let nodes = body_nodes(&body);
-        for hidden in [call_throw, binding_throw, pattern_throw] {
-            assert_eq!(
-                nodes
-                    .iter()
-                    .filter(|node| **node == BodyNode::Expr(hidden))
-                    .count(),
-                1,
-                "hidden operand {hidden:?} must participate exactly once",
-            );
-        }
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| **node == BodyNode::Expr(binding_throw))
+                .count(),
+            1,
+            "the binding operand must participate exactly once",
+        );
     }
 }

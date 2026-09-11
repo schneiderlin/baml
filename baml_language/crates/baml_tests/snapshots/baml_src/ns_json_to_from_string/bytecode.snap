@@ -222,31 +222,28 @@ function json_to_from_string.check_decode_error_path_contains_field() -> bool {
     load_const "{\"inner\":{}}"
     call baml.json.from_string
     store_var u
-    jump L2
+    jump L1
     load_var e
     store_var _4
     load_var _4
-    narrow_bind baml.json.JsonDecodeError, slot=3
-    pop_jump_if_false L0
-    jump L1
-
-  L0:
+    narrow_bind baml.json.DecodeError, slot=3
+    pop_jump_if_true L0
     load_var e
     rethrow
 
-  L1:
+  L0:
     load_var _4
     load_field .path
     load_const ".inner.value"
     call assert.contains
     pop 1
     load_const true
-    jump L3
+    jump L2
 
-  L2:
+  L1:
     load_const false
 
-  L3:
+  L2:
     return
 }
 
@@ -262,7 +259,6 @@ function json_to_from_string.closure_captures_type_arg_name() -> string {
 }
 
 function json_to_from_string.composite_generic_roundtrip_name() -> string {
-    load_type json_to_from_string.Container<json_to_from_string.User>
     load_const "Ada"
     load_const 30
     init_instance user.json_to_from_string.User .name, .age
@@ -300,7 +296,6 @@ function json_to_from_string.enum_variant_from_string_name() -> string {
 }
 
 function json_to_from_string.enum_variant_roundtrip_eq() -> bool {
-    load_type json_to_from_string.Color
     load_const user.json_to_from_string.Color.Blue
     alloc_variant user.json_to_from_string.Color
     call baml.json.to_string
@@ -336,17 +331,14 @@ function json_to_from_string.from_string_json_passthrough_int_match() -> bool {
     store_var _3
     load_var _3
     narrow_bind int, slot=1
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const false
     jump L1
 
   L0:
-    load_const false
-    jump L2
-
-  L1:
     load_const true
 
-  L2:
+  L1:
     return
 }
 
@@ -357,18 +349,15 @@ function json_to_from_string.from_string_json_passthrough_object_len() -> int {
     store_var _3
     load_var _3
     narrow_bind map<string, baml.json.json>, slot=1
-    pop_jump_if_false L0
+    pop_jump_if_true L0
+    load_const -1
     jump L1
 
   L0:
-    load_const -1
-    jump L2
-
-  L1:
     load_var _3
     container_len
 
-  L2:
+  L1:
     return
 }
 
@@ -418,7 +407,7 @@ function json_to_from_string.level3(s: string) -> #0 {
     return
 }
 
-function json_to_from_string.make_decoder() -> (string) -> #0 throws baml.json.JsonParseError | baml.json.JsonDecodeError {
+function json_to_from_string.make_decoder() -> (string) -> #0 throws baml.json.ParseError | baml.json.DecodeError {
     load_type #0
     make_closure .<lambda(make_decoder, 0)>, captures=0, ntypeargs=1
     return
@@ -428,18 +417,12 @@ function json_to_from_string.media_field_roundtrip_str() -> string {
     load_const "https://example.com/a.png"
     load_const "image/png"
     call baml.media.Image.from_url
-    store_var _2
-    load_type json_to_from_string.ProfileMedia
-    load_var _2
     init_instance user.json_to_from_string.ProfileMedia .avatar
     call baml.json.to_string
     store_var s
     load_type json_to_from_string.ProfileMedia
     load_var s
     call baml.json.from_string
-    store_var d
-    load_type json_to_from_string.ProfileMedia
-    load_var d
     call baml.json.to_string
     return
 }
@@ -455,7 +438,6 @@ function json_to_from_string.optional_field_decode_missing_is_null() -> bool {
 }
 
 function json_to_from_string.recursive_class_roundtrip_value() -> int {
-    load_type json_to_from_string.Tree
     load_const 1
     load_const 2
     load_type json_to_from_string.Tree
@@ -488,7 +470,6 @@ function json_to_from_string.recursive_class_roundtrip_value() -> int {
 }
 
 function json_to_from_string.roundtrip_simple_age() -> int {
-    load_type json_to_from_string.User
     load_const "Ada"
     load_const 30
     init_instance user.json_to_from_string.User .name, .age
@@ -510,7 +491,6 @@ function json_to_from_string.three_level_name() -> string {
 }
 
 function json_to_from_string.to_string_infers_simple_class() -> string {
-    load_type json_to_from_string.User
     load_const "Ada"
     load_const 30
     init_instance user.json_to_from_string.User .name, .age
@@ -521,9 +501,6 @@ function json_to_from_string.to_string_infers_simple_class() -> string {
 function json_to_from_string.to_string_json_passthrough_str() -> string {
     load_const "[1,2,3]"
     call baml.json.parse
-    store_var j
-    load_type baml.json.json
-    load_var j
     call baml.json.to_string
     return
 }

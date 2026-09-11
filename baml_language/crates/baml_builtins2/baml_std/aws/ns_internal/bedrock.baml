@@ -38,7 +38,7 @@
 // all encoded — so the produced path is byte-identical to the AWS SDK's.
 // ---------------------------------------------------------------------------
 
-// True for the RFC 3986 unreserved characters, which never need escaping.
+/// (internal) True for the RFC 3986 unreserved characters, which never need escaping.
 function _is_unreserved_byte(byte: int) -> bool {
     (byte >= 48 && byte <= 57) // 0-9
         || (byte >= 65 && byte <= 90) // A-Z
@@ -130,16 +130,12 @@ class ToolUseBlock {
     input: map<string, unknown>,
 }
 
-/// One piece of a tool's result. Only `text` is modeled: `ai.events` carries
-/// tool output as a string (`ToolCompleted.output` / `ToolFailed.message`), so
-/// the `json`/`image`/`document` members of the wire union have no source.
-class ToolResultContentBlock {
-    text: string,
-}
-
+/// `content` is a `ToolResultContentBlock[]` on the wire — `text`, `image`,
+/// `document` or `video`, the same members spelled the same way as in a
+/// message `ContentBlock`, so the one class serves both.
 class ToolResultBlock {
     toolUseId: string,
-    content: ToolResultContentBlock[],
+    content: ContentBlock[],
     status: string?, // success | error
 }
 
@@ -244,7 +240,7 @@ class ToolInputSchema {
 
     implements baml.ToJson {
         function to_json(self) -> baml.json.json {
-            let out: map<string, baml.json.json> = {  };
+            let out: map<string, baml.json.json> = {};
             let _ = out.set("json", self.json_schema);
             out
         }
@@ -387,13 +383,13 @@ function _prune_nulls(value: baml.json.json) -> baml.json.json {
 // an `s3Location`.
 // ---------------------------------------------------------------------------
 
-// Every LOCAL, pre-send rejection in this file throws ONE error identity:
-// `ai.errors.InvalidRequest` with a null status code — the same class
-// `converse_url` and `sign` already throw for an unresolvable region or
-// missing credentials. It is an `ai.errors.Failure`, so unlike
-// `baml.errors.InvalidArgument` it survives `BedrockClient.invoke`'s
-// `ai.errors.normalize` with its identity (and its `RetrySafety`) intact
-// instead of being flattened into an untyped `baml.errors.UnknownError`.
+/// (internal) Every LOCAL, pre-send rejection in this file throws ONE error identity:
+/// `ai.errors.InvalidRequest` with a null status code — the same class
+/// `converse_url` and `sign` already throw for an unresolvable region or
+/// missing credentials. It is an `ai.errors.Failure`, so unlike
+/// `baml.errors.InvalidArgument` it survives `BedrockClient.invoke`'s
+/// `ai.errors.normalize` with its identity (and its `RetrySafety`) intact
+/// instead of being flattened into an untyped `baml.errors.UnknownError`.
 function _reject(detail: string) -> ai.errors.InvalidRequest {
     ai.errors.InvalidRequest {
         provider: "aws-bedrock",
@@ -417,9 +413,9 @@ function _image_format(mime: string) -> string {
     }
 }
 
-// `VideoBlock.format`: mkv | mov | mp4 | webm | flv | mpeg | mpg | wmv |
-// three_gp. sys_llm's map (`build_request/bedrock.rs:280-292`) predates `mpg`
-// and `wmv`; both are carried here.
+/// (internal) `VideoBlock.format`: mkv | mov | mp4 | webm | flv | mpeg | mpg | wmv |
+/// three_gp. sys_llm's map (`build_request/bedrock.rs:280-292`) predates `mpg`
+/// and `wmv`; both are carried here.
 function _video_format(mime: string) -> string {
     match (mime) {
         "video/mp4" => "mp4",
@@ -435,10 +431,10 @@ function _video_format(mime: string) -> string {
     }
 }
 
-// `AudioBlock.format`: mp3 | opus | wav | aac | flac | mp4 | ogg | mkv | mka |
-// x-aac | m4a | mpeg | mpga | pcm | webm. sys_llm carried five of them
-// (`build_request/bedrock.rs:267-278`); the enum has widened since, so the
-// containers with an unambiguous IANA/common mime type are all mapped.
+/// (internal) `AudioBlock.format`: mp3 | opus | wav | aac | flac | mp4 | ogg | mkv | mka |
+/// x-aac | m4a | mpeg | mpga | pcm | webm. sys_llm carried five of them
+/// (`build_request/bedrock.rs:267-278`); the enum has widened since, so the
+/// containers with an unambiguous IANA/common mime type are all mapped.
 function _audio_format(mime: string) -> string {
     match (mime) {
         "audio/mpeg" | "audio/mp3" => "mp3",
@@ -458,8 +454,8 @@ function _audio_format(mime: string) -> string {
     }
 }
 
-// base64 bytes, else an s3:// location. Any other URL is a hard error: Bedrock
-// reads media from the request body or from S3, never from an arbitrary host.
+/// (internal) base64 bytes, else an s3:// location. Any other URL is a hard error: Bedrock
+/// reads media from the request body or from S3, never from an arbitrary host.
 function _media_source(
     resolved: ai.wire.ResolvedMedia,
     kind: string,
@@ -554,51 +550,59 @@ function _audio_block(audio: baml.media.Audio, preview: bool = false) -> Content
 // 5. Prompt lowering
 // ---------------------------------------------------------------------------
 
-// Converse splits system content off the alternating message list, the same
-// shape the Anthropic client uses.
+/// Converse splits system content off the alternating message list, the same
+/// shape the Anthropic client uses.
 class BedrockPrompt {
     system: SystemContentBlock[],
     messages: Message[],
 }
 
-// One rendered prompt message -> Converse content blocks.
-function _prompt_content(message: ai.PromptMessage, preview: bool = false) -> ContentBlock[] {
-    let blocks: ContentBlock[] = [];
-    for (let part in message.parts) {
-        match (part) {
-            let text: string => {
-                // Converse rejects empty and whitespace-only text blocks, and a
-                // rendered prompt routinely produces them around media parts —
-                // the same filter the Anthropic client applies in
-                // `_anthropic_prompt_blocks`.
-                if (text.trim() != "") {
-                    blocks.push(ContentBlock.of_text(text));
-                }
+/// (internal) One content block -> its Converse `ContentBlock`, or null when it lowers to
+/// nothing. Converse takes every media kind in a conversation message; a tool
+/// result carries `text`, `image`, `document` and `video` but has no audio
+/// member, so audio in a result degrades into a user turn after the run of results
+/// (`_lower_journal`); system content is text only (`_prompt_system`).
+///
+///   position    | text   | image  | pdf    | audio   | video
+///   system      | Accept | Reject | Reject | Reject  | Reject
+///   user        | Accept | Accept | Accept | Accept  | Accept
+///   assistant   | Accept | Accept | Accept | Accept  | Accept
+///   tool_result | Accept | Accept | Accept | Degrade | Accept
+function _lower_block(block: ai.content.Block, preview: bool = false) -> ContentBlock? {
+    match (block) {
+        let text: ai.content.Text => {
+            // Converse rejects empty and whitespace-only text blocks, and a
+            // rendered prompt routinely produces them around media parts —
+            // the same filter the Anthropic client applies.
+            if (text.text.trim() == "") {
                 null
-            },
-            let image: baml.media.Image => {
-                blocks.push(_image_block(image, preview = preview));
-                null
-            },
-            let audio: baml.media.Audio => {
-                blocks.push(_audio_block(audio, preview = preview));
-                null
-            },
-            let video: baml.media.Video => {
-                blocks.push(_video_block(video, preview = preview));
-                null
-            },
-            let pdf: baml.media.Pdf => {
-                blocks.push(_document_block(pdf, preview = preview));
-                null
-            },
-        };
+            } else {
+                ContentBlock.of_text(text.text)
+            }
+        },
+        let media: ai.content.Media => {
+            match (media.media) {
+                let image: baml.media.Image => _image_block(image, preview = preview),
+                let audio: baml.media.Audio => _audio_block(audio, preview = preview),
+                let video: baml.media.Video => _video_block(video, preview = preview),
+                let pdf: baml.media.Pdf => _document_block(pdf, preview = preview),
+            }
+        },
     }
-    blocks
 }
 
-// System content is text-only; a media part in a system message is rejected
-// rather than silently dropped (`build_request/bedrock.rs:174-176`).
+function _lower_blocks(blocks: ai.content.Block[], preview: bool = false) -> ContentBlock[] {
+    let out: ContentBlock[] = [];
+    for (let block in blocks) {
+        if let lowered: ContentBlock = _lower_block(block, preview = preview) {
+            out.push(lowered);
+        }
+    }
+    out
+}
+
+/// (internal) System content is text-only; a media part in a system message is rejected
+/// rather than silently dropped (`build_request/bedrock.rs:174-176`).
 function _prompt_system(message: ai.PromptMessage) -> SystemContentBlock[] {
     let blocks: SystemContentBlock[] = [];
     for (let part in message.parts) {
@@ -619,7 +623,7 @@ function _prompt_system(message: ai.PromptMessage) -> SystemContentBlock[] {
     blocks
 }
 
-/// The per-message metadata key that requests a Bedrock prompt-caching
+/// (internal) The per-message metadata key that requests a Bedrock prompt-caching
 /// checkpoint after the message's content.
 ///
 /// The engine emits `{"cachePoint":{"type":"default"}}` whenever a message
@@ -633,19 +637,19 @@ function _prompt_system(message: ai.PromptMessage) -> SystemContentBlock[] {
 /// metadata, so nothing populates this yet from the prompt DSL. Until that
 /// lands, use the client's `cache_system_prompt` / `cache_tools` options,
 /// which do not depend on per-message metadata.
-function _wants_cache_point(message: ai.PromptMessage) -> bool {
-    match (message.metadata.get("cache_point")) {
+function _wants_cache_point(metadata: map<string, baml.json.json>) -> bool {
+    match (metadata.get("cache_point")) {
         null => false,
         _ => true,
     }
 }
 
-// The Converse conversation roles are `user` and `assistant` only. `system`
-// is hoisted out above; every other authored role (including the role-less
-// default and `tool`) becomes `user`, matching the native Anthropic client and
-// PLAN §5's role-less default. sys_llm hard-errored on unknown roles instead
-// (`build_request/bedrock.rs:143-151`); collapsing keeps the four native
-// clients consistent with one another.
+/// (internal) The Converse conversation roles are `user` and `assistant` only. `system`
+/// is hoisted out above; every other authored role (including the role-less
+/// default and `tool`) becomes `user`, matching the native Anthropic client and
+/// PLAN §5's role-less default. sys_llm hard-errored on unknown roles instead
+/// (`build_request/bedrock.rs:143-151`); collapsing keeps the four native
+/// clients consistent with one another.
 function _conversation_role(role: string) -> string {
     if (role == "assistant") {
         "assistant"
@@ -654,14 +658,14 @@ function _conversation_role(role: string) -> string {
     }
 }
 
-// MULTI-SYSTEM: every `system` message merges into the one top-level `system`
-// array, deliberately diverging from PLAN §5's "others: demote 2nd+ to user"
-// row. That row exists for providers whose wire format has room for exactly
-// one system string, where a second one has nowhere to go; Converse's `system`
-// IS a `SystemContentBlock[]`, so merging is the format's own answer and
-// demoting would silently move authored instructions into the conversation.
-// The native Anthropic client (`messages.baml:308-337`) merges for the same
-// reason.
+/// (internal) MULTI-SYSTEM: every `system` message merges into the one top-level `system`
+/// array, deliberately diverging from PLAN §5's "others: demote 2nd+ to user"
+/// row. That row exists for providers whose wire format has room for exactly
+/// one system string, where a second one has nowhere to go; Converse's `system`
+/// IS a `SystemContentBlock[]`, so merging is the format's own answer and
+/// demoting would silently move authored instructions into the conversation.
+/// The native Anthropic client (`messages.baml:308-337`) merges for the same
+/// reason.
 function _lower_prompt(prompt: ai.Prompt, preview: bool = false) -> BedrockPrompt {
     let system: SystemContentBlock[] = [];
     let messages: Message[] = [];
@@ -670,17 +674,17 @@ function _lower_prompt(prompt: ai.Prompt, preview: bool = false) -> BedrockPromp
             for (let block in _prompt_system(message)) {
                 system.push(block);
             }
-            if (_wants_cache_point(message)) {
+            if (_wants_cache_point(message.metadata)) {
                 system.push(SystemContentBlock.of_cache_point());
             }
             null
         } else {
-            let content = _prompt_content(message, preview = preview);
+            let content = _lower_blocks(ai.wire.prompt_blocks(message), preview = preview);
             // A message that lowered to nothing (all-whitespace text) is
             // dropped: `content: []` is a ValidationException, and a lone
             // `cachePoint` with nothing to cache is no better.
             if (content.length() > 0) {
-                if (_wants_cache_point(message)) {
+                if (_wants_cache_point(message.metadata)) {
                     content.push(ContentBlock.of_cache_point());
                 }
                 messages.push(Message { role: _conversation_role(message.role), content: content });
@@ -699,42 +703,13 @@ function _lower_prompt(prompt: ai.Prompt, preview: bool = false) -> BedrockPromp
 // message.
 // ---------------------------------------------------------------------------
 
-// A lowered message plus whether it is an open tool-result group.
+/// A lowered message plus whether it is an open tool-result group.
 class PendingMessage {
     message: Message,
     tool_results: bool,
 }
 
-function _assistant_content(content: ai.content.Block[]) -> ContentBlock[] {
-    let out: ContentBlock[] = [];
-    for (let block in content) {
-        match (block) {
-            let text: ai.content.Text => {
-                out.push(ContentBlock.of_text(text.text));
-                null
-            },
-            // Dropped: Converse replays reasoning as `reasoningContent` with
-            // the provider's opaque `signature`, which `ai.content.Reasoning`
-            // (a readable summary) cannot reproduce; replaying it unsigned is
-            // rejected.
-            let reasoning: ai.content.Reasoning => null,
-            // Dropped: a generated media payload is an output, not replayable
-            // model input.
-            let media: ai.content.Media => null,
-            let use: ai.content.ToolUse => {
-                out.push(
-                    ContentBlock.of_tool_use(
-                        ToolUseBlock { toolUseId: use.id, name: use.name, input: use.args },
-                    ),
-                );
-                null
-            },
-        };
-    }
-    out
-}
-
-/// `ToolResultBlock.status` "is only supported by Amazon Nova and Anthropic
+/// (internal) `ToolResultBlock.status` "is only supported by Amazon Nova and Anthropic
 /// Claude 3 and 4 models" (API_runtime_ToolResultBlock). Sending it to any
 /// other family ships a member that model does not accept, so it is gated on a
 /// substring of the model id — which covers a bare id
@@ -749,11 +724,11 @@ function _supports_tool_result_status(model: string) -> bool {
     id.includes("anthropic.claude") || id.includes("amazon.nova")
 }
 
-// Append one toolResult block, extending the trailing group when it is open.
+/// (internal) Append one toolResult block, extending the trailing group when it is open.
 function _push_tool_result(
     pending: PendingMessage[],
     id: string,
-    output: string,
+    content: ContentBlock[],
     is_error: bool,
     with_status: bool,
 ) -> void {
@@ -764,13 +739,7 @@ function _push_tool_result(
     } else {
         "success"
     };
-    let block = ContentBlock.of_tool_result(
-        ToolResultBlock {
-            toolUseId: id,
-            content: [ToolResultContentBlock { text: output }],
-            status: status,
-        },
-    );
+    let block = ContentBlock.of_tool_result(ToolResultBlock { toolUseId: id, content: content, status: status });
     // `.at` is null on an empty list, which covers the no-messages case.
     if let last: PendingMessage = pending.at(pending.length() - 1) {
         if (last.tool_results) {
@@ -783,33 +752,67 @@ function _push_tool_result(
     );
 }
 
-// `ai.RunStarted` / `ai.ToolRequested` / `ai.Usage` / `ai.FinalProduced` are
-// journal-only and skip; skipping never closes an open tool-result group.
-function _lower_journal(journal: ai.Journal, with_status: bool) -> Message[] {
+/// (internal) `ai.RunStarted` / `ai.ToolRequested` / `ai.Usage` / `ai.FinalProduced` are
+/// journal-only and skip; skipping never closes an open tool-result group.
+function _lower_journal(
+    journal: ai.Journal,
+    with_status: bool,
+    preview: bool = false,
+) -> Message[] {
     let pending: PendingMessage[] = [];
     for (let event in journal.entries()) {
         match (event) {
             let user: ai.events.UserMessage => {
-                pending.push(
-                    PendingMessage {
-                        message: Message {
-                            role: "user",
-                            content: [ContentBlock.of_text(user.content)],
+                let content = _lower_blocks(user.content, preview = preview);
+                if (content.length() > 0) {
+                    if (_wants_cache_point(user.metadata)) {
+                        content.push(ContentBlock.of_cache_point());
+                    }
+                    pending.push(
+                        PendingMessage {
+                            message: Message { role: "user", content: content },
+                            tool_results: false,
                         },
-                        tool_results: false,
-                    },
-                );
+                    );
+                }
                 null
             },
             let assistant: ai.events.AssistantMessage => {
-                let content = _assistant_content(assistant.content);
+                let content: ContentBlock[] = [];
+                for (let block in assistant.content) {
+                    match (block) {
+                        let inner: ai.content.Block => {
+                            if let lowered: ContentBlock = _lower_block(inner, preview = preview) {
+                                content.push(lowered);
+                            }
+                            null
+                        },
+                        let use: ai.content.ToolUse => {
+                            content.push(
+                                ContentBlock.of_tool_use(
+                                    ToolUseBlock {
+                                        toolUseId: use.id,
+                                        name: use.name,
+                                        input: use.args,
+                                    },
+                                ),
+                            );
+                            null
+                        },
+                        // Dropped: Converse replays reasoning as
+                        // `reasoningContent` with the provider's opaque
+                        // `signature`, which `ai.content.Reasoning` (a readable
+                        // summary) cannot reproduce; replaying it unsigned is
+                        // rejected.
+                        let reasoning: ai.content.Reasoning => null,
+                    };
+                }
                 // An assistant turn that lowers to nothing is dropped rather
                 // than sent as `content: []`, which Converse rejects with a
                 // ValidationException. A reasoning-only turn is exactly that
-                // shape: `_assistant_content` drops Reasoning and Media, and
-                // `ai.wire.sanitize_for_client` KEEPS same-client reasoning,
-                // so nothing upstream removes it. Mirrors the Anthropic
-                // client's guard in `_anthropic_lower_journal`.
+                // shape, and `ai.wire.sanitize_for_client` KEEPS same-client
+                // reasoning, so nothing upstream removes it. Mirrors the
+                // Anthropic client's guard in `_lower_journal`.
                 if (content.length() > 0) {
                     pending.push(
                         PendingMessage {
@@ -821,10 +824,20 @@ function _lower_journal(journal: ai.Journal, with_status: bool) -> Message[] {
                 null
             },
             let completed: ai.events.ToolCompleted => {
-                _push_tool_result(pending, completed.id, completed.output, false, with_status);
+                // A toolResult carries text, image, document and video inline;
+                // `ai.wire.degrade_tool_media` has already moved audio out of
+                // the result and behind the run of results it belongs to.
+                _push_tool_result(
+                    pending,
+                    completed.id,
+                    _lower_blocks(completed.content, preview = preview),
+                    false,
+                    with_status,
+                );
+                null
             },
             let failed: ai.events.ToolFailed => {
-                _push_tool_result(pending, failed.id, failed.message, true, with_status);
+                _push_tool_result(pending, failed.id, [ContentBlock.of_text(failed.message)], true, with_status);
             },
             _ => null,
         };
@@ -840,10 +853,10 @@ function _lower_journal(journal: ai.Journal, with_status: bool) -> Message[] {
 // 7. toolConfig
 // ---------------------------------------------------------------------------
 
-// `tool_choice` option -> the Converse union. "auto" and "any" are the two
-// documented modes; anything else names a specific tool.
+/// (internal) `tool_choice` option -> the Converse union. "auto" and "any" are the two
+/// documented modes; anything else names a specific tool.
 function _tool_choice(choice: string) -> ToolChoice {
-    let empty: map<string, unknown> = { };
+    let empty: map<string, unknown> = {};
     match (choice) {
         "auto" => ToolChoice { auto: empty, any: null, tool: null },
         "any" | "required" => ToolChoice { auto: null, any: empty, tool: null },
@@ -909,10 +922,12 @@ function _inference_config(client: root.BedrockClient) -> InferenceConfig? {
             }
         },
     };
-    if (client.max_tokens == null
-        && client.temperature == null
-        && client.top_p == null
-        && stops == null) {
+    if (
+        client.max_tokens == null
+            && client.temperature == null
+            && client.top_p == null
+            && stops == null
+    ) {
         return null;
     }
     InferenceConfig {
@@ -923,10 +938,10 @@ function _inference_config(client: root.BedrockClient) -> InferenceConfig? {
     }
 }
 
-// A system-only or assistant-first prompt has no leading user message, which
-// Converse rejects ("A conversation must start with a user message"). Fold the
-// system blocks into a leading user message in that case — the same fallback
-// the Anthropic client uses (`anthropic/ns_internal/messages.baml:270-289`).
+/// (internal) A system-only or assistant-first prompt has no leading user message, which
+/// Converse rejects ("A conversation must start with a user message"). Fold the
+/// system blocks into a leading user message in that case — the same fallback
+/// the Anthropic client uses (`anthropic/ns_internal/messages.baml:270-289`).
 function _system_as_user(system: SystemContentBlock[]) -> Message {
     let content: ContentBlock[] = [];
     for (let block in system) {
@@ -941,18 +956,18 @@ function _system_as_user(system: SystemContentBlock[]) -> Message {
     Message { role: "user", content: content }
 }
 
-// Converse requires strict user/assistant alternation, and several paths here
-// can put two same-role messages side by side: a dropped assistant turn (a
-// reasoning-only reply lowers to no content) leaves the user turns that
-// bracketed it adjacent, the rendered prompt can end on the same role the
-// journal opens with, and consecutive toolResults arrive as separate `user`
-// messages when a journal-only event splits their group.
-//
-// Merging by concatenating content lists repairs every one of those, not just
-// the shape each guard was written for. Block order inside each message is
-// preserved and messages are joined in order, so a `cachePoint` still sits
-// after exactly the blocks it was marking. `_push_tool_result`'s grouping
-// becomes a special case of this.
+/// (internal) Converse requires strict user/assistant alternation, and several paths here
+/// can put two same-role messages side by side: a dropped assistant turn (a
+/// reasoning-only reply lowers to no content) leaves the user turns that
+/// bracketed it adjacent, the rendered prompt can end on the same role the
+/// journal opens with, and consecutive toolResults arrive as separate `user`
+/// messages when a journal-only event splits their group.
+///
+/// Merging by concatenating content lists repairs every one of those, not just
+/// the shape each guard was written for. Block order inside each message is
+/// preserved and messages are joined in order, so a `cachePoint` still sits
+/// after exactly the blocks it was marking. `_push_tool_result`'s grouping
+/// becomes a special case of this.
 function _merge_adjacent_roles(messages: Message[]) -> Message[] {
     let out: Message[] = [];
     for (let message in messages) {
@@ -975,18 +990,19 @@ function converse_request(
     input: ai.ModelTurnInput,
     preview: bool = false,
 ) -> ConverseRequest {
-    let prompt = _lower_prompt(
-        input.prompt(ai.wire.render_output_format(input.output_type)),
-        preview = preview,
-    );
+    let prompt = _lower_prompt(input.prompt(ai.internal.build_output_format(input.output_type)), preview = preview);
     let system = prompt.system;
     if (client.cache_system_prompt && system.length() > 0) {
         system.push(SystemContentBlock.of_cache_point());
     }
     let messages = prompt.messages;
     let journal_messages = _lower_journal(
-        ai.wire.sanitize_for_client(input.journal, client.id()),
+        ai.wire.degrade_tool_media(
+            ai.wire.sanitize_for_client(input.journal, client.id()),
+            ["image", "pdf", "video"],
+        ),
         _supports_tool_result_status(client.model),
+        preview = preview,
     );
     for (let message in journal_messages) {
         messages.push(message);
@@ -1080,14 +1096,14 @@ function converse_url(client: root.BedrockClient, preview: bool = false) -> stri
     }
 }
 
-// `base` with `extra` applied over it, header names lowercased so a user
-// override replaces the client's own header instead of duplicating it (SigV4
-// canonicalizes on the lowercased name).
+/// (internal) `base` with `extra` applied over it, header names lowercased so a user
+/// override replaces the client's own header instead of duplicating it (SigV4
+/// canonicalizes on the lowercased name).
 function _merge_headers(
     base: map<string, string>,
     extra: map<string, string>?,
 ) -> map<string, string> {
-    let out: map<string, string> = { };
+    let out: map<string, string> = {};
     for (let name in base.keys()) {
         let _ = out.set(name.to_lower_case(), base.get(name) ?? "");
     }
@@ -1103,17 +1119,15 @@ function _merge_headers(
     out
 }
 
-// Query parameters are percent-encoded with the same unreserved set SigV4's
-// canonical query uses, so signing them round-trips.
+/// (internal) Query parameters are percent-encoded with the same unreserved set SigV4's
+/// canonical query uses, so signing them round-trips.
 function _apply_query(url: string, params: map<string, string>?) -> string {
     match (params) {
         null => url,
         let query: map<string, string> => {
             let pairs: string[] = [];
             for (let name in query.keys()) {
-                pairs.push(
-                    `${encode_path_label(name)}=${encode_path_label(query.get(name) ?? "")}`,
-                );
+                pairs.push(`${encode_path_label(name)}=${encode_path_label(query.get(name) ?? "")}`);
             }
             if (pairs.length() == 0) {
                 url
@@ -1140,10 +1154,7 @@ function build_request(
     baml.http.Request {
         method: "POST",
         url: _apply_query(converse_url(client, preview = preview), client.query_params),
-        headers: _merge_headers(
-            { "content-type": "application/json", "accept": "application/json" },
-            client.headers,
-        ),
+        headers: _merge_headers({ "content-type": "application/json", "accept": "application/json" }, client.headers),
         body: baml.json.stringify(merged),
     }
 }
@@ -1153,7 +1164,7 @@ function build_request(
 function sign(client: root.BedrockClient, request: baml.http.Request) -> baml.http.Request {
     root.internal.sign_request(
         request,
-        root.internal.AwsSignOptions {
+        root.internal.SignOptions {
             region: client.region,
             profile: client.profile,
             access_key_id: client.access_key_id,
@@ -1244,7 +1255,7 @@ class ConverseResponse {
     additionalModelResponseFields: baml.json.json?,
 }
 
-/// True for the two `stopReason` values that say the turn's own content is
+/// (internal) True for the two `stopReason` values that say the turn's own content is
 /// unusable: `malformed_model_output` (the model emitted something the service
 /// could not assemble into a message) and `malformed_tool_use` (it emitted a
 /// tool call the service could not assemble into a `toolUse` block).
@@ -1306,14 +1317,14 @@ function parse_response(response: ConverseResponse) -> ai.ModelTurn {
             raw_output: baml.json.stringify(baml.json.to_json(response)),
         }
     }
-    let content: ai.content.Block[] = [];
+    let content: ai.content.ModelBlock[] = [];
     let blocks: ResponseContentBlock[] = message.content ?? [];
     for (let block in blocks) {
         if let text: string = block.text {
             content.push(ai.content.Text { text: text });
             null
         } else if let use: ResponseToolUse = block.toolUse {
-            let empty: map<string, unknown> = { };
+            let empty: map<string, unknown> = {};
             content.push(
                 ai.content.ToolUse {
                     id: use.toolUseId ?? "",
@@ -1354,7 +1365,7 @@ function parse_response(response: ConverseResponse) -> ai.ModelTurn {
         },
     };
 
-    ai.ModelTurn { content: content, stop_reason: stop, usage: usage }
+    ai.ModelTurn { calls: [], content: content, stop_reason: stop, usage: usage }
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,5 +1374,12 @@ function parse_response(response: ConverseResponse) -> ai.ModelTurn {
 
 function invoke(client: root.BedrockClient, input: ai.ModelTurnInput) -> ai.ModelTurn {
     let request = sign(client, build_request(client, input, preview = false));
-    parse_response(ai.wire.send_as<ConverseResponse>(request, "aws-bedrock"))
+    let sent = ai.wire.send_as_with_wire<ConverseResponse>(
+        request,
+        "aws-bedrock",
+        client.id(),
+        capture_wire = client.capture_wire,
+    );
+    let turn = parse_response(sent.value);
+    ai.ModelTurn { ...turn, calls: [sent.call] }
 }

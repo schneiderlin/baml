@@ -1,8 +1,8 @@
 // Internal helpers. Nothing here is part of the public ai surface.
 
-// One JSON Schema object for a function's parameters, derived from the
-// signature: every parameter typed via baml.json.schema.
-function _schema_for_signature(handler: baml.AnyFunction) -> map<string, unknown> {
+/// (internal) One JSON Schema object for a function's parameters, derived from the
+/// signature: every parameter typed via baml.json.schema.
+function _schema_for_signature(handler: reflect.AnyFunction) -> map<string, unknown> {
     let sig = reflect.signature(handler);
     let props: map<string, unknown> = {};
     let required: string[] = [];
@@ -13,14 +13,39 @@ function _schema_for_signature(handler: baml.AnyFunction) -> map<string, unknown
     { "type": "object", "properties": props, "required": required, "additionalProperties": false }
 }
 
-// Bound as `ctx` inside a compiler-desugared `@spec` prompt template.
-// `output_format` is the one placeholder the BEP allows.
+/// Bound as `ctx` inside a compiler-desugared `@spec` prompt template.
+/// `output_format` is the one placeholder the BEP allows.
 class SpecCtx {
-    output_format: string,
+    _output_format: root.OutputFormat,
+
+    function output_format(
+        self,
+        prefix: string | null | OutputFormatDefault = OutputFormatDefault.Auto,
+        or_splitter: string | OutputFormatDefault = OutputFormatDefault.Auto,
+        enum_value_prefix: string | null | OutputFormatDefault = OutputFormatDefault.Auto,
+        hoisted_class_prefix: string | null | OutputFormatDefault = OutputFormatDefault.Auto,
+        always_hoist_enums: bool | OutputFormatDefault = OutputFormatDefault.Auto,
+        quote_class_fields: bool | OutputFormatDefault = OutputFormatDefault.Auto,
+        hoist_classes: bool | "auto" | string[] | OutputFormatDefault = OutputFormatDefault.Auto,
+        map_style: "angle" | "object" | OutputFormatDefault = OutputFormatDefault.Auto,
+        render_null_as: string | null | OutputFormatDefault = OutputFormatDefault.Auto,
+    ) -> string throws never {
+        self._output_format._render(
+            prefix = prefix,
+            or_splitter = or_splitter,
+            enum_value_prefix = enum_value_prefix,
+            hoisted_class_prefix = hoisted_class_prefix,
+            always_hoist_enums = always_hoist_enums,
+            quote_class_fields = quote_class_fields,
+            hoist_classes = hoist_classes,
+            map_style = map_style,
+            render_null_as = render_null_as,
+        )
+    }
 }
 
 /// Assemble a structural `ai.Prompt` from a tagged template's flattened
-/// `parts` and `values`. `root.Role` values start new messages; media
+/// `parts` and `values`. `ai.Role` values start new messages; media
 /// remains structural until a provider lowers the prompt.
 //baml:mut_vm
 //baml:may_yield
@@ -56,7 +81,9 @@ function assemble_llm_prompt(parts: string[], values: unknown[]) -> root.Prompt 
     };
 
     if (needs_system) {
-        let system = root.Role { name: "system", metadata: {} };
+        // The reserved metadata key marks this role as assembler-inserted; the
+        // VM strips it and skips legacy edge-trimming for the message.
+        let system = root.Role { name: "system", metadata: { "__baml_synthetic_role": "1" } };
         let llm_parts: string[] = [""];
         for (let part in parts) {
             llm_parts.push(part);

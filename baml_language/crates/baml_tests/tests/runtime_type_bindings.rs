@@ -15,21 +15,21 @@ function TenantPersonType() -> reflect.class.Type {
     .field("name")
     .field("email")
   reflect.class.new("AcmePerson", {
-    "name": type.of<string>(),
-    "email": type.of<string>(),
-    "favorite_editor": type.of<string>(),
+    "name": reflect.Type.of<string>(),
+    "email": reflect.Type.of<string>(),
+    "favorite_editor": reflect.Type.of<string>(),
   }, implementations = [anchor_impl])
 }
 
-function main() -> string throws unknown {
+function main() -> string {
   let person_t = TenantPersonType()
   let app = reflect.Package.current().with_types({ "AcmePerson": person_t })
   let exported = app.get_class("root.AcmePerson") ?? throw "missing mounted class"
   if (exported.as_type() != person_t.as_type()) {
-    throw "with_types changed the mint"
+    throw "with_types changed the exported type"
   }
 
-  let pkg = reflect.Package.compile({ "tenant.baml": #"
+  let pkg = reflect.Package.compile({ "tenant.baml": `
 function Run(document: string) -> app.AcmePerson {
   app.AcmePerson {
     name: "Ada",
@@ -37,24 +37,24 @@ function Run(document: string) -> app.AcmePerson {
     favorite_editor: document,
   }
 }
-"# }, packages = { "app": app })
+` }, packages = { "app": app })
 
   let extract = pkg.get_function<(string) -> PersonAnchor>("root.Run")
     ?? throw "missing root.Run"
-  let person = extract(#"{"name":"Ada","email":"ada@example.com","favorite_editor":"vim"}"#)
-  if (type.of_value(person) != person_t.as_type()) {
-    throw "compiled wrapper did not return the mounted mint"
+  let person = extract(`{"name":"Ada","email":"ada@example.com","favorite_editor":"vim"}`)
+  if (reflect.Type.of_value(person) != person_t.as_type()) {
+    throw "compiled wrapper did not return the mounted type"
   }
   person.name + "|" + person.email
 }
 "####;
 
 const TYPE_BINDING_SOURCE: &str = r####"
-function main() -> bool throws unknown {
-  let pkg = reflect.Package.compile({ "items.baml": #"
+function main() -> bool {
+  let pkg = reflect.Package.compile({ "items.baml": `
 class Item { value string }
 function Items() -> Item[] { [Item { value: "bound" }] }
-  "# })
+  ` })
   let item_ct = pkg.get_class("root.Item") ?? throw "missing Item"
   let binding_evaluations: int = 0
   let operand = () -> {
@@ -64,23 +64,50 @@ function Items() -> Item[] { [Item { value: "bound" }] }
 
   let escaped: unknown = {
     type T = unreflect(operand());
-    if (type.of<T>() != item_ct.as_type()) {
-      throw "type.of<T>() did not preserve the bound value"
+    if (reflect.Type.of<T>() != item_ct.as_type()) {
+      throw "reflect.Type.of<T>() did not preserve the bound value"
     }
     let get_items = pkg.get_function<() -> T[]>("root.Items")
       ?? throw "missing root.Items"
     let items: T[] = get_items()
     let item: T = items[0]
-    if (type.of_value(item) != type.of<T>()) {
+    if (reflect.Type.of_value(item) != reflect.Type.of<T>()) {
       throw "typed result did not retain T"
     }
     item
   }
 
   binding_evaluations == 1
-    && type.of_value(escaped) == item_ct.as_type()
+    && reflect.Type.of_value(escaped) == item_ct.as_type()
 }
 "####;
+
+#[tokio::test]
+async fn with_types_carries_runtime_witnesses_into_consumer_compilation() {
+    let output = baml_test!(
+        r####"
+interface Labelled {
+  label string
+}
+
+function main() -> bool {
+  let witness = reflect.interface.implementation<Labelled>()
+    .field("label", class_field = "display_name")
+  let person = reflect.class.new("InternalPerson", {
+    "display_name": reflect.Type.of<string>(),
+  }, implementations = [witness])
+  let app = reflect.Package.current().with_types({ "PersonAlias": person })
+  let compiled = reflect.Package.compile({ "consumer.baml": `
+function as_label(value: app.PersonAlias) -> app.Labelled {
+  value
+}
+` }, packages = { "app": app })
+  compiled.functions().get("root.as_label") != null
+}
+"####
+    );
+    assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
+}
 
 #[tokio::test]
 async fn scenario_four_pattern_two_mounts_a_runtime_type_as_a_static_name() {
@@ -92,7 +119,7 @@ async fn scenario_four_pattern_two_mounts_a_runtime_type_as_a_static_name() {
 }
 
 #[tokio::test]
-async fn scoped_type_binding_evaluates_once_types_contracts_and_widens_on_escape() {
+async fn scoped_type_binding_evaluates_once_types_contracts_and_leaves_as_unknown() {
     let output = baml_test!(TYPE_BINDING_SOURCE);
     assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
 }
@@ -102,19 +129,19 @@ async fn type_bindings_work_in_lambdas_and_nested_shadowing_uses_distinct_slots(
     let output = baml_test!(
         r#"
 function main() -> bool {
-  let string_t = type.of<string>()
-  let int_t = type.of<int>()
-  let check = (bound: type) -> {
+  let string_t = reflect.Type.of<string>()
+  let int_t = reflect.Type.of<int>()
+  let check = (bound: reflect.Type) -> {
     type T = unreflect(bound);
-    type.of<T>() == bound
+    reflect.Type.of<T>() == bound
   }
 
   type T = unreflect(string_t);
   let inner = {
     type T = unreflect(int_t);
-    type.of<T>() == int_t
+    reflect.Type.of<T>() == int_t
   }
-  type.of<T>() == string_t && inner && check(int_t)
+  reflect.Type.of<T>() == string_t && inner && check(int_t)
 }
 "#
     );
@@ -122,50 +149,11 @@ function main() -> bool {
 }
 
 #[tokio::test]
-async fn scoped_type_argument_without_value_args_enforces_runtime_bounds() {
-    let output = baml_test!(
-        r#"
-interface SomeInterface {
-  label string
-}
-
-function needs_bound<A extends SomeInterface>() -> string {
-  "ok"
-}
-
-function main() -> bool {
-  let witness = reflect.interface.implementation<SomeInterface>().field("label")
-  let conforming = reflect.class.new("Conforming", {
-    "label": type.of<string>(),
-  }, implementations = [witness])
-  let nonconforming = reflect.class.new("Nonconforming", {
-    "other": type.of<string>(),
-  })
-
-  let rejected = {
-    type T = unreflect(nonconforming.as_type());
-    let result = needs_bound<T>() catch (e) {
-      baml.reflect.errors.CompilationError => e.diagnostics[0].code
-    }
-    result is string && result == "E0001"
-  }
-  let accepted = {
-    type T = unreflect(conforming.as_type());
-    needs_bound<T>() == "ok"
-  }
-  rejected && accepted
-}
-"#
-    );
-    assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
-}
-
-#[tokio::test]
-#[should_panic(expected = "runtime type bindings are only allowed inside")]
+#[should_panic(expected = "this runtime type must be given a name before it can be used here")]
 async fn top_level_runtime_type_binding_is_rejected() {
     let _ = baml_test!(
         r#"
-type T = unreflect(type.of<string>())
+type T = unreflect(reflect.Type.of<string>())
 function main() -> string { "unreachable" }
 "#
     );
@@ -177,7 +165,7 @@ async fn type_binding_name_is_not_visible_outside_its_block() {
     let _ = baml_test!(
         r#"
 function invalid() -> unknown {
-  let t = type.of<string>()
+  let t = reflect.Type.of<string>()
   let escaped: unknown = {
     type T = unreflect(t);
     null
@@ -198,17 +186,17 @@ async fn with_types_rejects_collisions_with_existing_exports() {
 type ExistingAlias = string
 function ExistingFunction() -> null { null }
 
-function main() -> string throws unknown {
-  let dynamic_t = reflect.class.new("Dynamic", { "value": type.of<string>() })
+function main() -> string {
+  let dynamic_t = reflect.class.new("Dynamic", { "value": reflect.Type.of<string>() })
   let alias_collision = reflect.Package.current().with_types({ "ExistingAlias": dynamic_t }) catch (e) {
-    baml.reflect.errors.CompilationError => e.diagnostics[0].code
+    reflect.errors.CompilationError => e.diagnostics[0].code
   }
   let function_collision = reflect.Package.current().with_types({ "ExistingFunction": dynamic_t }) catch (e) {
-    baml.reflect.errors.CompilationError => e.diagnostics[0].code
+    reflect.errors.CompilationError => e.diagnostics[0].code
   }
   let first_view = reflect.Package.current().with_types({ "Mounted": dynamic_t })
   let view_collision = first_view.with_types({ "Mounted": dynamic_t }) catch (e) {
-    baml.reflect.errors.CompilationError => e.diagnostics[0].code
+    reflect.errors.CompilationError => e.diagnostics[0].code
   }
   let a = if alias_collision is string { alias_collision } else { "alias collision accepted" }
   let f = if function_collision is string { function_collision } else { "function collision accepted" }
@@ -227,10 +215,10 @@ function main() -> string throws unknown {
 async fn with_types_rejects_non_identifier_keys() {
     let output = baml_test!(
         r#"
-function main() -> string throws unknown {
-  let dynamic_t = reflect.class.new("Dynamic", { "value": type.of<string>() })
+function main() -> string {
+  let dynamic_t = reflect.class.new("Dynamic", { "value": reflect.Type.of<string>() })
   let result = reflect.Package.current().with_types({ "not an identifier": dynamic_t }) catch (e) {
-    baml.reflect.errors.CompilationError => e.diagnostics[0].code
+    reflect.errors.CompilationError => e.diagnostics[0].code
   }
   if result is string { result } else { "invalid key was accepted" }
 }
@@ -239,8 +227,9 @@ function main() -> string throws unknown {
     assert_eq!(output.result, Ok(BexExternalValue::String("E0010".into())));
 }
 
-/// A scripted `ai.Client` that answers with a fixed payload, so the Agent loop
-/// runs end to end without a network or an API key.
+/// A scripted `ai.Client` that answers with a fixed payload and records the
+/// rendered prompts, so the Agent loop can be observed end to end without a
+/// network or an API key.
 const PROBE_CLIENT: &str = r##"
 client DefaultClient = openai.ResponsesClient.new(
     model = "gpt-4o-mini",
@@ -250,6 +239,7 @@ client DefaultClient = openai.ResponsesClient.new(
 
 class ProbeClient {
     reply: string,
+    requests: string[],
 
     implements ai.Client {
         function id(self) -> string {
@@ -257,13 +247,15 @@ class ProbeClient {
         }
 
         function render(self, input: ai.ModelTurnInput) -> baml.http.Request {
-            let _ = input;
-            baml.http.Request { method: "POST", url: "https://probe.invalid", headers: {}, body: "{}" }
+            let prompt = input.prompt(ai.internal.build_output_format(input.output_type)).text();
+            let _ = self.requests.push(prompt);
+            baml.http.Request { method: "POST", url: "https://probe.invalid", headers: {}, body: prompt }
         }
 
         function invoke(self, input: ai.ModelTurnInput) -> ai.ModelTurn {
-            let _ = input;
+            let _ = self.render(input);
             ai.ModelTurn {
+                calls: [],
                 content: [ai.content.Text { text: self.reply }],
                 stop_reason: ai.content.StopReason.Complete,
                 usage: null,
@@ -292,24 +284,24 @@ async fn interface_impl_methods_keep_runtime_type_definitions() {
             }
 
             implements Parser<T> {
-                function parse_it(self, text: string) -> T throws unknown {
+                function parse_it(self, text: string) -> T {
                     baml.sap.parse<T>(text)
                 }
 
                 function describe(self) -> string throws never {
-                    type.of<T>().to_string()
+                    reflect.Type.of<T>().to_string()
                 }
             }
         }
 
-        function main() -> string throws unknown {
+        function main() -> string {
             let output_type = reflect.class.new("RuntimeOutput", {
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }).as_type()
             type Out = unreflect(output_type)
 
             let holder = Holder<Out>.new()
-            let parsed = holder.parse_it(#"{"name":"Pixel"}"#)
+            let parsed = holder.parse_it(`{"name":"Pixel"}`)
             `${holder.describe()}|${reflect.class.get_field<string>(parsed, "name")}`
         }
         "##
@@ -321,7 +313,7 @@ async fn interface_impl_methods_keep_runtime_type_definitions() {
 }
 
 /// The ticket's Agent repro: `ai.Agent<Out>.run` is `implements Runner<Out>`, so
-/// it took the same hole — a payload `baml.sap.parse<unreflect(t)>` handled fine
+/// it took the same hole — a payload `baml.sap.parse<T>` handled fine
 /// came back as `ai.errors.ParseFailed` through the runner.
 #[tokio::test]
 async fn agent_run_parses_a_reflected_output_type() {
@@ -331,20 +323,20 @@ async fn agent_run_parses_a_reflected_output_type() {
 
         function DynamicOutput<T>() -> T {{
             client: DefaultClient
-            prompt: `${{ctx.output_format}}`
+            prompt: `${{ctx.output_format()}}`
         }}
 
-        function main() -> string throws unknown {{
+        function main() -> string {{
             let output_type = reflect.class.new("RuntimeOutput", {{
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }}).as_type()
             type Out = unreflect(output_type)
 
             // Control: the direct SAP call has always worked.
-            let direct = baml.sap.parse<Out>(#"{{"name":"Pixel"}}"#)
+            let direct = baml.sap.parse<Out>(`{{"name":"Pixel"}}`)
 
-            let run = ai.Agent<Out>.new(
-                client = ProbeClient {{ reply: #"{{"name":"Pixel"}}"# }},
+            let run = ai.Agent.new(
+                client = ProbeClient {{ reply: `{{"name":"Pixel"}}`, requests: [] }},
             ).run(DynamicOutput@spec<Out>())
 
             let direct_name = reflect.class.get_field<string>(direct, "name")
@@ -360,9 +352,102 @@ async fn agent_run_parses_a_reflected_output_type() {
     );
 }
 
+/// The Agent runner must hand the runtime output definition to the client
+/// renderer. Parsing alone can pass while the model receives no schema, so
+/// exercise every reflected declaration origin through `ai.Agent.run` and
+/// inspect the request built by the client.
+#[tokio::test]
+async fn agent_runner_renders_reflected_output_schemas_on_the_wire() {
+    let source = format!(
+        r####"
+        {PROBE_CLIENT}
+
+        function DynamicOutput<T>() -> T {{
+            client: DefaultClient
+            prompt: `${{ctx.output_format()}}`
+        }}
+
+        function main() -> string {{
+            let minted_class = reflect.class.new("MintedRecord", {{
+                "minted_field": reflect.Type.of<string>().meta(
+                    docstring = "Minted runner field docs",
+                ),
+            }}).as_type()
+            type MintedRecord = unreflect(minted_class)
+            let class_client = ProbeClient {{ reply: `{{"minted_field":"ok"}}`, requests: [] }}
+            let _ = ai.Agent.new(
+                client = class_client,
+            ).run(DynamicOutput@spec<MintedRecord>())
+
+            let minted_enum = reflect.enum.new(
+                "MintedChoice",
+                ["PENDING", "RUNNING"],
+            ).as_type()
+            type MintedChoice = unreflect(minted_enum)
+            let enum_client = ProbeClient {{ reply: `"RUNNING"`, requests: [] }}
+            let _ = ai.Agent.new(
+                client = enum_client,
+            ).run(DynamicOutput@spec<MintedChoice>())
+
+            let alpha = reflect.class.new("AlphaShape", {{
+                "alpha_only": reflect.Type.of<string>(),
+            }}).as_type()
+            let beta = reflect.class.new("BetaShape", {{
+                "beta_only": reflect.Type.of<int>(),
+            }}).as_type()
+            let union = reflect.union.new([alpha, beta]).as_type()
+            type MintedUnion = unreflect(union)
+            let union_client = ProbeClient {{ reply: `{{"alpha_only":"ok"}}`, requests: [] }}
+            let _ = ai.Agent.new(
+                client = union_client,
+            ).run(DynamicOutput@spec<MintedUnion>())
+
+            let package = reflect.Package.compile({{ "compiled.baml": `
+class CompiledRecord {{ compiled_field string }}
+` }})
+            let compiled = (package.get_class("root.CompiledRecord")
+                ?? throw "missing CompiledRecord").as_type()
+            type CompiledRecord = unreflect(compiled)
+            let compiled_client = ProbeClient {{ reply: `{{"compiled_field":"ok"}}`, requests: [] }}
+            let _ = ai.Agent.new(
+                client = compiled_client,
+            ).run(DynamicOutput@spec<CompiledRecord>())
+
+            let class_prompt = class_client.requests.at(0) ?? throw "missing class request"
+            let enum_prompt = enum_client.requests.at(0) ?? throw "missing enum request"
+            let union_prompt = union_client.requests.at(0) ?? throw "missing union request"
+            let compiled_prompt = compiled_client.requests.at(0) ?? throw "missing compiled request"
+            `${{class_prompt}}~~${{enum_prompt}}~~${{union_prompt}}~~${{compiled_prompt}}`
+        }}
+        "####
+    );
+    let output = baml_test!(&source);
+    let BexExternalValue::String(rendered) = output.result.expect("main must return") else {
+        panic!("main returns a string");
+    };
+    let prompts = rendered.split("~~").collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 4, "{rendered}");
+    assert!(
+        prompts[0].contains("minted_field") && prompts[0].contains("Minted runner field docs"),
+        "{}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains("PENDING") && prompts[1].contains("RUNNING"),
+        "{}",
+        prompts[1]
+    );
+    assert!(
+        prompts[2].contains("alpha_only") && prompts[2].contains("beta_only"),
+        "{}",
+        prompts[2]
+    );
+    assert!(prompts[3].contains("compiled_field"), "{}", prompts[3]);
+}
+
 /// B-1582 follow-up: definitions crossed dispatch, but *identity* did not.
 /// The resolver realizes an impl frame off the receiver's `Self`, which carries
-/// realized types only, so `type.of<T>()` in the body derived a fresh mint —
+/// realized types only, so `reflect.Type.of<T>()` in the body derived a fresh mint —
 /// structurally the right type, `==`-wrong against the value the caller minted.
 /// Every identity-keyed pattern (a registry, a stored type compared with `==`)
 /// silently missed. Covered here: an implements-block method, an inherited
@@ -372,14 +457,14 @@ async fn minted_type_identity_survives_interface_dispatch() {
     let output = baml_test!(
         r##"
         interface Probe<Out> {
-            function same(self, t: type) -> bool throws never
-            function same_from_default(self, t: type) -> bool throws never {
-                type.of<Out>() == t
+            function same(self, t: reflect.Type) -> bool throws never
+            function same_from_default(self, t: reflect.Type) -> bool throws never {
+                reflect.Type.of<Out>() == t
             }
         }
 
         interface Relay<Out> {
-            function relay(self, t: type) -> bool throws unknown
+            function relay(self, t: reflect.Type) -> bool throws unknown
         }
 
         class Holder<T> {
@@ -388,13 +473,13 @@ async fn minted_type_identity_survives_interface_dispatch() {
             }
 
             implements Probe<T> {
-                function same(self, t: type) -> bool throws never {
-                    type.of<T>() == t
+                function same(self, t: reflect.Type) -> bool throws never {
+                    reflect.Type.of<T>() == t
                 }
             }
 
             implements Relay<T> {
-                function relay(self, t: type) -> bool throws unknown {
+                function relay(self, t: reflect.Type) -> bool {
                     // Two-hop: the second interface operand is materialized
                     // inside this frame, so it has to carry the identity on.
                     Holder<T>.new().same(t)
@@ -402,9 +487,9 @@ async fn minted_type_identity_survives_interface_dispatch() {
             }
         }
 
-        function main() -> string throws unknown {
+        function main() -> string {
             let output_type = reflect.class.new("RuntimeOutput", {
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }).as_type()
             type Out = unreflect(output_type)
 
@@ -431,7 +516,7 @@ async fn interface_impl_methods_look_up_a_type_keyed_registry() {
     let output = baml_test!(
         r##"
         class Entry {
-            key: type,
+            key: reflect.Type,
             label: string,
         }
 
@@ -446,7 +531,7 @@ async fn interface_impl_methods_look_up_a_type_keyed_registry() {
 
             implements Named<T> {
                 function label(self, first: Entry, second: Entry) -> string throws never {
-                    let wanted = type.of<T>()
+                    let wanted = reflect.Type.of<T>()
                     if (first.key == wanted) {
                         first.label
                     } else if (second.key == wanted) {
@@ -458,12 +543,12 @@ async fn interface_impl_methods_look_up_a_type_keyed_registry() {
             }
         }
 
-        function main() -> string throws unknown {
+        function main() -> string {
             let first_type = reflect.class.new("Shape", {
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }).as_type()
             let second_type = reflect.class.new("Shape", {
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }).as_type()
             type First = unreflect(first_type)
             type Second = unreflect(second_type)
@@ -493,7 +578,7 @@ async fn dispatch_identity_separates_distinct_mints_and_leaves_static_generics_a
     let output = baml_test!(
         r##"
         interface Probe<Out> {
-            function same(self, t: type) -> bool throws never
+            function same(self, t: reflect.Type) -> bool throws never
         }
 
         class Holder<T> {
@@ -502,18 +587,18 @@ async fn dispatch_identity_separates_distinct_mints_and_leaves_static_generics_a
             }
 
             implements Probe<T> {
-                function same(self, t: type) -> bool throws never {
-                    type.of<T>() == t
+                function same(self, t: reflect.Type) -> bool throws never {
+                    reflect.Type.of<T>() == t
                 }
             }
         }
 
-        function main() -> string throws unknown {
+        function main() -> string {
             let mine = reflect.class.new("Shape", {
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }).as_type()
             let other = reflect.class.new("Shape", {
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }).as_type()
             type Mine = unreflect(mine)
 
@@ -522,8 +607,8 @@ async fn dispatch_identity_separates_distinct_mints_and_leaves_static_generics_a
             let foreign_mint = holder.same(other)
 
             let static_holder = Holder<string>.new()
-            let static_match = static_holder.same(type.of<string>())
-            let static_miss = static_holder.same(type.of<int>())
+            let static_match = static_holder.same(reflect.Type.of<string>())
+            let static_miss = static_holder.same(reflect.Type.of<int>())
             `${own_mint}|${foreign_mint}|${static_match}|${static_miss}`
         }
         "##
@@ -534,23 +619,21 @@ async fn dispatch_identity_separates_distinct_mints_and_leaves_static_generics_a
     );
 }
 
-/// A runtime *package*'s declarations do NOT keep identity across dispatch, and
-/// that is deliberate. Recovery reads a definition back out of the interface
-/// operand's overlay, which is keyed by qualified name — and a compiled
-/// package's `Item` is plain `user.Item`, exactly like a static `Item` and like
-/// every other package's `Item`. Answering from a name that several definitions
-/// can spell would hand back a *wrong* mint (see the two regressions below), so
-/// the recovery declines and the body re-derives a static value. Definitions
-/// still travel (#4501), which is what `name()` pins: the impl body can still
-/// read the type, it just does not hold the caller's identity token for it.
+/// A runtime *package*'s declarations keep their identity across dispatch.
+/// Under name-keyed recovery this was deliberately FALSE — several definitions
+/// can spell `user.Item`, so answering from the name risked a wrong identity
+/// and recovery declined. A frame slot now carries the declaration's own head,
+/// so `reflect.Type.of<T>()` in the impl body *is* the caller's type: there is no
+/// separate identity token to lose, and nothing name-shaped to answer from.
+/// `name()` still pins that the definition travels too.
 #[tokio::test]
-async fn runtime_package_declarations_keep_definitions_but_not_identity() {
+async fn runtime_package_declarations_keep_definitions_and_identity() {
     let output = baml_test!(
         r##"
         interface Probe<Out> {
-            function same(self, t: type) -> bool throws never
+            function same(self, t: reflect.Type) -> bool throws never
             function name(self) -> string throws never {
-                type.of<Out>().to_string()
+                reflect.Type.of<Out>().to_string()
             }
         }
 
@@ -560,16 +643,16 @@ async fn runtime_package_declarations_keep_definitions_but_not_identity() {
             }
 
             implements Probe<T> {
-                function same(self, t: type) -> bool throws never {
-                    type.of<T>() == t
+                function same(self, t: reflect.Type) -> bool throws never {
+                    reflect.Type.of<T>() == t
                 }
             }
         }
 
-        function main() -> string throws unknown {
-            let pkg = reflect.Package.compile({ "items.baml": #"
+        function main() -> string {
+            let pkg = reflect.Package.compile({ "items.baml": `
 class Item { value string }
-              "# })
+              ` })
             let item_type = (pkg.get_class("root.Item") ?? throw "missing Item").as_type()
             type Item = unreflect(item_type)
 
@@ -580,7 +663,7 @@ class Item { value string }
     );
     assert_eq!(
         output.result,
-        Ok(BexExternalValue::String("false|Item".into()))
+        Ok(BexExternalValue::String("true|Item".into()))
     );
 }
 
@@ -589,8 +672,9 @@ class Item { value string }
 /// overlay onto anything materialized in a frame that touched a runtime type,
 /// so binding a compiled package's `Item` puts `user.Item` in this frame's
 /// overlay — and the static `Holder<Item>` dispatch below then sees it. Reading
-/// the overlay by plain name reported `type.of<T>() != type.of<Item>()` and
-/// `== ` the *package's* mint, which no `$dyn`-named type can reproduce.
+/// the overlay by plain name reported `reflect.Type.of<T>() != reflect.Type.of<Item>()` and
+/// `==` the *package's* declaration, which no runtime-created type can
+/// reproduce.
 #[tokio::test]
 async fn static_class_slots_are_not_answered_from_a_same_named_runtime_definition() {
     let output = baml_test!(
@@ -600,7 +684,7 @@ async fn static_class_slots_are_not_answered_from_a_same_named_runtime_definitio
         }
 
         interface Probe<Out> {
-            function same(self, t: type) -> bool throws never
+            function same(self, t: reflect.Type) -> bool throws never
         }
 
         class Holder<T> {
@@ -609,16 +693,16 @@ async fn static_class_slots_are_not_answered_from_a_same_named_runtime_definitio
             }
 
             implements Probe<T> {
-                function same(self, t: type) -> bool throws never {
-                    type.of<T>() == t
+                function same(self, t: reflect.Type) -> bool throws never {
+                    reflect.Type.of<T>() == t
                 }
             }
         }
 
-        function main() -> string throws unknown {
-            let pkg = reflect.Package.compile({ "items.baml": #"
+        function main() -> string {
+            let pkg = reflect.Package.compile({ "items.baml": `
 class Item { value string }
-              "# })
+              ` })
             let runtime_item = (pkg.get_class("root.Item") ?? throw "missing Item").as_type()
             // Binding it merges `user.Item` into this frame's overlay, which is
             // what every type materialized here from now on carries.
@@ -626,7 +710,7 @@ class Item { value string }
             let _shadow_holder = Holder<Shadow>.new()
 
             let holder = Holder<Item>.new()
-            `${holder.same(type.of<Item>())}|${holder.same(runtime_item)}`
+            `${holder.same(reflect.Type.of<Item>())}|${holder.same(runtime_item)}`
         }
         "##
     );
@@ -636,17 +720,17 @@ class Item { value string }
     );
 }
 
-/// Two compiled packages that each declare `Item` produce two distinct mints
-/// under one qualified name. An overlay keeps the first pointer it sees per
-/// name, so a by-name recovery answered `Holder<B>` with A's mint — `==` true
-/// against a type it is not, and false against the one it is. Declining is the
-/// only honest answer available from a name alone.
+/// Two compiled packages that each declare `Item` keep two identities. Each
+/// grafted declaration is reminted with its own dynamic tag and the frame slot
+/// carries its head, so nothing name-shaped exists to conflate them — the
+/// shape that could only decline while both were spelled `user.Item` and a
+/// name-keyed overlay kept the first pointer it saw per name.
 #[tokio::test]
-async fn same_named_declarations_from_two_packages_do_not_cross_match() {
+async fn same_named_declarations_from_two_packages_keep_separate_identities() {
     let output = baml_test!(
         r##"
         interface Probe<Out> {
-            function same(self, t: type) -> bool throws never
+            function same(self, t: reflect.Type) -> bool throws never
         }
 
         class Holder<T> {
@@ -655,19 +739,19 @@ async fn same_named_declarations_from_two_packages_do_not_cross_match() {
             }
 
             implements Probe<T> {
-                function same(self, t: type) -> bool throws never {
-                    type.of<T>() == t
+                function same(self, t: reflect.Type) -> bool throws never {
+                    reflect.Type.of<T>() == t
                 }
             }
         }
 
-        function main() -> string throws unknown {
-            let first = reflect.Package.compile({ "a.baml": #"
+        function main() -> string {
+            let first = reflect.Package.compile({ "a.baml": `
 class Item { value string }
-              "# })
-            let second = reflect.Package.compile({ "b.baml": #"
+              ` })
+            let second = reflect.Package.compile({ "b.baml": `
 class Item { value string }
-              "# })
+              ` })
             let first_item = (first.get_class("root.Item") ?? throw "missing A").as_type()
             let second_item = (second.get_class("root.Item") ?? throw "missing B").as_type()
             type First = unreflect(first_item)
@@ -675,15 +759,16 @@ class Item { value string }
 
             let _first_holder = Holder<First>.new()
             let holder = Holder<Second>.new()
-            // Neither is claimed. The failure this guards is the SECOND value
-            // being `true` — answering with a foreign package's identity.
+            // The holder's own declaration answers true — the slot carries its
+            // head. The failure this guards is the SECOND value being `true`:
+            // answering with a same-named foreign package's identity.
             `${holder.same(second_item)}|${holder.same(first_item)}`
         }
         "##
     );
     assert_eq!(
         output.result,
-        Ok(BexExternalValue::String("false|false".into()))
+        Ok(BexExternalValue::String("true|false".into()))
     );
 }
 
@@ -696,7 +781,7 @@ async fn dispatch_identity_covers_owner_and_method_slots_together() {
     let output = baml_test!(
         r##"
         interface Probe<Out> {
-            function pair<M>(self, own: type, method: type) -> string throws never
+            function pair<M>(self, own: reflect.Type, method: reflect.Type) -> string throws never
         }
 
         class Holder<T> {
@@ -705,18 +790,18 @@ async fn dispatch_identity_covers_owner_and_method_slots_together() {
             }
 
             implements Probe<T> {
-                function pair<M>(self, own: type, method: type) -> string throws never {
-                    `${type.of<T>() == own}|${type.of<M>() == method}|${type.of<T>() == method}`
+                function pair<M>(self, own: reflect.Type, method: reflect.Type) -> string throws never {
+                    `${reflect.Type.of<T>() == own}|${reflect.Type.of<M>() == method}|${reflect.Type.of<T>() == method}`
                 }
             }
         }
 
-        function main() -> string throws unknown {
+        function main() -> string {
             let owner_type = reflect.class.new("Owner", {
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }).as_type()
             let method_type = reflect.class.new("Method", {
-                "name": type.of<string>(),
+                "name": reflect.Type.of<string>(),
             }).as_type()
             type Owner = unreflect(owner_type)
             type Method = unreflect(method_type)
@@ -738,7 +823,7 @@ async fn dispatch_identity_covers_a_runtime_enum_slot() {
     let output = baml_test!(
         r##"
         interface Probe<Out> {
-            function same(self, t: type) -> bool throws never
+            function same(self, t: reflect.Type) -> bool throws never
         }
 
         class Holder<T> {
@@ -747,13 +832,13 @@ async fn dispatch_identity_covers_a_runtime_enum_slot() {
             }
 
             implements Probe<T> {
-                function same(self, t: type) -> bool throws never {
-                    type.of<T>() == t
+                function same(self, t: reflect.Type) -> bool throws never {
+                    reflect.Type.of<T>() == t
                 }
             }
         }
 
-        function main() -> string throws unknown {
+        function main() -> string {
             let choice = reflect.enum.new("Choice", ["FIRST", "SECOND"]).as_type()
             let other = reflect.enum.new("Choice", ["FIRST", "SECOND"]).as_type()
             type Choice = unreflect(choice)
@@ -766,5 +851,382 @@ async fn dispatch_identity_covers_a_runtime_enum_slot() {
     assert_eq!(
         output.result,
         Ok(BexExternalValue::String("true|false".into()))
+    );
+}
+
+/// A runtime declaration's identity is its tag, never a spelling — so no
+/// internal identity token exists to leak, and every surface that renders a
+/// type name must show the name the source wrote. Pinned here at once:
+/// `to_string`, `to_baml`, the LLM schema `ctx.output_format()` builds, and a
+/// compiler diagnostic.
+#[tokio::test]
+async fn a_package_declarations_identity_never_reaches_rendered_output() {
+    let output = baml_test!(
+        r##"
+        client TestClient = openai.ResponsesClient.new(
+            model = "gpt-4o-mini",
+            api_key = "test-key",
+            base_url = "http://localhost:1234",
+        );
+
+        function Render<T>() -> T {
+            client: TestClient
+            prompt: `${ctx.output_format()}`
+        }
+
+        function main() -> string {
+            // `next` makes `Item` recursive, which forces the LLM schema to
+            // hoist it under a *name* rather than inline its shape.
+            let pkg = reflect.Package.compile({ "items.baml": `
+class Item { value string, next Item? }
+function Items() -> Item[] { [Item { value: "bound", next: null }] }
+              ` })
+            let item_type = (pkg.get_class("root.Item") ?? throw "missing Item").as_type()
+            type Item = unreflect(item_type)
+
+            // A diagnostic that has to name the type it rejected.
+            let contract = pkg.get_function<() -> Item>("root.Items") catch (e) {
+                reflect.errors.CompilationError => e.diagnostics[0].message,
+                _ => "wrong error",
+            }
+            let diagnostic = if contract is string { contract } else { "no diagnostic" }
+
+            // `~~` and not `|`: `to_baml()` and the LLM schema both spell a
+            // union with `|`, so a `|` join could split *inside* a surface and
+            // leave the assertions below silently comparing the wrong text.
+            let schema = Render@render_prompt<Item[]>()
+            `${item_type.to_string()}~~${item_type.to_baml()}~~${schema}~~${diagnostic}`
+        }
+        "##
+    );
+    let BexExternalValue::String(rendered) = output.result.expect("main must return") else {
+        panic!("main returns a string");
+    };
+    assert!(
+        !rendered.contains("$dyn"),
+        "a runtime mint leaked into rendered output: {rendered}"
+    );
+    let mut parts = rendered.splitn(4, "~~");
+    assert_eq!(parts.next(), Some("Item"));
+    assert_eq!(
+        parts.next(),
+        Some("class Item {\n  value string\n  next Item?\n}")
+    );
+    let schema = parts.next().expect("schema");
+    assert!(
+        schema.contains("Item") && schema.contains("value"),
+        "the LLM schema must describe the package class by its source name: {schema}"
+    );
+    let diagnostic = parts.next().expect("diagnostic");
+    assert!(
+        diagnostic.contains("Item"),
+        "the diagnostic must name the package class by its source name: {diagnostic}"
+    );
+}
+
+#[tokio::test]
+async fn docstrings_render_for_static_minted_and_mounted_types() {
+    let output = baml_test!(
+        r####"
+/// Static class docs
+class StaticDoc {
+  /// Static field docs
+  value string @description("Static field description")
+}
+
+enum StaticState {
+  /// Static enum value docs
+  READY
+}
+
+interface DocAnchor {
+  value string
+}
+
+function main() -> string {
+  let anchor = reflect.interface.implementation<DocAnchor>().field("value")
+  let minted = reflect.class.new("Minted", {
+    "value": reflect.Type.of<string>().meta(
+      description = "Minted field description",
+      docstring = "Minted field docs",
+    ),
+  }, implementations = [anchor])
+  let app = reflect.Package.current().with_types({ "Minted": minted })
+  let compiled = reflect.Package.compile({ "wrapper.baml": `
+function make_mounted() -> app.Minted {
+  app.Minted { value: "ok" }
+}
+` }, packages = { "app": app })
+  let make_mounted = compiled.get_function<() -> DocAnchor>("root.make_mounted")
+    ?? throw "missing make_mounted"
+  let mounted = reflect.Type.of_value(make_mounted())
+
+  `${reflect.Type.of<StaticDoc>().to_baml()}~~${reflect.Type.of<StaticState>().to_baml()}~~${ai.wire.render_output_format(reflect.Type.of<StaticDoc>())}~~${ai.wire.render_output_format(reflect.Type.of<StaticState>())}~~${minted.as_type().to_baml()}~~${ai.wire.render_output_format(minted.as_type())}~~${mounted.to_baml()}~~${ai.wire.render_output_format(mounted)}`
+}
+"####
+    );
+    let BexExternalValue::String(rendered) = output.result.expect("main must return") else {
+        panic!("main returns a string");
+    };
+    let parts = rendered.splitn(8, "~~").collect::<Vec<_>>();
+    assert_eq!(parts.len(), 8, "{rendered}");
+
+    assert!(
+        parts[0].starts_with("/// Static class docs\nclass StaticDoc"),
+        "{}",
+        parts[0]
+    );
+    assert!(
+        parts[0].contains("  /// Static field docs\n  value string"),
+        "{}",
+        parts[0]
+    );
+    assert!(
+        parts[1].contains("  /// Static enum value docs\n  READY"),
+        "{}",
+        parts[1]
+    );
+
+    let static_description = parts[2]
+        .find("/// Static field description")
+        .expect("static description renders");
+    let static_docstring = parts[2]
+        .find("/// Static field docs")
+        .expect("static docstring renders");
+    assert!(static_description < static_docstring, "{}", parts[2]);
+    assert!(parts[2].contains("/// Static class docs"), "{}", parts[2]);
+    assert!(
+        parts[3].contains("READY: Static enum value docs"),
+        "{}",
+        parts[3]
+    );
+
+    assert!(parts[4].contains("  /// Minted field docs\n  value string"));
+    let minted_description = parts[5]
+        .find("/// Minted field description")
+        .expect("minted description renders");
+    let minted_docstring = parts[5]
+        .find("/// Minted field docs")
+        .expect("minted docstring renders");
+    assert!(minted_description < minted_docstring, "{}", parts[5]);
+
+    assert!(parts[6].contains("/// Minted field docs"), "{}", parts[6]);
+    assert!(parts[7].contains("/// Minted field docs"), "{}", parts[7]);
+}
+
+/// Binds `item_type` to a class named `Item`, compiled into a runtime package.
+/// Both origins below create runtime declarations, so both must render them
+/// the same way. Two fields, so a coercion failure is reported against the
+/// class rather than being implied onto a lone field.
+const ORIGIN_COMPILED_PACKAGE: &str = r##"
+            let pkg = reflect.Package.compile({ "items.baml": `
+class Item { value string, count int }
+              ` })
+            let item_type = (pkg.get_class("root.Item") ?? throw "missing Item").as_type()
+"##;
+
+/// The same `Item`, built by `reflect.class.new`.
+const ORIGIN_CLASS_NEW: &str = r##"
+            let item_type = reflect.class.new("Item", {
+                "value": reflect.Type.of<string>(),
+                "count": reflect.Type.of<int>(),
+            }).as_type()
+"##;
+
+/// The two error surfaces that name a class in prose: schema-aligned parsing
+/// (what an LLM's output is coerced through) and `baml.json` decoding.
+fn error_surfaces_source(origin: &str) -> String {
+    format!(
+        r##"
+        function main() -> string {{
+            {origin}
+            type Item = unreflect(item_type)
+
+            let sap = baml.sap.parse<Item>("null") catch (e) {{
+                baml.errors.ParseError => e.message,
+                _ => "not a ParseError",
+            }}
+            let sap_message = if sap is string {{ sap }} else {{ "sap accepted a null" }}
+
+            let decoded = baml.json.from_string<Item>("[1, 2]") catch (e) {{
+                baml.json.DecodeError => e.message,
+                _ => "not a DecodeError",
+            }}
+            let decode_message = if decoded is string {{ decoded }} else {{ "decode accepted a list" }}
+
+            `${{sap_message}}~${{decode_message}}`
+        }}
+        "##
+    )
+}
+
+/// Every surface that renders a runtime class must show the name its source
+/// wrote, never an internal identity.
+///
+/// Schema-aligned parsing is the first of them. A runtime-*compiled* `Item`
+/// renders package-qualified `user.Item` — exactly what a static `Item` prints
+/// in the same error — while an anonymous `reflect.class.new` one renders the
+/// bare `Item`: it has no package, so its display name is its only spelling.
+#[tokio::test]
+async fn a_coercion_error_names_a_runtime_class_as_its_source_spelled_it() {
+    for (origin, expected) in [
+        (ORIGIN_COMPILED_PACKAGE, "Expected user.Item"),
+        (ORIGIN_CLASS_NEW, "Expected Item"),
+    ] {
+        let source = error_surfaces_source(origin);
+        let output = baml_test!(&source);
+        let BexExternalValue::String(rendered) = output.result.expect("main must return") else {
+            panic!("main returns a string");
+        };
+        let (sap_message, _) = rendered.split_once('~').expect("both messages");
+        assert!(
+            sap_message.contains(expected),
+            "a coercion error must name the class as its source spelled it \
+             (want `{expected}`): {sap_message}"
+        );
+    }
+}
+
+/// `baml.json` decoding is the second. Two behaviors pinned at once: the
+/// decoder resolves a runtime class through its head (a name lookup could not
+/// see it at all), and its errors name the class as the source spelled it.
+#[tokio::test]
+async fn a_decode_error_names_a_runtime_class_as_its_source_spelled_it() {
+    for origin in [ORIGIN_COMPILED_PACKAGE, ORIGIN_CLASS_NEW] {
+        let source = error_surfaces_source(origin);
+        let output = baml_test!(&source);
+        let BexExternalValue::String(rendered) = output.result.expect("main must return") else {
+            panic!("main returns a string");
+        };
+        let (_, decode_message) = rendered.split_once('~').expect("both messages");
+        assert!(
+            !decode_message.contains("$dyn"),
+            "a runtime mint leaked into a decode error: {decode_message}"
+        );
+        assert!(
+            decode_message.contains("expected JSON object for class `Item`"),
+            "a decode error must name the class as its source spelled it: {decode_message}"
+        );
+    }
+}
+
+/// The fourth surface: a diagnostic from a *runtime* compile that has to name
+/// a runtime declaration. The way one reaches a compile diagnostic is a
+/// mounted type: `with_types` publishes an anonymous declaration under a mount
+/// name, and a package compiled against it can then be wrong about it. The
+/// message must name it the way the mount did — alias-qualified `app.Item`,
+/// exactly as the failing source wrote it.
+#[tokio::test]
+async fn a_runtime_compile_diagnostic_names_a_mounted_runtime_class() {
+    let output = baml_test!(
+        r##"
+        function main() -> string {
+            let item_type = reflect.class.new("Item", {
+                "value": reflect.Type.of<string>(),
+            }).as_type()
+            let app = reflect.Package.current().with_types({ "Item": item_type })
+            let compiled = reflect.Package.compile({ "wrong.baml": `
+function Run() -> int { app.Item { value: "x" } }
+              ` }, packages = { "app": app }) catch (e) {
+                reflect.errors.CompilationError => e.diagnostics[0].message,
+                _ => "not a CompilationError",
+            }
+            if compiled is string { compiled } else { "the wrong program compiled" }
+        }
+        "##
+    );
+    let BexExternalValue::String(diagnostic) = output.result.expect("main must return") else {
+        panic!("main returns a string");
+    };
+    assert!(
+        !diagnostic.contains("$dyn"),
+        "a runtime mint leaked into a compile diagnostic: {diagnostic}"
+    );
+    assert_eq!(
+        diagnostic.as_str(),
+        "mismatched types: expected `int`, found `app.Item`"
+    );
+}
+
+/// Identity by name is what a runtime type test reads, so two compiled packages
+/// that each declare `Item` used to answer for each other: a value made by the
+/// first package matched `is` against the second package's class. Nothing
+/// reported an error — the branch simply ran on a value it was never given.
+#[tokio::test]
+async fn a_runtime_type_test_does_not_match_another_packages_same_named_class() {
+    let output = baml_test!(
+        r##"
+        function main() -> string {
+            let first = reflect.Package.compile({ "a.baml": `
+class Item { value string }
+function Make() -> Item { Item { value: "a" } }
+              ` })
+            let second = reflect.Package.compile({ "b.baml": `
+class Item { value string }
+              ` })
+            type First = unreflect((first.get_class("root.Item") ?? throw "missing A").as_type())
+            type Second = unreflect((second.get_class("root.Item") ?? throw "missing B").as_type())
+
+            let make = first.get_function<() -> First>("root.Make") ?? throw "missing root.Make"
+            let value: unknown = make()
+            let own = if value is First { "yes" } else { "no" }
+            let foreign = if value is Second { "yes" } else { "no" }
+            `${own}|${foreign}`
+        }
+        "##
+    );
+    assert_eq!(output.result, Ok(BexExternalValue::String("yes|no".into())));
+}
+
+/// The LLM schema `ctx.output_format()` builds is assembled from a definition
+/// overlay keyed by qualified name, so the same collision showed up there as a
+/// prompt describing the *first* package's fields under the second package's
+/// class. The model was then asked for a shape the caller never declared.
+#[tokio::test]
+async fn an_output_format_schema_describes_each_packages_own_class() {
+    let output = baml_test!(
+        r##"
+        client TestClient = openai.ResponsesClient.new(
+            model = "gpt-4o-mini",
+            api_key = "test-key",
+            base_url = "http://localhost:1234",
+        );
+
+        function Render<T>() -> T {
+            client: TestClient
+            prompt: `${ctx.output_format()}`
+        }
+
+        function main() -> string {
+            // `next` makes each `Item` recursive, which forces the schema to
+            // hoist it under a name rather than inline its shape.
+            let first = reflect.Package.compile({ "a.baml": `
+class Item { alpha string, next Item? }
+              ` })
+            let second = reflect.Package.compile({ "b.baml": `
+class Item { beta int, next Item? }
+              ` })
+            type First = unreflect((first.get_class("root.Item") ?? throw "missing A").as_type())
+            type Second = unreflect((second.get_class("root.Item") ?? throw "missing B").as_type())
+
+            `${Render@render_prompt<First[]>()}~${Render@render_prompt<Second[]>()}`
+        }
+        "##
+    );
+    let BexExternalValue::String(rendered) = output.result.expect("main must return") else {
+        panic!("main returns a string");
+    };
+    let (first, second) = rendered.split_once('~').expect("both schemas");
+    assert!(
+        !rendered.contains("$dyn"),
+        "a runtime mint leaked into an LLM schema: {rendered}"
+    );
+    assert!(
+        first.contains("alpha") && !first.contains("beta"),
+        "the first package's schema must describe its own fields: {first}"
+    );
+    assert!(
+        second.contains("beta") && !second.contains("alpha"),
+        "the second package's schema must describe its own fields: {second}"
     );
 }

@@ -137,8 +137,8 @@ nonisolated struct BamlBridge_Cffi_V1_InboundValue: Sendable {
     set {value = .bigintValue(newValue)}
   }
 
-  /// A reflected BAML type passed as a value (mirrors a `type`-typed BAML
-  /// value, e.g. the result of `reflect.type_of<T>()`). Accepted as an
+  /// A reflected BAML type passed as a value (mirrors a `reflect.Type` BAML
+  /// value, e.g. the result of `reflect.Type.of<T>()`). Accepted as an
   /// argument value so the host can pass types as data.
   var tyValue: BamlBridge_Cffi_V1_BamlTy {
     get {
@@ -159,6 +159,25 @@ nonisolated struct BamlBridge_Cffi_V1_InboundValue: Sendable {
     set {value = .tyDefValue(newValue)}
   }
 
+  /// Rust-backed values cross as portable data, never as capability handles.
+  /// These message shapes are shared with the outbound side so host-created
+  /// and engine-created values have one canonical representation.
+  var mediaValue: BamlBridge_Cffi_V1_BamlValueMedia {
+    get {
+      if case .mediaValue(let v)? = value {return v}
+      return BamlBridge_Cffi_V1_BamlValueMedia()
+    }
+    set {value = .mediaValue(newValue)}
+  }
+
+  var promptAstValue: BamlBridge_Cffi_V1_BamlValuePromptAst {
+    get {
+      if case .promptAstValue(let v)? = value {return v}
+      return BamlBridge_Cffi_V1_BamlValuePromptAst()
+    }
+    set {value = .promptAstValue(newValue)}
+  }
+
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
   nonisolated enum OneOf_Value: Equatable, Sendable {
@@ -173,14 +192,19 @@ nonisolated struct BamlBridge_Cffi_V1_InboundValue: Sendable {
     case handle(BamlBridge_Cffi_V1_BamlHandle)
     case uint8ArrayValue(Data)
     case bigintValue(String)
-    /// A reflected BAML type passed as a value (mirrors a `type`-typed BAML
-    /// value, e.g. the result of `reflect.type_of<T>()`). Accepted as an
+    /// A reflected BAML type passed as a value (mirrors a `reflect.Type` BAML
+    /// value, e.g. the result of `reflect.Type.of<T>()`). Accepted as an
     /// argument value so the host can pass types as data.
     case tyValue(BamlBridge_Cffi_V1_BamlTy)
     /// Definition-carrying reflected type. New hosts use this for values that
     /// must retain runtime-created class/enum schemas; tag 13 remains for
     /// rollout compatibility with structural/static type senders.
     case tyDefValue(BamlBridge_Cffi_V1_BamlTyDef)
+    /// Rust-backed values cross as portable data, never as capability handles.
+    /// These message shapes are shared with the outbound side so host-created
+    /// and engine-created values have one canonical representation.
+    case mediaValue(BamlBridge_Cffi_V1_BamlValueMedia)
+    case promptAstValue(BamlBridge_Cffi_V1_BamlValuePromptAst)
 
   }
 
@@ -424,7 +448,7 @@ fileprivate nonisolated let _protobuf_package = "baml_bridge.cffi.v1"
 
 nonisolated extension BamlBridge_Cffi_V1_InboundValue: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   static let protoMessageName: String = _protobuf_package + ".InboundValue"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}value_type\0\u{3}string_value\0\u{3}int_value\0\u{3}float_value\0\u{3}bool_value\0\u{3}list_value\0\u{3}map_value\0\u{3}class_value\0\u{3}enum_value\0\u{1}handle\0\u{3}uint8array_value\0\u{3}bigint_value\0\u{3}ty_value\0\u{3}ty_def_value\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}value_type\0\u{3}string_value\0\u{3}int_value\0\u{3}float_value\0\u{3}bool_value\0\u{3}list_value\0\u{3}map_value\0\u{3}class_value\0\u{3}enum_value\0\u{1}handle\0\u{3}uint8array_value\0\u{3}bigint_value\0\u{3}ty_value\0\u{3}ty_def_value\0\u{3}media_value\0\u{3}prompt_ast_value\0")
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -572,6 +596,32 @@ nonisolated extension BamlBridge_Cffi_V1_InboundValue: SwiftProtobuf.Message, Sw
           self.value = .tyDefValue(v)
         }
       }()
+      case 15: try {
+        var v: BamlBridge_Cffi_V1_BamlValueMedia?
+        var hadOneofValue = false
+        if let current = self.value {
+          hadOneofValue = true
+          if case .mediaValue(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.value = .mediaValue(v)
+        }
+      }()
+      case 16: try {
+        var v: BamlBridge_Cffi_V1_BamlValuePromptAst?
+        var hadOneofValue = false
+        if let current = self.value {
+          hadOneofValue = true
+          if case .promptAstValue(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.value = .promptAstValue(v)
+        }
+      }()
       default: break
       }
     }
@@ -637,6 +687,14 @@ nonisolated extension BamlBridge_Cffi_V1_InboundValue: SwiftProtobuf.Message, Sw
     case .tyDefValue?: try {
       guard case .tyDefValue(let v)? = self.value else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 14)
+    }()
+    case .mediaValue?: try {
+      guard case .mediaValue(let v)? = self.value else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 15)
+    }()
+    case .promptAstValue?: try {
+      guard case .promptAstValue(let v)? = self.value else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 16)
     }()
     case nil: break
     }

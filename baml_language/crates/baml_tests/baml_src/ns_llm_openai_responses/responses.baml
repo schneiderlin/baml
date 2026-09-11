@@ -97,7 +97,7 @@ function _oai_batch(payloads: string[]) -> string {
     baml.json.stringify(baml.json.to_json(events))
 }
 
-function _oai_first_text(events: ai.stream.StreamEvent[]) -> string {
+function _oai_first_text(events: ai.stream.Event[]) -> string {
     for (let e in events) {
         if let delta: ai.stream.TextDelta = e {
             return delta.text;
@@ -121,7 +121,7 @@ function _oai_error_name(error: unknown) -> string {
 // The rendered request body, as a plain call so a `catch_all` at the call site
 // is unambiguous.
 function _oai_render_body(cl: openai.ResponsesClient, input: ai.ModelTurnInput) -> string {
-    let req = openai.internal.openai_render(cl, input);
+    let req = openai.internal.render(cl, input);
     req.body
 }
 
@@ -159,7 +159,7 @@ function oai_request_shape() -> string {
                 verbosity = "low",
                 parallel_tool_calls = true,
             );
-            let result = ai.Agent<string>.new(client = cl).run(OaiEcho@spec("Say pong."));
+            let result = ai.Agent.new(client = cl).run(OaiEcho@spec("Say pong."));
             let sent = mock.last_request();
             [
                 result.value,
@@ -239,7 +239,7 @@ function oai_passthrough() -> string {
                 headers = { "X-Trace": "abc", "authorization": "Bearer overridden" },
                 query_params = { "api-version": "2024 05" },
             );
-            let result = ai.Agent<string>.new(client = cl).run(OaiEcho@spec("Say pong."));
+            let result = ai.Agent.new(client = cl).run(OaiEcho@spec("Say pong."));
             let sent = mock.last_request();
             [
                 result.value,
@@ -295,7 +295,7 @@ function oai_tools_and_journal() -> string {
     let args: map<string, unknown> = { };
     let journal = ai.Journal {
         log: [
-            ai.events.UserMessage { content: "earlier question" },
+            ai.events.UserMessage.new("earlier question"),
             ai.events.AssistantMessage {
                 content: [
                     ai.content.Text { text: "on it" },
@@ -306,7 +306,7 @@ function oai_tools_and_journal() -> string {
         ],
     };
     let cl = openai.ResponsesClient.new(model = "gpt-4o-mini", api_key = "test-key");
-    let req = openai.internal.openai_render(cl, _oai_input(spec, journal, toolbox));
+    let req = openai.internal.render(cl, _oai_input(spec, journal, toolbox));
     req.body
 }
 
@@ -339,7 +339,7 @@ function oai_media_input() -> string {
     );
     let cl = openai.ResponsesClient.new(model = "gpt-4o-mini", api_key = "test-key");
     let empty = ai.tools.Toolbox.new([]);
-    let req = openai.internal.openai_render(cl, _oai_input(spec, ai.Journal.new(spec), empty));
+    let req = openai.internal.render(cl, _oai_input(spec, ai.Journal.new(spec), empty));
     req.body
 }
 
@@ -367,7 +367,7 @@ test "oai_system_image_input" {
     let got = oai_system_image_input();
     assert.contains(
         got,
-        `{"role":"system","content":[{"type":"input_text","text":"\\nLook: "},{"type":"input_image","image_url":"data:image/png;base64,aW1n","detail":"auto"}]}`,
+        `{"role":"system","content":[{"type":"input_text","text":"Look:"},{"type":"input_image","image_url":"data:image/png;base64,aW1n","detail":"auto"}]}`,
     )
 }
 
@@ -383,7 +383,7 @@ function oai_image_generation() -> string {
                 api_key = "test-key",
                 base_url = mock.base_url(),
             );
-            let result = ai.Agent<image>.new(client = cl).run(OaiPicture@spec("a red apple"));
+            let result = ai.Agent.new(client = cl).run(OaiPicture@spec("a red apple"));
             let sent = mock.last_request();
             [
                 result.value.base64(),
@@ -430,7 +430,7 @@ function oai_tool_schema_keeps_nulls() -> string {
         ],
     );
     let cl = openai.ResponsesClient.new(model = "gpt-4o-mini", api_key = "test-key");
-    let req = openai.internal.openai_render(cl, _oai_input(spec, ai.Journal.new(spec), toolbox));
+    let req = openai.internal.render(cl, _oai_input(spec, ai.Journal.new(spec), toolbox));
     req.body
 }
 
@@ -451,7 +451,7 @@ function oai_message_metadata_on_content_part() -> string {
     let spec = OaiMetaEcho@spec("Say pong.");
     let cl = openai.ResponsesClient.new(model = "gpt-4o-mini", api_key = "test-key");
     let empty = ai.tools.Toolbox.new([]);
-    let req = openai.internal.openai_render(cl, _oai_input(spec, ai.Journal.new(spec), empty));
+    let req = openai.internal.render(cl, _oai_input(spec, ai.Journal.new(spec), empty));
     let body = baml.json.parse(req.body);
     [
         `system_role=${baml.json.path_or<string>(body, ".input[0].role", "-")}`,
@@ -479,7 +479,7 @@ function oai_usage_details() -> string {
                 api_key = "test-key",
                 base_url = mock.base_url(),
             );
-            let result = ai.Agent<string>.new(client = cl).run(OaiEcho@spec("Say pong."));
+            let result = ai.Agent.new(client = cl).run(OaiEcho@spec("Say pong."));
             [
                 result.usage.input_tokens.to_string(),
                 result.usage.output_tokens.to_string(),
@@ -505,7 +505,7 @@ function oai_sparse_usage() -> string {
                 api_key = "test-key",
                 base_url = mock.base_url(),
             );
-            let result = ai.Agent<string>.new(client = cl).run(OaiEcho@spec("Say pong."));
+            let result = ai.Agent.new(client = cl).run(OaiEcho@spec("Say pong."));
             `${result.value}|${result.usage.input_tokens}|${result.usage.output_tokens}`
         },
     )
@@ -516,7 +516,7 @@ test "oai_sparse_usage" {
 }
 
 // Malformed `arguments` on a function_call item is PROVIDER-malformed output:
-// it must arrive as ai.errors.ParseFailed, not as the raw baml JsonParseError
+// it must arrive as ai.errors.ParseFailed, not as the raw baml baml.json.ParseError
 // escaping through the client's catch_all as an untyped UnknownError.
 function _oai_invoke_text(cl: openai.ResponsesClient, input: ai.ModelTurnInput) -> string {
     cl.invoke(input).terminal_text() ?? ""
@@ -547,7 +547,7 @@ test "oai_bad_tool_arguments" {
 
 // A provider error status is classified, never reported as a transport failure.
 function _oai_run(cl: openai.ResponsesClient) -> string {
-    let result = ai.Agent<string>.new(client = cl).run(OaiEcho@spec("Say pong."));
+    let result = ai.Agent.new(client = cl).run(OaiEcho@spec("Say pong."));
     result.value
 }
 
@@ -887,9 +887,9 @@ test "oai_stream_status_error" {
     assert.equal(oai_stream_status_error(), "invalid_request:http 401")
 }
 
-// The decoder buffers streamed function-call arguments across batches (the
-// stream event types cannot carry a tool call yet — PLAN §6), and a
-// `output_text.done` for an item that never streamed a delta emits it once.
+// The decoder buffers streamed function-call arguments across batches while
+// also exposing each fragment as ToolUseDelta, and a `output_text.done` for an
+// item that never streamed a delta emits it once.
 function oai_stream_decoder_buffers() -> string {
     let state = openai.internal.OaStreamState.new();
     let first: map<string, unknown> = {
@@ -907,11 +907,11 @@ function oai_stream_decoder_buffers() -> string {
         "item_id": "msg_1",
         "text": "hello",
     };
-    let batch_one = openai.internal._openai_decode_batch(
+    let batch_one = openai.internal._decode_batch(
         _oai_batch([_oai_json(first), _oai_json(second)]),
         state,
     );
-    let batch_two = openai.internal._openai_decode_batch(_oai_batch([_oai_json(done)]), state);
+    let batch_two = openai.internal._decode_batch(_oai_batch([_oai_json(done)]), state);
     [
         state.call_arguments.get("fc_1") ?? "",
         batch_one.length().to_string(),
@@ -922,7 +922,7 @@ function oai_stream_decoder_buffers() -> string {
 }
 
 test "oai_stream_decoder_buffers" {
-    assert.equal(oai_stream_decoder_buffers(), "{\"city\":\"paris\"}|0|1|hello|unset")
+    assert.equal(oai_stream_decoder_buffers(), "{\"city\":\"paris\"}|2|1|hello|unset")
 }
 
 // The dedup key is the CONTENT PART, not the item: a message with two text
@@ -948,7 +948,7 @@ function oai_stream_content_index_parts() -> string {
         "content_index": 1,
         "text": "two",
     };
-    let events = openai.internal._openai_decode_batch(
+    let events = openai.internal._decode_batch(
         _oai_batch([_oai_json(delta), _oai_json(done_zero), _oai_json(done_one)]),
         state,
     );
@@ -1066,7 +1066,7 @@ function _oai_live_client() -> openai.ResponsesClient {
 
 // The whole wire path against the real endpoint: typed body, auth, parse.
 function oai_live_answers() -> bool {
-    let result = ai.Agent<string>.new(client = _oai_live_client())
+    let result = ai.Agent.new(client = _oai_live_client())
         .run(OaiEcho@spec("Say pong."));
     result.value.trim().length() > 0 && result.usage.output_tokens > 0
 }
@@ -1083,7 +1083,7 @@ function oai_live_streams() -> bool {
 // gate: OPENAI_LIVE_IMAGE=1.
 function oai_live_generates_image() -> bool {
     let cl = openai.ResponsesClient.new(model = "gpt-4o-mini");
-    let picture = ai.Agent<image>.new(client = cl).run(OaiPicture@spec("a single red apple"));
+    let picture = ai.Agent.new(client = cl).run(OaiPicture@spec("a single red apple"));
     picture.value.base64().length() > 0
 }
 
@@ -1112,4 +1112,78 @@ testset "live" with testing.Sequential() {
     } else {
         log.warn("live::openai_responses not registered: OPENAI_API_KEY is unset")
     }
+}
+
+// ─── journal content blocks: media in tool results and user turns ─────────────
+//
+// Responses column of the lowering table (`_lower_block` in responses.baml):
+// image and pdf are Accepted inside `function_call_output.output` as input
+// parts; audio has no part there and Degrades into a trailing user turn;
+// video is Rejected everywhere.
+
+function _oai_media_body(media: image | audio | video | pdf) -> json {
+    let cl = openai.ResponsesClient.new(model = "gpt-4o-mini", api_key = "test-key");
+    let input = _oai_input(
+        OaiEcho@spec("Say pong."),
+        root.llm_mock.media_journal("openai/gpt-4o-mini", media),
+        ai.tools.Toolbox.new([]),
+    );
+    baml.json.parse(openai.internal.render(cl, input).body)
+}
+
+// input: [prompt user, function_call, function_call, function_call_output
+// (string), function_call_output (parts), user(text + image)].
+function oai_journal_image_accepted() -> string {
+    let body = _oai_media_body(root.llm_mock.media_png());
+    [
+        baml.json.path<string>(body, ".input[3].call_id"),
+        baml.json.path<string>(body, ".input[3].output"),
+        baml.json.path<string>(body, ".input[4].output[0].text"),
+        baml.json.path<string>(body, ".input[4].output[1].type"),
+        baml.json.path<string>(body, ".input[4].output[1].image_url"),
+        baml.json.path<string>(body, ".input[5].role"),
+        baml.json.path<string>(body, ".input[5].content[0].text"),
+        baml.json.path<string>(body, ".input[5].content[1].type"),
+        baml.json.path_or<string>(body, ".input[6].role", "absent"),
+    ].join("|")
+}
+
+test "oai_journal_image_accepted" {
+    assert.equal(
+        oai_journal_image_accepted(),
+        "call_text|sunny in SF|captured:|input_image|data:image/png;base64,SGVsbG8=|user|Screenshot after the tool ran:|input_image|absent",
+    )
+}
+
+// Degrade: the result's output stays the plain text; the audio follows as a
+// user message behind a note naming the tool.
+function oai_journal_audio_degrades() -> string {
+    let body = _oai_media_body(root.llm_mock.media_mp3());
+    [
+        baml.json.path<string>(body, ".input[4].output"),
+        baml.json.path<string>(body, ".input[5].role"),
+        baml.json.path<string>(body, ".input[5].content[0].text"),
+        baml.json.path<string>(body, ".input[5].content[1].input_audio.format"),
+        baml.json.path<string>(body, ".input[6].content[0].text"),
+        baml.json.path<string>(body, ".input[6].content[1].type"),
+    ].join("|")
+}
+
+test "oai_journal_audio_degrades" {
+    assert.equal(
+        oai_journal_audio_degrades(),
+        `captured:|user|${root.llm_mock.degrade_note("capture")}|mp3|Screenshot after the tool ran:|input_audio`,
+    )
+}
+
+function oai_journal_video_rejected() -> string {
+    let clip = baml.media.Video.from_base64("QUJD", "video/mp4");
+    baml.json.stringify(_oai_media_body(clip)) catch_all (e) {
+        let invalid: ai.errors.InvalidRequest => invalid.detail,
+        _ => `unexpected error class: ${e.to_string()}`,
+    }
+}
+
+test "oai_journal_video_rejected" {
+    assert.equal(oai_journal_video_rejected(), "OpenAI Responses does not support video prompt input")
 }

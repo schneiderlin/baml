@@ -12,9 +12,9 @@ mod coherence;
 mod impl_rules;
 
 use baml_base::{Literal, Name};
-use baml_compiler2_hir::{contributions::Definition, package::PackageId};
+use baml_compiler2_hir::contributions::Definition;
 use baml_type::{
-    ParamTy, QualifiedTypeName, Ty, TyAttr,
+    DeclName, ParamTy, Ty, TyAttr,
     normalize::TypeContext as _,
     pattern_overlap::TypeVarBoundsMap,
     unify::{AliasEquivCtx, TypeBindings, contains_bound_typevar},
@@ -55,34 +55,11 @@ pub(crate) struct LowerScope<'a, 'db> {
     pub self_ty: Option<Ty>,
 }
 
-fn interned_bounds(
-    bounds: &TypeVarBoundsMap,
-) -> rustc_hash::FxHashMap<ParamTy, Vec<baml_type::interned::InterfaceRef>> {
-    bounds
-        .iter()
-        .map(|(param, ifaces)| {
-            (
-                param.clone(),
-                ifaces
-                    .iter()
-                    .map(baml_type::interned::InterfaceRef::from_constraint)
-                    .collect(),
-            )
-        })
-        .collect()
-}
-
 fn scope_ctx<'db>(scope: &LowerScope<'_, 'db>) -> crate::lower::LowerCtx<'db> {
     crate::lower::lower_ctx_for_package(scope.db, scope.package_items, scope.ns_context.to_vec())
         .with_frame(scope.generic_params.to_vec())
-        .with_bounds(interned_bounds(scope.bounds))
-        .with_self_ty(
-            scope
-                .self_ty
-                .as_ref()
-                .map(baml_type::interned::Ty::from_plain),
-        )
-        .with_diagnostics()
+        .with_bounds(scope.bounds.clone())
+        .with_self_ty(scope.self_ty.clone())
 }
 
 pub(crate) fn lower_ref_in(
@@ -111,13 +88,14 @@ pub(crate) fn lower_ref_in_at(
     diags: &mut Vec<TirTypeError>,
 ) -> Ty {
     let ctx = scope_ctx(scope);
-    let lowered = ctx.lower_type_ref_at(store, id, position).to_plain();
+    let (lowered, lowering_diagnostics) =
+        ctx.lower_type_ref_at_with_diagnostics(store, id, position);
     diags.extend(
-        ctx.take_diagnostics()
+        lowering_diagnostics
             .into_iter()
             .map(|diag| crate::lower::lowering_diag_error(&diag.kind)),
     );
-    lowered
+    crate::lower::reject_holes(&lowered)
 }
 
 /// [`lower_expr_in`] at an explicit [`crate::lower::TypePosition`].
@@ -146,14 +124,51 @@ pub(crate) fn interface_self_param(
         .expect("interface frame starts with Self")
 }
 
-/// Resolve a name against the FULL interface frame (declared params and
-/// associated slots), innermost-last-wins.
-fn resolve_frame_param(frame: &[ParamTy], name: &Name) -> Option<ParamTy> {
-    frame
-        .iter()
-        .rev()
-        .find(|param| param.name() == name)
-        .cloned()
+/// Collapse `Self.X` projections through the pins resolved so far — the
+/// projection-only counterpart of the old associated frame-slot
+/// substitution (associated types are not frame slots; a sibling reference
+/// in a binding value or realized default is a projection over `Self`).
+/// Only projections whose base IS this interface's `Self` — the symbolic
+/// param or the realized receiver — collapse; foreign bases keep theirs.
+/// The qualifier must match at its GENERICS too, not just its name: `Self`
+/// may implement the same interface at several instantiations, and a
+/// written `(Self as I<float>).X` inside an `I<int>` realization names the
+/// OTHER instantiation's member — its pin belongs to the resolver, never to
+/// this realization's pin list. (A projection's spelled qualifier always
+/// carries its instantiation — `projection_interface_for` reads it off the
+/// bound or the existential — and every caller collapses a type already
+/// substituted at the realization's args, so equality is exact here.)
+pub(crate) fn collapse_self_assoc_projections(
+    ty: &Ty,
+    self_tys: &[&Ty],
+    iface: Option<&DeclName>,
+    iface_args: &[Ty],
+    pins: &[(Name, Ty)],
+) -> Ty {
+    let Some(iface) = iface else {
+        return ty.clone();
+    };
+    if pins.is_empty() {
+        return ty.clone();
+    }
+    baml_type::unify::rewrite_ty(ty, &mut |node| {
+        if let Ty::AssociatedTypeProjection {
+            base,
+            interface,
+            member,
+            ..
+        } = node
+            && &interface.name == iface
+            && interface.generics.len() == iface_args.len()
+            && interface.generics.iter().eq(iface_args)
+            && self_tys.iter().any(|s| *s == base.as_ref())
+            && let Some((_, pin)) = pins.iter().find(|(name, _)| name == member)
+        {
+            Some(pin.clone())
+        } else {
+            None
+        }
+    })
 }
 
 /// One binding per param mapping it to itself as a rigid var — the identity
@@ -189,12 +204,11 @@ pub fn interface_declared_param_bounds(
             .bounds
             .iter()
             .filter_map(|&id| {
-                ctx.lower_type_ref_at(
+                crate::lower::reject_holes(&ctx.lower_type_ref_at(
                     &data.type_refs,
                     id,
                     crate::lower::TypePosition::ConstraintHead,
-                )
-                .to_plain()
+                ))
                 .as_interface()
             })
             .collect();
@@ -211,10 +225,10 @@ pub fn interface_declared_param_bounds(
 /// Every type alias visible to `pkg_id` (its own plus its dependency
 /// closure's), resolved to its one-level value through the `hir_ty` road.
 #[salsa::tracked(returns(ref))]
-pub fn package_resolved_aliases<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
-    pkg_id: PackageId<'db>,
-) -> std::collections::HashMap<QualifiedTypeName, Ty> {
+pub fn package_resolved_aliases(
+    db: &dyn baml_compiler2_ppir::Db,
+    pkg_id: baml_base::SourceRoot,
+) -> std::collections::HashMap<DeclName, Ty> {
     let mut aliases = std::collections::HashMap::new();
     let mut packages = vec![pkg_id];
     packages.extend(baml_compiler2_hir::package::package_dependency_closure(
@@ -227,7 +241,7 @@ pub fn package_resolved_aliases<'db>(
                 if let Definition::TypeAlias(loc) = def {
                     aliases
                         .entry(qualify_def(db, Definition::TypeAlias(*loc), name))
-                        .or_insert_with(|| crate::lower::type_alias_value(db, *loc).to_plain());
+                        .or_insert_with(|| crate::lower::type_alias_value(db, *loc));
                 }
             }
         }
@@ -239,12 +253,9 @@ pub fn package_resolved_aliases<'db>(
 /// folding), or `None` if `qtn` is not an enum.
 pub fn enum_variant_names(
     db: &dyn baml_compiler2_ppir::Db,
-    enum_qtn: &QualifiedTypeName,
+    enum_qtn: &DeclName,
 ) -> Option<Vec<Name>> {
-    let package_id = PackageId::new(db, enum_qtn.package().clone());
-    let items = baml_compiler2_ppir::package_items(db, package_id);
-    let Definition::Enum(enum_loc) = items.lookup_type(enum_qtn.namespace(), enum_qtn.name())?
-    else {
+    let Definition::Enum(enum_loc) = crate::facts::definition_of(db, enum_qtn)? else {
         return None;
     };
     Some(
@@ -259,12 +270,12 @@ pub fn enum_variant_names(
 /// [`package_resolved_aliases`] with every body folded toward the union
 /// canonical form the overlap machinery assumes (see `baml_type::unify`).
 #[salsa::tracked(returns(ref))]
-pub fn normalized_alias_map<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
-    pkg_id: PackageId<'db>,
-) -> std::collections::HashMap<QualifiedTypeName, Ty> {
+pub fn normalized_alias_map(
+    db: &dyn baml_compiler2_ppir::Db,
+    pkg_id: baml_base::SourceRoot,
+) -> std::collections::HashMap<DeclName, Ty> {
     let mut aliases = package_resolved_aliases(db, pkg_id).clone();
-    let enum_variants = |qtn: &QualifiedTypeName| enum_variant_names(db, qtn);
+    let enum_variants = |qtn: &DeclName| enum_variant_names(db, qtn);
     for body in aliases.values_mut() {
         *body = baml_type::unify::nf(body, &enum_variants);
     }
@@ -299,7 +310,7 @@ struct InterfaceTypeAssocLowering<'a, 'db> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterfaceImplOrigin {
     /// `implements I { … }` written in the class body.
-    InBodyClass { class_qtn: QualifiedTypeName },
+    InBodyClass { class_qtn: DeclName },
     /// `implement<…> I for <for_target>` — any out-of-body impl (concrete class, generic, or
     /// non-class target).
     OutOfBody,
@@ -310,7 +321,7 @@ pub enum InterfaceImplOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedInterface<'db> {
     pub loc: baml_compiler2_hir::loc::InterfaceLoc<'db>,
-    pub qtn: QualifiedTypeName,
+    pub qtn: DeclName,
 }
 
 /// Whether `arg` (already [normalized](baml_type::normalize::TypeContext::normalize)) implements
@@ -326,7 +337,7 @@ pub fn normalized_arg_implements_bound(
     bound: &baml_type::Interface,
 ) -> bool {
     let carried_bounds = match arg {
-        Ty::Unknown { .. } | Ty::Error { .. } => return true,
+        Ty::Error { .. } => return true,
         Ty::TypeVar(name, _) => ctx.type_var_bound(name),
         Ty::AssociatedTypeProjection {
             interface, member, ..
@@ -398,7 +409,8 @@ fn lower_interface_associated_bindings<'db>(
     let mut value_bindings: TypeBindings = identity_bindings(generic_params);
     value_bindings.insert(self_param.clone(), self_ty.clone());
     let mut resolved_pins: Vec<(Name, Ty)> = Vec::new();
-    let mut default_bindings = baml_type::unify::bind_type_vars(&iface_params, interface_args);
+    let default_bindings = baml_type::unify::bind_type_vars(&iface_params, interface_args);
+    let self_var = Ty::TypeVar(self_param.clone(), TyAttr::default());
 
     iface
         .associated_types
@@ -415,8 +427,8 @@ fn lower_interface_associated_bindings<'db>(
                         self_param.clone(),
                         vec![baml_type::Interface::new(
                             qtn.clone(),
-                            interface_args.to_vec(),
-                            resolved_pins.clone(),
+                            interface_args.into(),
+                            resolved_pins.clone().into(),
                         )],
                     );
                 }
@@ -450,10 +462,16 @@ fn lower_interface_associated_bindings<'db>(
                 );
                 baml_type::unify::substitute_ty(&realized, &default_bindings)
             };
+            // A sibling reference (`type Items = Self.Item[]`) is a projection
+            // over `Self`; the earlier witness is its value.
+            let ty = collapse_self_assoc_projections(
+                &ty,
+                &[&self_var, self_ty],
+                iface_qtn.as_ref(),
+                interface_args,
+                &resolved_pins,
+            );
             resolved_pins.push((assoc.name.clone(), ty.clone()));
-            let assoc_param = resolve_frame_param(&frame, &assoc.name)
-                .expect("associated type parameter is in its interface frame");
-            default_bindings.insert(assoc_param, ty.clone());
             Some((assoc.name.clone(), ty))
         })
         .collect()
@@ -477,12 +495,12 @@ pub(crate) fn complete_interface_associated_bindings_from_tys<'db>(
         .cloned()
         .expect("interface frame starts with Self");
     let iface_params = crate::lower::interface_declared_params(db, iface_loc);
-    let mut bindings = baml_type::unify::bind_type_vars(&iface_params, interface_args);
-    for (name, ty) in associated_bindings {
-        let param = resolve_frame_param(&frame, name)
-            .expect("associated type parameter is in its interface frame");
-        bindings.insert(param, ty.clone());
-    }
+    let iface_qtn = interface_loc_qtn(db, iface_loc);
+    let bindings = baml_type::unify::bind_type_vars(&iface_params, interface_args);
+    let self_var = Ty::TypeVar(self_param.clone(), TyAttr::default());
+    // The members resolved so far, in declaration order — a later member's
+    // `Self.X` projection collapses through them.
+    let mut resolved_pins: Vec<(Name, Ty)> = Vec::new();
 
     iface
         .associated_types
@@ -493,9 +511,14 @@ pub(crate) fn complete_interface_associated_bindings_from_tys<'db>(
                 .find(|(name, _)| name == &assoc.name)
             {
                 let ty = baml_type::unify::substitute_ty(ty, &bindings);
-                let assoc_param = resolve_frame_param(&frame, &assoc.name)
-                    .expect("associated type parameter is in its interface frame");
-                bindings.insert(assoc_param, ty.clone());
+                let ty = collapse_self_assoc_projections(
+                    &ty,
+                    &[&self_var],
+                    iface_qtn.as_ref(),
+                    interface_args,
+                    &resolved_pins,
+                );
+                resolved_pins.push((assoc.name.clone(), ty.clone()));
                 return Some((assoc.name.clone(), ty));
             }
             if !fill_defaults {
@@ -507,20 +530,10 @@ pub(crate) fn complete_interface_associated_bindings_from_tys<'db>(
             // default is lowered once (symbolic `Self`) by the shared query.
             let (default, _diags) =
                 interface_associated_type_default(db, iface_loc, assoc.name.clone())?;
-            let self_pins: Vec<(Name, Ty)> = iface
-                .associated_types
-                .iter()
-                .filter_map(|assoc| {
-                    let param = resolve_frame_param(&frame, &assoc.name)?;
-                    bindings
-                        .get(&param)
-                        .map(|ty| (assoc.name.clone(), ty.clone()))
-                })
-                .collect();
             let self_ty = Ty::Interface(
-                interface_loc_qtn(db, iface_loc)?,
-                interface_args.to_vec(),
-                self_pins,
+                iface_qtn.clone()?,
+                interface_args.into(),
+                resolved_pins.clone().into(),
                 TyAttr::default(),
             );
             let realized = realize_associated_default(
@@ -531,9 +544,14 @@ pub(crate) fn complete_interface_associated_bindings_from_tys<'db>(
                 &self_ty,
             );
             let ty = baml_type::unify::substitute_ty(&realized, &bindings);
-            let assoc_param = resolve_frame_param(&frame, &assoc.name)
-                .expect("associated type parameter is in its interface frame");
-            bindings.insert(assoc_param, ty.clone());
+            let ty = collapse_self_assoc_projections(
+                &ty,
+                &[&self_var, &self_ty],
+                iface_qtn.as_ref(),
+                interface_args,
+                &resolved_pins,
+            );
+            resolved_pins.push((assoc.name.clone(), ty.clone()));
             Some((assoc.name.clone(), ty))
         })
         .collect()
@@ -565,8 +583,7 @@ impl<'db> InterfaceDeclScope<'db> {
     ) -> Self {
         let iface = baml_compiler2_ppir::item_data::interface_data(db, iface_loc);
         let pkg_info = baml_compiler2_hir::file_package::file_package(db, iface_loc.file(db));
-        let pkg_items =
-            baml_compiler2_ppir::package_items(db, PackageId::new(db, pkg_info.package.clone()));
+        let pkg_items = baml_compiler2_ppir::package_items(db, pkg_info.root);
 
         // `Self` plus the declared params: the frame's universal prefix,
         // without the associated-type slots that follow it.
@@ -585,7 +602,7 @@ impl<'db> InterfaceDeclScope<'db> {
                 .iter()
                 .map(|p| Ty::TypeVar(p.clone(), TyAttr::default()))
                 .collect(),
-            Vec::new(),
+            Box::new([]),
         );
         let mut bounds = interface_declared_param_bounds(db, iface_loc);
         bounds.insert(self_param.clone(), vec![self_constraint]);
@@ -835,12 +852,12 @@ pub fn realize_associated_default(
 pub fn existential_associated_default(
     db: &dyn baml_compiler2_ppir::Db,
     res_ctx: &crate::package_interface::PackageResolutionContext<'_>,
-    qtn: &QualifiedTypeName,
+    qtn: &DeclName,
     args: &[Ty],
     self_ty: &Ty,
     member: &Name,
 ) -> Option<Ty> {
-    let items = res_ctx.items_for_package(db, qtn.package())?;
+    let items = res_ctx.items_for_root(db, qtn.root())?;
     let Definition::Interface(iface_loc) = items.lookup_type(qtn.namespace(), qtn.name())? else {
         return None;
     };
@@ -873,6 +890,11 @@ fn lower_interface_type_associated_bindings(
     // The interface's declared parameter bounds, so a `T.member` projection in a
     // binding value or default resolves `T`'s declaring interface.
     let iface_bounds = interface_declared_param_bounds(ctx.db, ctx.iface_loc);
+    let iface_qtn = interface_loc_qtn(ctx.db, ctx.iface_loc);
+    let self_var = Ty::TypeVar(self_param.clone(), TyAttr::default());
+    // The members resolved so far, in declaration order — a later member's
+    // `Self.X` projection collapses through them.
+    let mut resolved_pins: Vec<(Name, Ty)> = Vec::new();
 
     ctx.iface
         .associated_types
@@ -924,29 +946,23 @@ fn lower_interface_type_associated_bindings(
                         &bindings,
                     )
                 };
-                let assoc_param = resolve_frame_param(&frame, &assoc.name)
-                    .expect("associated type parameter is in its interface frame");
-                bindings.insert(assoc_param, ty.clone());
+                let ty = collapse_self_assoc_projections(
+                    &ty,
+                    &[&self_var],
+                    iface_qtn.as_ref(),
+                    ctx.interface_args,
+                    &resolved_pins,
+                );
+                resolved_pins.push((assoc.name.clone(), ty.clone()));
                 return Some((assoc.name.clone(), ty));
             }
             // Fill the omitted default eagerly at this interface realized on the receiver.
             let (default, _diags) =
                 interface_associated_type_default(ctx.db, ctx.iface_loc, assoc.name.clone())?;
-            let self_pins: Vec<(Name, Ty)> = ctx
-                .iface
-                .associated_types
-                .iter()
-                .filter_map(|assoc| {
-                    let param = resolve_frame_param(&frame, &assoc.name)?;
-                    bindings
-                        .get(&param)
-                        .map(|ty| (assoc.name.clone(), ty.clone()))
-                })
-                .collect();
             let self_ty = Ty::Interface(
-                interface_loc_qtn(ctx.db, ctx.iface_loc)?,
-                ctx.interface_args.to_vec(),
-                self_pins,
+                iface_qtn.clone()?,
+                ctx.interface_args.into(),
+                resolved_pins.clone().into(),
                 TyAttr::default(),
             );
             let realized = realize_associated_default(
@@ -957,9 +973,14 @@ fn lower_interface_type_associated_bindings(
                 &self_ty,
             );
             let ty = baml_type::unify::substitute_ty(&realized, &bindings);
-            let assoc_param = resolve_frame_param(&frame, &assoc.name)
-                .expect("associated type parameter is in its interface frame");
-            bindings.insert(assoc_param, ty.clone());
+            let ty = collapse_self_assoc_projections(
+                &ty,
+                &[&self_var, &self_ty],
+                iface_qtn.as_ref(),
+                ctx.interface_args,
+                &resolved_pins,
+            );
+            resolved_pins.push((assoc.name.clone(), ty.clone()));
             Some((assoc.name.clone(), ty))
         })
         .collect()
@@ -971,7 +992,7 @@ fn lower_interface_type_associated_bindings(
 pub fn match_ty_patterns(
     pairs: &[(&Ty, &Ty)],
     generic_params: &[ParamTy],
-    aliases: &std::collections::HashMap<QualifiedTypeName, Ty>,
+    aliases: &AliasEquivCtx<'_>,
 ) -> Option<TypeBindings> {
     let mut bindings = TypeBindings::default();
     for (pattern, concrete) in pairs {
@@ -986,7 +1007,7 @@ pub fn match_ty_pattern_into(
     pattern: &Ty,
     concrete: &Ty,
     generic_params: &[ParamTy],
-    aliases: &std::collections::HashMap<QualifiedTypeName, Ty>,
+    aliases: &AliasEquivCtx<'_>,
     bindings: &mut TypeBindings,
 ) -> Option<()> {
     if let Ty::TypeVar(name, _) = pattern
@@ -995,9 +1016,7 @@ pub fn match_ty_pattern_into(
         return bind_type_var(name, concrete, bindings, aliases);
     }
 
-    if !contains_bound_typevar(pattern, generic_params)
-        && AliasEquivCtx(aliases).equivalent(pattern, concrete)
-    {
+    if !contains_bound_typevar(pattern, generic_params) && aliases.equivalent(pattern, concrete) {
         return Some(());
     }
 
@@ -1010,7 +1029,7 @@ pub fn match_ty_pattern_into(
             |param: &ParamTy| generic_params.contains(param) && !bindings.contains_key(param);
         if !baml_type_runtime::contains_typevar_where(pattern, &unbound) {
             let substituted = baml_type::unify::substitute_ty(pattern, bindings);
-            if AliasEquivCtx(aliases).equivalent(&substituted, concrete) {
+            if aliases.equivalent(&substituted, concrete) {
                 return Some(());
             }
         }
@@ -1037,7 +1056,7 @@ pub fn match_ty_pattern_into(
             }
             Some(())
         }
-        (Ty::List(p, _), Ty::List(c, _)) | (Ty::EvolvingList(p, _), Ty::EvolvingList(c, _)) => {
+        (Ty::List(p, _), Ty::List(c, _)) => {
             match_ty_pattern_into(p, c, generic_params, aliases, bindings)
         }
         (
@@ -1047,8 +1066,7 @@ pub fn match_ty_pattern_into(
             Ty::Map {
                 key: ck, value: cv, ..
             },
-        )
-        | (Ty::EvolvingMap(pk, pv, _), Ty::EvolvingMap(ck, cv, _)) => {
+        ) => {
             match_ty_pattern_into(pk, ck, generic_params, aliases, bindings)?;
             match_ty_pattern_into(pv, cv, generic_params, aliases, bindings)
         }
@@ -1096,7 +1114,7 @@ pub fn match_ty_pattern_into(
             match_ty_pattern_into(p_ret, c_ret, generic_params, aliases, bindings)?;
             match_ty_pattern_into(p_throws, c_throws, generic_params, aliases, bindings)
         }
-        _ if AliasEquivCtx(aliases).equivalent(pattern, concrete) => Some(()),
+        _ if aliases.equivalent(pattern, concrete) => Some(()),
         _ => None,
     }
 }
@@ -1105,7 +1123,7 @@ fn match_union_members(
     pattern_members: &[Ty],
     concrete_members: &[Ty],
     generic_params: &[ParamTy],
-    aliases: &std::collections::HashMap<QualifiedTypeName, Ty>,
+    aliases: &AliasEquivCtx<'_>,
     bindings: &mut TypeBindings,
 ) -> Option<()> {
     let Some((pattern_head, pattern_tail)) = pattern_members.split_first() else {
@@ -1153,10 +1171,10 @@ fn bind_type_var(
     param: &ParamTy,
     concrete: &Ty,
     bindings: &mut TypeBindings,
-    aliases: &std::collections::HashMap<QualifiedTypeName, Ty>,
+    aliases: &AliasEquivCtx<'_>,
 ) -> Option<()> {
     match bindings.get(param) {
-        Some(existing) if AliasEquivCtx(aliases).equivalent(existing, concrete) => Some(()),
+        Some(existing) if aliases.equivalent(existing, concrete) => Some(()),
         Some(_) => None,
         None => {
             bindings.insert(param.clone(), concrete.clone());
@@ -1227,7 +1245,7 @@ fn resolved_interface_from_ty(
     let Ty::Interface(qtn, _, _, _) = ty else {
         return None;
     };
-    let pkg_id = PackageId::new(db, qtn.package().clone());
+    let pkg_id = qtn.root();
     let resolved_pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
     let Definition::Interface(loc) = resolved_pkg_items.lookup_type(qtn.namespace(), qtn.name())?
     else {
@@ -1264,8 +1282,7 @@ pub fn interface_requires_cycle<'db>(
         |loc: baml_compiler2_hir::loc::InterfaceLoc<'db>| -> Vec<baml_compiler2_hir::loc::InterfaceLoc<'db>> {
             let iface = baml_compiler2_ppir::item_data::interface_data(db, loc);
             let pkg = baml_compiler2_hir::file_package::file_package(db, loc.file(db));
-            let pkg_items =
-                baml_compiler2_ppir::package_items(db, PackageId::new(db, pkg.package.clone()));
+            let pkg_items = baml_compiler2_ppir::package_items(db, pkg.root);
             iface
                 .requires
                 .iter()
@@ -1317,8 +1334,7 @@ pub fn interface_closure_locs<'db>(
         out.push(loc);
         let iface = baml_compiler2_ppir::item_data::interface_data(db, loc);
         let pkg_info = baml_compiler2_hir::file_package::file_package(db, loc.file(db));
-        let pkg_id = PackageId::new(db, pkg_info.package.clone());
-        let parent_pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
+        let parent_pkg_items = baml_compiler2_ppir::package_items(db, pkg_info.root);
         for &parent in &iface.requires {
             if let Some(parent_loc) = resolve_ref_to_interface(
                 db,
@@ -1398,8 +1414,7 @@ pub fn interface_closure_locs_with_args_and_assoc<'db>(
         }
         let iface = baml_compiler2_ppir::item_data::interface_data(db, loc);
         let pkg_info = baml_compiler2_hir::file_package::file_package(db, loc.file(db));
-        let pkg_id = PackageId::new(db, pkg_info.package.clone());
-        let parent_pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
+        let parent_pkg_items = baml_compiler2_ppir::package_items(db, pkg_info.root);
         let mut diags = Vec::new();
         let associated_bindings = complete_interface_associated_bindings_from_tys(
             db,
@@ -1416,19 +1431,17 @@ pub fn interface_closure_locs_with_args_and_assoc<'db>(
         let mut child_ancestors = ancestors.clone();
         child_ancestors.insert(loc);
 
-        let frame = crate::lower::interface_frame(db, loc);
+        // Only the declared params bind: associated types are projection-only
+        // (`Self.X`), resolved through `self_bound`'s pins below, and a bare
+        // assoc name in a parent argument is ban-illegal.
         let iface_params = crate::lower::interface_declared_params(db, loc);
-        let mut bindings = baml_type::unify::bind_type_vars(&iface_params, &args);
-        for (name, ty) in &associated_bindings {
-            let param = resolve_frame_param(&frame, name)
-                .expect("associated type parameter is in its interface frame");
-            bindings.insert(param, ty.clone());
-        }
+        let bindings = baml_type::unify::bind_type_vars(&iface_params, &args);
 
         // This interface as a constraint (its associated types pinned to the realized
         // bindings) — so a required interface's `Item = Self.Item` resolves `Self.Item` here.
-        let self_bound = interface_loc_qtn(db, loc)
-            .map(|qtn| baml_type::Interface::new(qtn, args.clone(), associated_bindings.clone()));
+        let self_bound = interface_loc_qtn(db, loc).map(|qtn| {
+            baml_type::Interface::new(qtn, args.clone().into(), associated_bindings.clone().into())
+        });
         // The requiring interface's declared parameter bounds, so a `T.member`
         // projection in a parent's generic arguments resolves `T`'s declaring
         // interface.
@@ -1525,7 +1538,7 @@ pub fn interface_requires<'db>(
     if sub.name == sup.name {
         return false;
     }
-    let Some(pkg_items) = res_ctx.items_for_package(db, sub.name.package()) else {
+    let Some(pkg_items) = res_ctx.items_for_root(db, sub.name.root()) else {
         return false;
     };
     let Some(Definition::Interface(sub_loc)) =
@@ -1577,7 +1590,7 @@ pub fn interface_requires<'db>(
 pub fn type_generic_bound_errors(
     db: &dyn baml_compiler2_ppir::Db,
     scope_bounds: &rustc_hash::FxHashMap<ParamTy, Vec<baml_type::Interface>>,
-    ty: &Ty,
+    ty: &baml_type::LoweringTy,
 ) -> Vec<TirTypeError> {
     let facts = crate::facts::Facts::with_bounds(db, scope_bounds.clone());
     let mut errors = Vec::new();
@@ -1589,13 +1602,13 @@ pub fn type_generic_bound_errors(
 fn collect_type_generic_bound_errors<'db>(
     db: &'db dyn baml_compiler2_ppir::Db,
     facts: &crate::facts::Facts<'db>,
-    ty: &Ty,
-    seen_aliases: &mut FxHashSet<QualifiedTypeName>,
+    ty: &baml_type::LoweringTy,
+    seen_aliases: &mut FxHashSet<DeclName>,
     errors: &mut Vec<TirTypeError>,
 ) {
     use baml_type::normalize::TypeContext as _;
     match ty {
-        Ty::Class(qtn, args, _) => {
+        baml_type::LoweringTy::Class(qtn, args, _) => {
             for arg in args {
                 collect_type_generic_bound_errors(db, facts, arg, seen_aliases, errors);
             }
@@ -1605,7 +1618,7 @@ fn collect_type_generic_bound_errors<'db>(
                 check_head_args(facts, &params, &declared, args, errors);
             }
         }
-        Ty::Interface(qtn, args, pins, _) => {
+        baml_type::LoweringTy::Interface(qtn, args, pins, _) => {
             for arg in args {
                 collect_type_generic_bound_errors(db, facts, arg, seen_aliases, errors);
             }
@@ -1614,38 +1627,23 @@ fn collect_type_generic_bound_errors<'db>(
             }
             if let Some(Definition::Interface(iface)) = facts.definition_of(qtn) {
                 let params = crate::lower::interface_declared_params(db, iface);
-                let plain = interface_declared_param_bounds(db, iface);
-                let declared: rustc_hash::FxHashMap<
-                    ParamTy,
-                    Vec<baml_type::interned::InterfaceRef>,
-                > = plain
-                    .iter()
-                    .map(|(param, bounds)| {
-                        (
-                            param.clone(),
-                            bounds
-                                .iter()
-                                .map(baml_type::interned::InterfaceRef::from_constraint)
-                                .collect(),
-                        )
-                    })
-                    .collect();
+                let declared = interface_declared_param_bounds(db, iface);
                 check_head_args(facts, &params, &declared, args, errors);
             }
         }
-        Ty::List(inner, _) | Ty::EvolvingList(inner, _) => {
+        baml_type::LoweringTy::List(inner, _) => {
             collect_type_generic_bound_errors(db, facts, inner, seen_aliases, errors);
         }
-        Ty::Map { key, value, .. } | Ty::EvolvingMap(key, value, _) => {
+        baml_type::LoweringTy::Map { key, value, .. } => {
             collect_type_generic_bound_errors(db, facts, key, seen_aliases, errors);
             collect_type_generic_bound_errors(db, facts, value, seen_aliases, errors);
         }
-        Ty::Union(members, _) => {
+        baml_type::LoweringTy::Union(members, _) => {
             for member in members {
                 collect_type_generic_bound_errors(db, facts, member, seen_aliases, errors);
             }
         }
-        Ty::Function {
+        baml_type::LoweringTy::Function {
             params,
             ret,
             throws,
@@ -1657,16 +1655,24 @@ fn collect_type_generic_bound_errors<'db>(
             collect_type_generic_bound_errors(db, facts, ret, seen_aliases, errors);
             collect_type_generic_bound_errors(db, facts, throws, seen_aliases, errors);
         }
-        Ty::Future(value, error, _) => {
+        baml_type::LoweringTy::Future(value, error, _) => {
             collect_type_generic_bound_errors(db, facts, value, seen_aliases, errors);
             collect_type_generic_bound_errors(db, facts, error, seen_aliases, errors);
         }
-        Ty::TypeAlias(qtn, _) => {
+        baml_type::LoweringTy::TypeAlias(qtn, _) => {
             if !seen_aliases.insert(qtn.clone()) {
                 return;
             }
             if let Some(expanded) = facts.alias_def(qtn) {
-                collect_type_generic_bound_errors(db, facts, &expanded, seen_aliases, errors);
+                // Alias definitions are finalized facts; the walk's lowering
+                // vocabulary is the wider member, so the upcast is zero-cost.
+                collect_type_generic_bound_errors(
+                    db,
+                    facts,
+                    expanded.as_lowering_ty(),
+                    seen_aliases,
+                    errors,
+                );
             }
             seen_aliases.remove(qtn);
         }
@@ -1681,34 +1687,32 @@ fn collect_type_generic_bound_errors<'db>(
 fn check_head_args(
     facts: &crate::facts::Facts<'_>,
     params: &[ParamTy],
-    declared: &rustc_hash::FxHashMap<ParamTy, Vec<baml_type::interned::InterfaceRef>>,
-    args: &[Ty],
+    declared: &rustc_hash::FxHashMap<ParamTy, Vec<baml_type::Interface>>,
+    args: &[baml_type::LoweringTy],
     errors: &mut Vec<TirTypeError>,
 ) {
     use baml_type::normalize::TypeContext as _;
     if params.is_empty() || args.is_empty() {
         return;
     }
-    let bindings = baml_type::unify::bind_type_vars(params, args);
+    // A hole-carrying argument is judged after instantiation, not here: only
+    // closed arguments are bound-checked, and only they contribute to the
+    // sibling-bound substitution environment. (The vacuous pass the retired
+    // lossy materialization gave holes, now decided by the narrowing instead
+    // of by walking an inert sentinel.)
+    let closed: Vec<Option<Ty>> = args.iter().map(|arg| Ty::try_from(arg).ok()).collect();
+    let (closed_params, closed_args): (Vec<ParamTy>, Vec<Ty>) = params
+        .iter()
+        .zip(&closed)
+        .filter_map(|(param, arg)| Some((param.clone(), arg.clone()?)))
+        .unzip();
+    let bindings = baml_type::unify::bind_type_vars(&closed_params, &closed_args);
     for (index, param) in params.iter().enumerate() {
-        let Some(actual) = args.get(index) else {
+        let Some(actual) = closed.get(index).and_then(Option::as_ref) else {
             continue;
         };
         for bound in declared.get(param).into_iter().flatten() {
-            let bound_ty = Ty::Interface(
-                bound.name.clone(),
-                bound
-                    .generics
-                    .iter()
-                    .map(baml_type::interned::Ty::to_plain)
-                    .collect(),
-                bound
-                    .associated_types
-                    .iter()
-                    .map(|(name, ty)| (name.clone(), ty.to_plain()))
-                    .collect(),
-                TyAttr::default(),
-            );
+            let bound_ty = bound.to_ty();
             let Some(bound) = baml_type::unify::substitute_ty(&bound_ty, &bindings).as_interface()
             else {
                 continue;
@@ -1717,10 +1721,7 @@ fn check_head_args(
             let admissible = arg.is_concrete()
                 || matches!(
                     arg,
-                    Ty::TypeVar(..)
-                        | Ty::AssociatedTypeProjection { .. }
-                        | Ty::Unknown { .. }
-                        | Ty::Error { .. }
+                    Ty::TypeVar(..) | Ty::AssociatedTypeProjection { .. } | Ty::Error { .. }
                 );
             if !admissible {
                 errors.push(TirTypeError::BoundedTypeArgNotConcrete {
@@ -1737,7 +1738,7 @@ fn check_head_args(
     }
 }
 
-// ── Associated-type projection determination (lowering) ────────────────────
+// ── Item projection determination (lowering) ───────────────────────────────
 //
 // TIR's `builder::associated_projection`, on hir_ty's substrate: lowering a
 // written `base.member` / `(base as I).member` determines the declaring
@@ -1749,6 +1750,40 @@ fn check_head_args(
 // must be proven; when the determined interface already pins `member`, the
 // projection collapses to the pin (opportunistic - realization is the
 // oracle's job).
+//
+// Determination is NAMESPACE-BLIND: which interface declares a member is
+// fixed by the base, never by what the member is. [`MemberNamespace`]
+// therefore parameterizes only the declaration oracle and the result the
+// caller builds - rustc's shape, where `(Self type, trait ref, item)` is one
+// concept and the item's namespace picks between a `ProjectionTy` and an
+// associated-fn `DefId`.
+
+/// Which namespace an item projection resolves its member in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberNamespace {
+    /// Associated types - `(T as I).Assoc`, written in type position.
+    Type,
+    /// Fields and methods, `self`-less interface statics included -
+    /// `(T as I).item`, written in value position.
+    Value,
+}
+
+/// What an interface declares under a name in [`MemberNamespace::Value`].
+/// The two kinds share the namespace but not the access shape (a field read
+/// dispatches virtually on a receiver; a method may be called with `Self`
+/// written instead), so the kind rides along with the determination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueMemberKind {
+    Field,
+    Method,
+}
+
+/// What an interface declares under a name, across both namespaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceMemberKind {
+    AssociatedType,
+    Value(ValueMemberKind),
+}
 
 /// The result of lowering a projection: the resolved plain [`Ty`] - the
 /// canonical triple when the interface is determined, otherwise `Ty::Error`
@@ -1759,7 +1794,13 @@ pub struct ProjectionLowering {
 }
 
 /// The outcome of resolving which interface declares a projection's member.
-enum Determination {
+///
+/// Public because both namespaces consume it: the type namespace maps it to
+/// a `Ty` in [`lower_projection`], the value namespace to a resolved item.
+/// The variants carry no namespace-specific wording - each caller phrases
+/// its own diagnostics, since "no associated type `X`" and "no method `x`"
+/// are the same determination reported two ways.
+pub enum Determination {
     Determined(baml_type::Interface),
     Undeclared {
         container: crate::diagnostics::AssocContainer,
@@ -1776,9 +1817,65 @@ enum Determination {
 /// Whether `ty` already carries an upstream error, so a projection over it
 /// must not emit a fresh diagnostic.
 fn projection_poisoned(ty: &Ty) -> bool {
-    matches!(
-        ty,
-        Ty::Error { .. } | Ty::Unknown { .. } | Ty::BuiltinUnknown { .. } | Ty::Infer { .. }
+    matches!(ty, Ty::Error { .. } | Ty::Unknown { .. })
+}
+
+/// Determine which interface declares `member` for `base`, in `ns` - the
+/// namespace-blind core both item-projection roads share. `scope_bounds` is
+/// the enclosing scope's PLAIN param env (a type variable base resolves
+/// through it).
+///
+/// A written `explicit_interface` that is not an interface at all is rejected
+/// here, so callers never have to re-check the qualifier: the returned
+/// [`Determination::Poisoned`] carries the diagnostic (or none, when the
+/// qualifier was already an error type and must not double-report).
+pub fn determine_member_interface(
+    db: &dyn baml_compiler2_ppir::Db,
+    viewer: baml_base::SourceRoot,
+    scope_bounds: &rustc_hash::FxHashMap<ParamTy, Vec<baml_type::Interface>>,
+    base: &Ty,
+    explicit_interface: Option<Ty>,
+    member: &Name,
+    ns: MemberNamespace,
+) -> (Determination, Vec<TirTypeError>) {
+    let facts = crate::facts::Facts::with_bounds(db, scope_bounds.clone());
+    determine_member_interface_with_facts(db, viewer, &facts, base, explicit_interface, member, ns)
+}
+
+/// [`determine_member_interface`] against an ALREADY-BUILT fact oracle. A
+/// caller that holds one (inference does) reuses it rather than rebuilding
+/// the param env per projection. `viewer` is the asking package: the impls
+/// that can declare the member are the ones it can see.
+pub fn determine_member_interface_with_facts(
+    db: &dyn baml_compiler2_ppir::Db,
+    viewer: baml_base::SourceRoot,
+    facts: &crate::facts::Facts<'_>,
+    base: &Ty,
+    explicit_interface: Option<Ty>,
+    member: &Name,
+    ns: MemberNamespace,
+) -> (Determination, Vec<TirTypeError>) {
+    let explicit = match explicit_interface {
+        None => None,
+        Some(iface_ty) => {
+            let iface_ty = projection_expand_aliases(facts, iface_ty);
+            match iface_ty.as_interface() {
+                Some(interface) => Some(interface),
+                None if projection_poisoned(&iface_ty) => {
+                    return (Determination::Poisoned, Vec::new());
+                }
+                None => {
+                    return (
+                        Determination::Poisoned,
+                        vec![TirTypeError::NonInterfaceProjectionQualifier],
+                    );
+                }
+            }
+        }
+    };
+    (
+        determine_interface(db, viewer, facts, base, explicit, member, ns),
+        Vec::new(),
     )
 }
 
@@ -1786,42 +1883,28 @@ fn projection_poisoned(ty: &Ty) -> bool {
 /// projection, determining the declaring interface. `scope_bounds` is the
 /// enclosing scope's PLAIN param env (a type variable base resolves through
 /// it); `pkg` scopes equivalence and alias expansion.
+///
+/// The [`MemberNamespace::Type`] half of [`determine_member_interface`]: the
+/// determination is shared, and only the product - a canonical projection
+/// triple, or the interface's own pin for `member` - is namespace-specific.
 pub fn lower_projection(
     db: &dyn baml_compiler2_ppir::Db,
+    viewer: baml_base::SourceRoot,
     scope_bounds: &rustc_hash::FxHashMap<ParamTy, Vec<baml_type::Interface>>,
     base: Ty,
     explicit_interface: Option<Ty>,
     member: Name,
 ) -> ProjectionLowering {
-    let facts = crate::facts::Facts::with_bounds(db, scope_bounds.clone());
-    let mut diagnostics = Vec::new();
-    let explicit = match explicit_interface {
-        None => None,
-        Some(iface_ty) => {
-            let iface_ty = projection_expand_aliases(&facts, iface_ty);
-            match iface_ty.as_interface() {
-                Some(interface) => Some(interface),
-                None if projection_poisoned(&iface_ty) => {
-                    return ProjectionLowering {
-                        ty: Ty::Error {
-                            attr: TyAttr::default(),
-                        },
-                        diagnostics,
-                    };
-                }
-                None => {
-                    diagnostics.push(TirTypeError::NonInterfaceProjectionQualifier);
-                    return ProjectionLowering {
-                        ty: Ty::Error {
-                            attr: TyAttr::default(),
-                        },
-                        diagnostics,
-                    };
-                }
-            }
-        }
-    };
-    let ty = match determine_interface(db, &facts, &base, explicit, &member) {
+    let (determination, mut diagnostics) = determine_member_interface(
+        db,
+        viewer,
+        scope_bounds,
+        &base,
+        explicit_interface,
+        &member,
+        MemberNamespace::Type,
+    );
+    let ty = match determination {
         Determination::Determined(interface) => {
             if let Some((_, pinned)) = interface
                 .associated_types
@@ -1871,16 +1954,18 @@ pub fn lower_projection(
 
 fn determine_interface<'db>(
     db: &'db dyn baml_compiler2_ppir::Db,
+    viewer: baml_base::SourceRoot,
     facts: &crate::facts::Facts<'db>,
     base: &Ty,
     explicit: Option<baml_type::Interface>,
     member: &Name,
+    ns: MemberNamespace,
 ) -> Determination {
     use crate::diagnostics::AssocContainer;
     // An explicit qualifier must declare `member` DIRECTLY: `requires` is a
     // bound, not inheritance.
     if let Some(qualifier) = &explicit
-        && !interface_declares_member(db, &qualifier.name, member)
+        && !interface_declares_member(db, &qualifier.name, member, ns)
     {
         return Determination::Undeclared {
             container: AssocContainer::Interface(qualifier.name.clone()),
@@ -1900,6 +1985,7 @@ fn determine_interface<'db>(
                 undeclared,
                 &base,
                 true,
+                ns,
             )
         }
         Ty::TypeVar(param, _) => {
@@ -1918,7 +2004,7 @@ fn determine_interface<'db>(
             } else {
                 let undeclared = AssocContainer::Interface(bounds[0].name.clone());
                 resolve_via_roots(
-                    db, facts, bounds, explicit, member, undeclared, &base, false,
+                    db, facts, bounds, explicit, member, undeclared, &base, false, ns,
                 )
             }
         }
@@ -1931,12 +2017,13 @@ fn determine_interface<'db>(
         | Ty::Float { .. }
         | Ty::String { .. }
         | Ty::Bool { .. }
+        | Ty::Null { .. }
         | Ty::Uint8Array { .. }
         | Ty::Media(..)
         | Ty::Literal(..)
         | Ty::EnumVariant(..) => match explicit {
-            None => determine_concrete(db, facts, &base, member),
-            Some(qualifier) => match concrete_realized_interface(db, facts, &base, &qualifier) {
+            None => determine_concrete(db, viewer, facts, &base, member, ns),
+            Some(qualifier) => match concrete_realized_interface(db, &base, &qualifier) {
                 Some(realized) => Determination::Determined(realized),
                 None => Determination::SubjectDoesNotImplementQualifier {
                     subject: base.clone(),
@@ -1950,15 +2037,13 @@ fn determine_interface<'db>(
             member: inner_member,
             ..
         } => {
-            let inner_ref = baml_type::interned::InterfaceRef::from_constraint(inner_interface);
-            let inner_base_interned = baml_type::interned::Ty::from_plain(inner_base);
-            let root = crate::impls::realized_assoc_bound(
+            let root = crate::impls::realized_assoc_bound_plain(
                 db,
-                &inner_ref,
-                &inner_base_interned,
+                inner_interface,
+                inner_base,
                 inner_member,
             )
-            .and_then(|bound| bound.to_plain().as_interface());
+            .and_then(|bound| bound.as_interface());
             match root {
                 Some(root) => {
                     let container = AssocContainer::Interface(root.name.clone());
@@ -1971,6 +2056,7 @@ fn determine_interface<'db>(
                         container,
                         &base,
                         false,
+                        ns,
                     )
                 }
                 None => match explicit {
@@ -1984,9 +2070,7 @@ fn determine_interface<'db>(
                 },
             }
         }
-        Ty::Error { .. } | Ty::Unknown { .. } | Ty::BuiltinUnknown { .. } | Ty::Infer { .. } => {
-            Determination::Poisoned
-        }
+        Ty::Error { .. } | Ty::Unknown { .. } => Determination::Poisoned,
         Ty::TypeAlias(..) => Determination::Poisoned,
         _ => match explicit {
             Some(qualifier) => Determination::SubjectDoesNotImplementQualifier {
@@ -2012,9 +2096,10 @@ fn resolve_via_roots<'db>(
     // chained projection's declared bound) leaves them unpinned - the
     // implementor may override.
     fill_defaults: bool,
+    ns: MemberNamespace,
 ) -> Determination {
     match explicit {
-        None => resolve_through_roots(db, roots, member, undeclared, fill_defaults),
+        None => resolve_through_roots(db, roots, member, undeclared, fill_defaults, ns),
         Some(qualifier) => {
             match realize_qualifier_through_roots(db, facts, &roots, &qualifier, fill_defaults) {
                 Some(realized) => Determination::Determined(realized),
@@ -2049,9 +2134,16 @@ fn realize_qualifier_through_roots<'db>(
             if let Some(qtn) = interface_loc_qtn(db, loc)
                 && qtn == qualifier.name
             {
-                let realized = baml_type::Interface::new(qtn, args, assoc);
-                if qualifier_compatible_with_realization(facts, qualifier, &realized) {
-                    return Some(realized);
+                let candidate = baml_type::Interface::new(qtn, args.into(), assoc.into());
+                if written_qualifier_proven_by(facts, qualifier, &candidate) {
+                    // The WRITTEN generics ride (they are equivalent to the
+                    // candidate's, rigid vars included); the candidate
+                    // supplies what the qualifier left unwritten.
+                    return Some(baml_type::Interface {
+                        name: candidate.name,
+                        generics: qualifier.generics.clone(),
+                        associated_types: candidate.associated_types,
+                    });
                 }
             }
         }
@@ -2061,42 +2153,34 @@ fn realize_qualifier_through_roots<'db>(
 
 /// Every written qualifier constraint must be consistent with the
 /// realization the roots prove; symbolic positions fail open.
-fn qualifier_compatible_with_realization(
+/// Whether a bound-closure `candidate` PROVES the written qualifier: every
+/// written position must be equivalent — a rigid type variable is equivalent
+/// to itself and to nothing else — and written associated pins must match.
+/// Nothing fails open: a symbolic position either proves rigidly or the
+/// qualifier is unproven and the caller reports it.
+fn written_qualifier_proven_by(
     facts: &crate::facts::Facts<'_>,
-    qualifier: &baml_type::Interface,
-    realized: &baml_type::Interface,
+    written: &baml_type::Interface,
+    candidate: &baml_type::Interface,
 ) -> bool {
     let equivalent = |a: &Ty, b: &Ty| baml_type::normalize::equivalent(a, b, facts);
-    let symbolic = |ty: &Ty| baml_type_runtime::contains_typevar(ty);
-    if !qualifier.generics.is_empty() {
-        if qualifier.generics.len() != realized.generics.len() {
-            return false;
-        }
-        for (written, real) in qualifier.generics.iter().zip(realized.generics.iter()) {
-            if symbolic(written) || symbolic(real) {
-                continue;
-            }
-            if !equivalent(written, real) {
-                return false;
-            }
-        }
+    if written.generics.len() != candidate.generics.len() {
+        return false;
     }
-    for (name, written) in &qualifier.associated_types {
-        let Some((_, real)) = realized
+    if !written
+        .generics
+        .iter()
+        .zip(&candidate.generics)
+        .all(|(written, real)| equivalent(written, real))
+    {
+        return false;
+    }
+    written.associated_types.iter().all(|(name, written_ty)| {
+        candidate
             .associated_types
             .iter()
-            .find(|(real_name, _)| real_name == name)
-        else {
-            return false;
-        };
-        if symbolic(written) || symbolic(real) {
-            continue;
-        }
-        if !equivalent(written, real) {
-            return false;
-        }
-    }
-    true
+            .any(|(real_name, real_ty)| real_name == name && equivalent(written_ty, real_ty))
+    })
 }
 
 /// Unqualified: search every root - a root that declares `member` directly
@@ -2109,6 +2193,7 @@ fn resolve_through_roots(
     member: &Name,
     undeclared: crate::diagnostics::AssocContainer,
     fill_defaults: bool,
+    ns: MemberNamespace,
 ) -> Determination {
     let mut declarers: Vec<baml_type::Interface> = Vec::new();
     let push = |declarers: &mut Vec<baml_type::Interface>, interface: baml_type::Interface| {
@@ -2117,31 +2202,20 @@ fn resolve_through_roots(
         }
     };
     for root in roots {
-        if interface_declares_member(db, &root.name, member) {
+        if interface_declares_member(db, &root.name, member, ns) {
             push(&mut declarers, root);
             continue;
         }
-        let root_ref = baml_type::interned::InterfaceRef::from_constraint(&root);
-        let subject = root_ref.existential();
+        let subject = root.to_ty();
         if crate::package_interface::mounted_type_row(db, &root.name).is_some() {
-            for inherited in crate::impls::direct_requires_closure(db, &root_ref, &subject, 64) {
-                if interface_declares_member(db, &inherited.name, member) {
-                    push(
-                        &mut declarers,
-                        baml_type::Interface {
-                            name: inherited.name,
-                            generics: inherited
-                                .generics
-                                .iter()
-                                .map(baml_type::interned::Ty::to_plain)
-                                .collect(),
-                            associated_types: inherited
-                                .associated_types
-                                .iter()
-                                .map(|(name, ty)| (name.clone(), ty.to_plain()))
-                                .collect(),
-                        },
-                    );
+            for inherited in crate::impls::direct_requires_closure_plain(
+                db,
+                &root,
+                &subject,
+                crate::impls::REQUIRES_CLOSURE_FUEL,
+            ) {
+                if interface_declares_member(db, &inherited.name, member, ns) {
+                    push(&mut declarers, inherited);
                 }
             }
             continue;
@@ -2156,13 +2230,16 @@ fn resolve_through_roots(
             &root.associated_types,
             fill_defaults,
         ) {
-            if !interface_declares_member_at(db, loc, member) {
+            if !interface_declares_member_at(db, loc, member, ns) {
                 continue;
             }
             let Some(qtn) = interface_loc_qtn(db, loc) else {
                 continue;
             };
-            push(&mut declarers, baml_type::Interface::new(qtn, args, assoc));
+            push(
+                &mut declarers,
+                baml_type::Interface::new(qtn, args.into(), assoc.into()),
+            );
         }
     }
     match declarers.len() {
@@ -2179,47 +2256,36 @@ fn resolve_through_roots(
 /// transitively requires, mirroring the symbolic road).
 fn determine_concrete<'db>(
     db: &'db dyn baml_compiler2_ppir::Db,
+    viewer: baml_base::SourceRoot,
     facts: &crate::facts::Facts<'db>,
     base: &Ty,
     member: &Name,
+    ns: MemberNamespace,
 ) -> Determination {
     use crate::diagnostics::AssocContainer;
     let Some(interned) = crate::impls::try_interned_ty(base) else {
         return Determination::Poisoned;
     };
     let mut declarers: Vec<baml_type::Interface> = Vec::new();
-    for resolved in crate::impls::impls_for_type(db, &interned) {
-        let view = resolved.implemented_view(db, &interned);
-        let interface = baml_type::Interface {
-            name: view.name.clone(),
-            generics: view
-                .generics
-                .iter()
-                .map(baml_type::interned::Ty::to_plain)
-                .collect(),
-            associated_types: view
-                .associated_types
-                .iter()
-                .map(|(name, ty)| (name.clone(), ty.to_plain()))
-                .collect(),
-        };
-        if interface_declares_member(db, &interface.name, member) && !declarers.contains(&interface)
+    for interface in crate::impls::impl_views_for_type(db, viewer, base) {
+        if interface_declares_member(db, &interface.name, member, ns)
+            && !declarers.contains(&interface)
         {
             declarers.push(interface);
         }
     }
     if declarers.len() > 1 {
-        let heads: Vec<baml_type::interned::InterfaceRef> = declarers
+        let heads: Vec<baml_type::interned::InferInterface> = declarers
             .iter()
             .map(|iface| {
-                baml_type::interned::InterfaceRef::new(
+                baml_type::interned::InferInterface::new(
                     iface.name.clone(),
                     iface
                         .generics
                         .iter()
                         .map(baml_type::interned::Ty::from_plain)
                         .collect(),
-                    Vec::new(),
+                    Box::new([]),
                 )
             })
             .collect();
@@ -2252,38 +2318,37 @@ fn determine_concrete<'db>(
     }
 }
 
-/// A concrete base's realized view of the WRITTEN qualifier - the impl of
-/// that interface, when the base has one.
-fn concrete_realized_interface<'db>(
-    db: &'db dyn baml_compiler2_ppir::Db,
-    facts: &crate::facts::Facts<'db>,
+/// A concrete base's view of the WRITTEN qualifier, proven — not selected.
+///
+/// The qualifier is a GOAL for the impl oracle: `resolve_impl` matches it
+/// with rustc's placeholder discipline, so a rigid type variable in a written
+/// argument unifies only with an impl's own parameter (a blanket
+/// `implements<U> Conv<U> for Multi` proves `(Multi as Conv<T>)`), never with
+/// ground structure (`implements Conv<int> for Multi` does NOT prove it — the
+/// claim must hold for every possible `T`). Written associated-type pins are
+/// enforced by the same match, fail-closed.
+///
+/// The returned interface carries the WRITTEN generics — symbolic arguments
+/// stay symbolic, ride the instantiation frame as their `TypeArgRef` slots,
+/// and resolve per realized argument at runtime, exactly as a typevar `Self`
+/// does — plus the impl's realization of the associated types the qualifier
+/// left unwritten.
+fn concrete_realized_interface(
+    db: &dyn baml_compiler2_ppir::Db,
     base: &Ty,
     qualifier: &baml_type::Interface,
 ) -> Option<baml_type::Interface> {
     let interned = crate::impls::try_interned_ty(base)?;
-    for resolved in crate::impls::impls_for_type(db, &interned) {
-        let view = resolved.implemented_view(db, &interned);
-        if view.name != qualifier.name {
-            continue;
-        }
-        let realized = baml_type::Interface {
-            name: view.name.clone(),
-            generics: view
-                .generics
-                .iter()
-                .map(baml_type::interned::Ty::to_plain)
-                .collect(),
-            associated_types: view
-                .associated_types
-                .iter()
-                .map(|(name, ty)| (name.clone(), ty.to_plain()))
-                .collect(),
-        };
-        if qualifier_compatible_with_realization(facts, qualifier, &realized) {
-            return Some(realized);
-        }
-    }
-    None
+    let goal = baml_type::interned::InferInterface::from_constraint(qualifier);
+    let resolved = crate::impls::resolve_impl(db, &interned, &goal)?;
+    let view = resolved.implemented_view(db, &interned);
+    let view = baml_type::Interface::try_from(&view)
+        .unwrap_or_else(|_| unreachable!("realized view of a closed base is closed"));
+    Some(baml_type::Interface {
+        name: view.name,
+        generics: qualifier.generics.clone(),
+        associated_types: view.associated_types,
+    })
 }
 
 /// Expand a top-level alias chain, bounded against cycles.
@@ -2301,39 +2366,138 @@ fn projection_expand_aliases(facts: &crate::facts::Facts<'_>, mut ty: Ty) -> Ty 
     ty
 }
 
-pub(crate) fn interface_declares_member(
+/// Whether `qtn` declares `member` in `ns` — [`interface_declared_kind`]
+/// collapsed to a `bool`, for callers that only need existence.
+pub fn interface_declares_member(
     db: &dyn baml_compiler2_ppir::Db,
-    qtn: &QualifiedTypeName,
+    qtn: &DeclName,
     member: &Name,
+    ns: MemberNamespace,
 ) -> bool {
-    if let Some(crate::package_interface::ExportedType::Interface {
-        associated_types, ..
-    }) = crate::package_interface::mounted_type_row(db, qtn)
+    if let Some(row @ crate::package_interface::ExportedType::Interface { .. }) =
+        crate::package_interface::mounted_type_row(db, qtn)
     {
-        return associated_types.iter().any(|assoc| assoc.name == *member);
+        return mounted_declares_member(row, member, ns);
     }
     projection_interface_loc(db, qtn)
-        .is_some_and(|loc| interface_declares_member_at(db, loc, member))
+        .is_some_and(|loc| interface_declares_member_at(db, loc, member, ns))
 }
 
 fn interface_declares_member_at(
     db: &dyn baml_compiler2_ppir::Db,
     loc: baml_compiler2_hir::loc::InterfaceLoc<'_>,
     member: &Name,
+    ns: MemberNamespace,
 ) -> bool {
-    baml_compiler2_ppir::item_data::interface_data(db, loc)
-        .associated_types
+    let data = baml_compiler2_ppir::item_data::interface_data(db, loc);
+    match ns {
+        MemberNamespace::Type => data
+            .associated_types
+            .iter()
+            .any(|assoc| &assoc.name == member),
+        MemberNamespace::Value => source_declared_value_kind(db, data, member).is_some(),
+    }
+}
+
+/// The value-namespace kind an interface declares `name` as, reading a
+/// SOURCE interface's span-free data. Fields win the tie because a field and
+/// a method cannot share a name (the HIR rejects that at declaration), so the
+/// order is a formality that keeps the scan single-pass.
+fn source_declared_value_kind(
+    db: &dyn baml_compiler2_ppir::Db,
+    data: &baml_compiler2_ppir::item_data::InterfaceData<'_>,
+    name: &Name,
+) -> Option<ValueMemberKind> {
+    if data.fields.iter().any(|field| field.name == *name) {
+        return Some(ValueMemberKind::Field);
+    }
+    data.methods
         .iter()
-        .any(|assoc| &assoc.name == member)
+        .any(|&method| baml_compiler2_ppir::item_data::function_data(db, method).name == *name)
+        .then_some(ValueMemberKind::Method)
+}
+
+/// The same question against a MOUNTED package row, which splits what source
+/// keeps in one `methods` list into required and defaulted halves.
+fn mounted_declares_member(
+    row: &crate::package_interface::ExportedType,
+    member: &Name,
+    ns: MemberNamespace,
+) -> bool {
+    mounted_declared_kind(row, member, ns).is_some()
+}
+
+/// The mounted-row twin of [`source_declared_value_kind`], generalized over
+/// both namespaces so [`interface_declared_kind`] can answer either from one
+/// row lookup. Returns `None` for a non-interface row.
+fn mounted_declared_kind(
+    row: &crate::package_interface::ExportedType,
+    member: &Name,
+    ns: MemberNamespace,
+) -> Option<InterfaceMemberKind> {
+    let crate::package_interface::ExportedType::Interface {
+        associated_types,
+        fields,
+        required_methods,
+        default_methods,
+        ..
+    } = row
+    else {
+        return None;
+    };
+    match ns {
+        MemberNamespace::Type => associated_types
+            .iter()
+            .any(|assoc| assoc.name == *member)
+            .then_some(InterfaceMemberKind::AssociatedType),
+        MemberNamespace::Value => {
+            if fields.iter().any(|(field, ..)| field == member) {
+                return Some(InterfaceMemberKind::Value(ValueMemberKind::Field));
+            }
+            required_methods
+                .iter()
+                .chain(default_methods)
+                .any(|method| method.name == *member)
+                .then_some(InterfaceMemberKind::Value(ValueMemberKind::Method))
+        }
+    }
+}
+
+/// What `qtn` declares under `name` in `ns`, mounted rows and source alike -
+/// the one declaration oracle both namespaces read. [`interface_declares_member`]
+/// is this collapsed to a `bool`; callers that must tell a field from a method
+/// (a virtual field read dispatches differently from a call, and the ambiguity
+/// diagnostics word themselves differently) ask here instead.
+pub fn interface_declared_kind(
+    db: &dyn baml_compiler2_ppir::Db,
+    qtn: &DeclName,
+    name: &Name,
+    ns: MemberNamespace,
+) -> Option<InterfaceMemberKind> {
+    if let Some(row @ crate::package_interface::ExportedType::Interface { .. }) =
+        crate::package_interface::mounted_type_row(db, qtn)
+    {
+        return mounted_declared_kind(row, name, ns);
+    }
+    let loc = projection_interface_loc(db, qtn)?;
+    let data = baml_compiler2_ppir::item_data::interface_data(db, loc);
+    match ns {
+        MemberNamespace::Type => data
+            .associated_types
+            .iter()
+            .any(|assoc| &assoc.name == name)
+            .then_some(InterfaceMemberKind::AssociatedType),
+        MemberNamespace::Value => {
+            source_declared_value_kind(db, data, name).map(InterfaceMemberKind::Value)
+        }
+    }
 }
 
 fn projection_interface_loc<'db>(
     db: &'db dyn baml_compiler2_ppir::Db,
-    qtn: &QualifiedTypeName,
+    qtn: &DeclName,
 ) -> Option<baml_compiler2_hir::loc::InterfaceLoc<'db>> {
-    let pkg_id = PackageId::new(db, qtn.package().clone());
-    let pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
-    match pkg_items.lookup_type(qtn.namespace(), qtn.name())? {
+    match crate::facts::definition_of(db, qtn)? {
         Definition::Interface(loc) => Some(loc),
         _ => None,
     }
@@ -2347,10 +2511,10 @@ pub fn interface_base_without_member_pin(
     db: &dyn baml_compiler2_ppir::Db,
     base_ty: &Ty,
     member: &Name,
-) -> Option<QualifiedTypeName> {
+) -> Option<DeclName> {
     use baml_type::normalize::TypeContext as _;
     let facts = crate::facts::Facts::new(db);
-    let mut seen: FxHashSet<QualifiedTypeName> = FxHashSet::default();
+    let mut seen: FxHashSet<DeclName> = FxHashSet::default();
     let mut current = base_ty.clone();
     loop {
         match current {
@@ -2372,8 +2536,8 @@ pub fn interface_base_without_member_pin(
 mod tests {
     use super::*;
 
-    fn qtn(namespace: &[&str], name: &str) -> QualifiedTypeName {
-        QualifiedTypeName::new(
+    fn qtn(namespace: &[&str], name: &str) -> DeclName {
+        crate::test_heads::new(
             Name::new("user"),
             namespace.iter().map(|part| Name::new(*part)).collect(),
             Name::new(name),
@@ -2381,11 +2545,11 @@ mod tests {
     }
 
     fn class(namespace: &[&str], name: &str, args: Vec<Ty>) -> Ty {
-        Ty::Class(qtn(namespace, name), args, TyAttr::default())
+        Ty::Class(qtn(namespace, name), args.into(), TyAttr::default())
     }
 
     fn interface(name: &str, args: Vec<Ty>) -> Ty {
-        Ty::Interface(qtn(&[], name), args, vec![], TyAttr::default())
+        Ty::Interface(qtn(&[], name), args.into(), Box::new([]), TyAttr::default())
     }
 
     fn int() -> Ty {
@@ -2419,7 +2583,7 @@ mod tests {
             match_ty_patterns(
                 &[(&pattern, &good)],
                 &params,
-                &std::collections::HashMap::default()
+                &crate::test_heads::no_aliases()
             )
             .is_some()
         );
@@ -2427,7 +2591,7 @@ mod tests {
             match_ty_patterns(
                 &[(&pattern, &bad)],
                 &params,
-                &std::collections::HashMap::default()
+                &crate::test_heads::no_aliases()
             )
             .is_none()
         );
@@ -2438,14 +2602,24 @@ mod tests {
         let side = Ty::Enum(qtn(&[], "Side"), TyAttr::default());
         let side_left = Ty::EnumVariant(qtn(&[], "Side"), Name::new("Left"), TyAttr::default());
         let other = Ty::EnumVariant(qtn(&[], "Coin"), Name::new("Heads"), TyAttr::default());
-        let aliases = std::collections::HashMap::default();
+        let aliases: std::collections::HashMap<DeclName, Ty> = std::collections::HashMap::default();
 
         assert!(
-            match_ty_patterns(&[(&side, &side_left)], &[], &aliases).is_some(),
+            match_ty_patterns(
+                &[(&side, &side_left)],
+                &[],
+                &crate::test_heads::alias_ctx(&aliases)
+            )
+            .is_some(),
             "`Side.Left` should match a `for Side` pattern",
         );
         assert!(
-            match_ty_patterns(&[(&side, &other)], &[], &aliases).is_none(),
+            match_ty_patterns(
+                &[(&side, &other)],
+                &[],
+                &crate::test_heads::alias_ctx(&aliases)
+            )
+            .is_none(),
             "a variant of a *different* enum must not match",
         );
     }
@@ -2465,7 +2639,7 @@ mod tests {
         let bindings = match_ty_patterns(
             &[(&pattern, &actual)],
             &params,
-            &std::collections::HashMap::default(),
+            &crate::test_heads::no_aliases(),
         )
         .expect("nested list arg should bind T");
         assert_eq!(bindings.get(&param("T")), Some(&int()));
@@ -2475,11 +2649,11 @@ mod tests {
     fn contains_bound_typevar_checks_interface_associated_bindings() {
         let ty = Ty::Interface(
             qtn(&[], "Source"),
-            vec![],
-            vec![(
+            Box::new([]),
+            Box::new([(
                 Name::new("Item"),
                 Ty::List(Box::new(type_var("T")), TyAttr::default()),
-            )],
+            )]),
             TyAttr::default(),
         );
 
@@ -2496,7 +2670,7 @@ mod tests {
             match_ty_patterns(
                 &[(&pattern, &same_short_name)],
                 &[],
-                &std::collections::HashMap::default()
+                &crate::test_heads::no_aliases()
             )
             .is_none(),
             "same short name in different namespaces must not match"
@@ -2505,14 +2679,14 @@ mod tests {
 
     #[test]
     fn match_ty_pattern_unions_are_order_insensitive_with_bindings() {
-        let pattern = Ty::Union(vec![type_var("T"), string()], TyAttr::default());
-        let actual = Ty::Union(vec![string(), int()], TyAttr::default());
+        let pattern = Ty::Union(Box::new([type_var("T"), string()]), TyAttr::default());
+        let actual = Ty::Union(Box::new([string(), int()]), TyAttr::default());
         let params = vec![param("T")];
 
         let bindings = match_ty_patterns(
             &[(&pattern, &actual)],
             &params,
-            &std::collections::HashMap::default(),
+            &crate::test_heads::no_aliases(),
         )
         .expect("union members should be matched by type, not position");
         assert_eq!(bindings.get(&param("T")), Some(&int()));

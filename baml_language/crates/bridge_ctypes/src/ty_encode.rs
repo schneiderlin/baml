@@ -274,9 +274,7 @@ fn runtime_ty_to_variant(ty: &RuntimeTy) -> TyVariant {
         }
         RuntimeTy::Void { .. } => TyVariant::Void(crate::baml_bridge::cffi::BamlTyVoid {}),
         RuntimeTy::Never { .. } => TyVariant::Never(crate::baml_bridge::cffi::BamlTyNever {}),
-        RuntimeTy::BuiltinUnknown { .. } => {
-            TyVariant::Unknown(crate::baml_bridge::cffi::BamlTyUnknown {})
-        }
+        RuntimeTy::Unknown { .. } => TyVariant::Unknown(crate::baml_bridge::cffi::BamlTyUnknown {}),
     }
 }
 
@@ -376,8 +374,8 @@ mod tests {
         // Interface existential with generic args + an associated binding.
         assert_roundtrip(&RuntimeTy::Interface(
             TypeName::from_dotted_path("user.Iterator"),
-            vec![RuntimeTy::int()],
-            vec![(Name::new("Item"), RuntimeTy::string())],
+            Box::new([RuntimeTy::int()]),
+            Box::new([(Name::new("Item"), RuntimeTy::string())]),
             TyAttr::default(),
         ));
         // Projection carrying a full interface constraint (encoded as a
@@ -386,8 +384,8 @@ mod tests {
             base: Box::new(RuntimeTy::int()),
             interface: Box::new(RuntimeInterface {
                 name: TypeName::from_dotted_path("user.Iterator"),
-                generics: vec![RuntimeTy::int()],
-                associated_types: vec![(Name::new("Item"), RuntimeTy::string())],
+                generics: Box::new([RuntimeTy::int()]),
+                associated_types: Box::new([(Name::new("Item"), RuntimeTy::string())]),
             }),
             member: Name::new("Item"),
             attr: TyAttr::default(),
@@ -397,8 +395,8 @@ mod tests {
             base: Box::new(RuntimeTy::string()),
             interface: Box::new(RuntimeInterface {
                 name: TypeName::from_dotted_path("user.HasOutput"),
-                generics: vec![],
-                associated_types: vec![],
+                generics: Box::new([]),
+                associated_types: Box::new([]),
             }),
             member: Name::new("Output"),
             attr: TyAttr::default(),
@@ -408,7 +406,7 @@ mod tests {
     #[test]
     fn roundtrip_function() {
         assert_roundtrip(&RuntimeTy::Function {
-            params: vec![],
+            params: Box::new([]),
             ret: Box::new(RuntimeTy::int()),
             throws: Box::new(RuntimeTy::Never {
                 attr: TyAttr::default(),

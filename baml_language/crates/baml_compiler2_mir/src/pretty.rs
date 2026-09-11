@@ -29,14 +29,14 @@ use crate::{
 };
 
 /// Pretty print a MIR function.
-pub fn display_function(func: &MirFunction) -> String {
+pub fn display_function(func: &MirFunction<'_>) -> String {
     let mut output = String::new();
     let _ = write_function(&mut output, func);
     output
 }
 
 /// Write a MIR function to a formatter.
-pub fn write_function(f: &mut impl Write, func: &MirFunction) -> fmt::Result {
+pub fn write_function(f: &mut impl Write, func: &MirFunction<'_>) -> fmt::Result {
     match &func.kind {
         MirFunctionKind::Builtin(kind) => {
             let kind_str = match kind {
@@ -54,8 +54,8 @@ pub fn write_function(f: &mut impl Write, func: &MirFunction) -> fmt::Result {
 /// Write the bytecode body of a MIR function.
 fn write_bytecode_function(
     f: &mut impl Write,
-    func: &MirFunction,
-    body: &MirFunctionBody,
+    func: &MirFunction<'_>,
+    body: &MirFunctionBody<'_>,
 ) -> fmt::Result {
     // Function header
     write!(f, "fn {}(", func.item_ref)?;
@@ -129,7 +129,7 @@ fn write_local_decl_inline(f: &mut impl Write, id: Local, decl: &LocalDecl) -> f
     }
 }
 
-fn write_block(f: &mut impl Write, block: &BasicBlock) -> fmt::Result {
+fn write_block(f: &mut impl Write, block: &BasicBlock<'_>) -> fmt::Result {
     writeln!(f, "    {}: {{", block.id)?;
 
     for stmt in &block.statements {
@@ -150,7 +150,7 @@ fn write_block(f: &mut impl Write, block: &BasicBlock) -> fmt::Result {
     Ok(())
 }
 
-fn write_statement(f: &mut impl Write, stmt: &Statement) -> fmt::Result {
+fn write_statement(f: &mut impl Write, stmt: &Statement<'_>) -> fmt::Result {
     match &stmt.kind {
         StatementKind::Assign { destination, value } => {
             write!(f, "{destination} = ")?;
@@ -172,12 +172,6 @@ fn write_statement(f: &mut impl Write, stmt: &Statement) -> fmt::Result {
         StatementKind::Drop(place) => {
             write!(f, "drop({place});")
         }
-        StatementKind::VizEnter(idx) => {
-            write!(f, "viz_enter({idx});")
-        }
-        StatementKind::VizExit(idx) => {
-            write!(f, "viz_exit({idx});")
-        }
         StatementKind::FreshCell(local) => {
             write!(f, "fresh_cell({local});")
         }
@@ -187,7 +181,14 @@ fn write_statement(f: &mut impl Write, stmt: &Statement) -> fmt::Result {
                 IntrinsicOp::Log(LogLevel::Debug) => "log_debug",
                 IntrinsicOp::Log(LogLevel::Warn) => "log_warn",
                 IntrinsicOp::Log(LogLevel::Error) => "log_error",
-                IntrinsicOp::BindType(slot) => return write!(f, "bind_type({slot}, {args:?});"),
+                IntrinsicOp::BindType(slot) => {
+                    write!(f, "bind_type({slot}")?;
+                    for arg in args {
+                        write!(f, ", ")?;
+                        write_operand(f, arg)?;
+                    }
+                    return write!(f, ");");
+                }
             };
             write!(f, "intrinsic {op_str}(")?;
             for (i, arg) in args.iter().enumerate() {
@@ -204,7 +205,7 @@ fn write_statement(f: &mut impl Write, stmt: &Statement) -> fmt::Result {
     }
 }
 
-fn write_terminator(f: &mut impl Write, term: &Terminator) -> fmt::Result {
+fn write_terminator(f: &mut impl Write, term: &Terminator<'_>) -> fmt::Result {
     match term {
         Terminator::Goto { target } => {
             write!(f, "goto -> {target};")
@@ -267,7 +268,6 @@ fn write_terminator(f: &mut impl Write, term: &Terminator) -> fmt::Result {
             args,
             ntypeargs,
             runtime_id,
-            runtime_type_check,
             destination,
             target,
             unwind,
@@ -295,9 +295,6 @@ fn write_terminator(f: &mut impl Write, term: &Terminator) -> fmt::Result {
                 wrote_arg = true;
             }
             write_runtime_id_arg(f, wrote_arg, runtime_id.as_ref())?;
-            if *runtime_type_check {
-                write!(f, "; runtime_type_check")?;
-            }
             write!(f, ") -> [{target}")?;
             if let Some(u) = unwind {
                 write!(f, ", unwind: {u}")?;
@@ -310,7 +307,6 @@ fn write_terminator(f: &mut impl Write, term: &Terminator) -> fmt::Result {
             args,
             ntypeargs,
             runtime_id,
-            runtime_type_check,
             destination,
             target,
             unwind,
@@ -337,9 +333,6 @@ fn write_terminator(f: &mut impl Write, term: &Terminator) -> fmt::Result {
                 wrote_arg = true;
             }
             write_runtime_id_arg(f, wrote_arg, runtime_id.as_ref())?;
-            if *runtime_type_check {
-                write!(f, "; runtime_type_check")?;
-            }
             write!(f, ") -> [{target}")?;
             if let Some(u) = unwind {
                 write!(f, ", unwind: {u}")?;
@@ -440,12 +433,16 @@ fn write_terminator(f: &mut impl Write, term: &Terminator) -> fmt::Result {
         }
         Terminator::ShortCircuit {
             operand,
-            is_and,
+            kind,
             destination,
             eval_rhs,
             join,
         } => {
-            let op = if *is_and { "&&" } else { "||" };
+            let op = match kind {
+                crate::ShortCircuitKind::And => "&&",
+                crate::ShortCircuitKind::Or => "||",
+                crate::ShortCircuitKind::Coalesce => "??",
+            };
             write!(f, "{destination} = short_circuit({op}) ")?;
             write_operand(f, operand)?;
             write!(f, " -> [eval: {eval_rhs}, join: {join}];")
@@ -456,7 +453,7 @@ fn write_terminator(f: &mut impl Write, term: &Terminator) -> fmt::Result {
 fn write_runtime_id_arg(
     f: &mut impl Write,
     wrote_arg: bool,
-    runtime_id: Option<&Operand>,
+    runtime_id: Option<&Operand<'_>>,
 ) -> fmt::Result {
     if let Some(runtime_id) = runtime_id {
         if wrote_arg {
@@ -468,7 +465,7 @@ fn write_runtime_id_arg(
     Ok(())
 }
 
-fn write_rvalue(f: &mut impl Write, rvalue: &Rvalue) -> fmt::Result {
+fn write_rvalue(f: &mut impl Write, rvalue: &Rvalue<'_>) -> fmt::Result {
     match rvalue {
         Rvalue::Use(operand) => write_operand(f, operand),
         Rvalue::VirtualFieldAccess {
@@ -568,16 +565,6 @@ fn write_rvalue(f: &mut impl Write, rvalue: &Rvalue) -> fmt::Result {
             write_operand(f, operand)?;
             write!(f, ", {})", type_tag_name(*tag))
         }
-        Rvalue::RuntimeIsType {
-            operand,
-            type_value,
-        } => {
-            write!(f, "runtime_is_type(")?;
-            write_operand(f, operand)?;
-            write!(f, ", ")?;
-            write_operand(f, type_value)?;
-            write!(f, ")")
-        }
         Rvalue::MakeClosure {
             lambda_idx,
             captures,
@@ -614,6 +601,25 @@ fn write_rvalue(f: &mut impl Write, rvalue: &Rvalue) -> fmt::Result {
             write!(f, "(")?;
             write_operand(f, receiver)?;
             write!(f, ")")
+        }
+        Rvalue::MakeVirtualFunction {
+            self_ty,
+            iface,
+            method,
+            type_args,
+        } => {
+            write!(f, "make_virtual_function ({self_ty} as {iface:?}).{method}")?;
+            if !type_args.is_empty() {
+                write!(f, "<")?;
+                for (index, arg) in type_args.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write_operand(f, arg)?;
+                }
+                write!(f, ">")?;
+            }
+            Ok(())
         }
         Rvalue::LoadType(template) => {
             write!(f, "load_type({template})")
@@ -665,7 +671,7 @@ fn type_tag_name(tag: i64) -> std::borrow::Cow<'static, str> {
     })
 }
 
-fn write_operand(f: &mut impl Write, operand: &Operand) -> fmt::Result {
+fn write_operand(f: &mut impl Write, operand: &Operand<'_>) -> fmt::Result {
     match operand {
         Operand::Copy(place) => write!(f, "copy {place}"),
         Operand::Move(place) => write!(f, "move {place}"),
@@ -673,7 +679,7 @@ fn write_operand(f: &mut impl Write, operand: &Operand) -> fmt::Result {
     }
 }
 
-fn write_constant(f: &mut impl Write, constant: &Constant) -> fmt::Result {
+fn write_constant(f: &mut impl Write, constant: &Constant<'_>) -> fmt::Result {
     match constant {
         Constant::Int(n) => write!(f, "const {n}_i64"),
         Constant::Bigint(n) => write!(f, "const {n}n"),
@@ -696,7 +702,7 @@ fn write_constant(f: &mut impl Write, constant: &Constant) -> fmt::Result {
 // Display implementations
 // ============================================================================
 
-impl fmt::Display for MirFunction {
+impl fmt::Display for MirFunction<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Use a String buffer since fmt::Formatter doesn't implement Write
         let mut buf = String::new();
@@ -710,13 +716,13 @@ mod tests {
     use super::*;
     use crate::{BlockId, Place};
 
-    fn render_terminator(terminator: &Terminator) -> String {
+    fn render_terminator(terminator: &Terminator<'_>) -> String {
         let mut output = String::new();
         write_terminator(&mut output, terminator).expect("terminator renders");
         output
     }
 
-    fn local_copy(local: usize) -> Operand {
+    fn local_copy(local: usize) -> Operand<'static> {
         Operand::copy_local(Local(local))
     }
 
@@ -725,8 +731,8 @@ mod tests {
         let terminator = Terminator::Call {
             callee: local_copy(1),
             args: Vec::new(),
+            argument_layout: None,
             ntypeargs: 0,
-            runtime_type_check: false,
             runtime_id: Some(local_copy(9)),
             destination: Place::local(Local(0)),
             target: BlockId(1),
@@ -742,15 +748,15 @@ mod tests {
     #[test]
     fn virtual_call_runtime_id_without_visible_args_has_no_leading_comma() {
         let terminator = Terminator::VirtualCall {
+            argument_layout: None,
             iface: baml_type::TyTemplateInterface::new(
                 baml_type::TypeName::from_dotted_path("baml.ops.Equals"),
-                Vec::new(),
-                Vec::new(),
+                Box::new([]),
+                Box::new([]),
             ),
             method: "eq".to_string(),
             args: Vec::new(),
             ntypeargs: 0,
-            runtime_type_check: false,
             runtime_id: Some(local_copy(9)),
             destination: Place::local(Local(0)),
             target: BlockId(1),

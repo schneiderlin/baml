@@ -101,7 +101,7 @@ function env_ref_api_key_reaches_the_wire() -> string {
                 api_key = env.HOME,
                 base_url = mock.base_url(),
             );
-            let result = ai.Agent<string>.new(client = cl).run(EnvRefEcho@spec("Say pong."));
+            let result = ai.Agent.new(client = cl).run(EnvRefEcho@spec("Say pong."));
             `${result.value}|${mock.last_request().header("authorization") ?? "<absent>"}`
         },
     )
@@ -126,7 +126,7 @@ function plain_string_api_key_still_works() -> string {
                 api_key = "test-key",
                 base_url = mock.base_url(),
             );
-            let result = ai.Agent<string>.new(client = cl).run(EnvRefEcho@spec("Say pong."));
+            let result = ai.Agent.new(client = cl).run(EnvRefEcho@spec("Say pong."));
             `${result.value}|${mock.last_request().header("authorization") ?? "<absent>"}`
         },
     )
@@ -164,7 +164,7 @@ function env_ref_base_url_resolves_at_request_time() -> string {
                 api_key = "test-key",
                 base_url = mock.base_url(),
             );
-            let result = ai.Agent<string>.new(client = cl).run(EnvRefEcho@spec("Say pong."));
+            let result = ai.Agent.new(client = cl).run(EnvRefEcho@spec("Say pong."));
             `${fell_through}|${result.value}|${mock.last_request().path()}`
         },
     )
@@ -331,8 +331,8 @@ function explicit_credential_wins_per_client_family() -> string {
         openai.OpenRouterClient.new(model = "m", api_key = "sk-explicit").resolved_api_key() ?? "<null>",
         openai.OllamaClient.new(model = "m", api_key = "sk-explicit").resolved_api_key() ?? "<null>",
         openai.GenericClient.new(model = "m", api_key = "sk-explicit").resolved_api_key() ?? "<null>",
-        anthropic.AnthropicClient.new(model = "m", api_key = "sk-explicit").resolved_api_key(),
-        google.GoogleClient.new(model = "m", api_key = "sk-explicit").resolved_api_key(),
+        anthropic.Client.new(model = "m", api_key = "sk-explicit").resolved_api_key(),
+        google.GeminiClient.new(model = "m", api_key = "sk-explicit").resolved_api_key(),
         google.VertexClient.new(model = "m", api_key = "sk-explicit").resolved_api_key() ?? "<null>",
         vercel.AiGatewayImageClient.new(model = "m", api_key = "sk-explicit").resolved_api_key(),
     ].join("|")
@@ -419,7 +419,7 @@ test "resolve_without_a_slash_is_typed" {
 // typed, CATCHABLE failure naming the variable — not a panic that escapes the
 // caller's catch_all.
 function resolve_of_a_ref_reads_at_call_time() -> string {
-    let selector: ai.ClientSelector = env.BAML_TEST_ENV_REF_UNSET_CLIENT;
+    let selector: ai.Selector = env.BAML_TEST_ENV_REF_UNSET_CLIENT;
     ai.clients.resolve(selector).id() catch (e) {
         ai.errors.InvalidRequest => e.detail,
     }
@@ -452,7 +452,7 @@ function dynamic_client_selector_runs_against_the_mock() -> string {
                 base_url = mock.base_url(),
             );
             let spec = EnvRefDynamicEcho@spec("Say pong.");
-            let result = ai.Agent<string>.new(client = cl).run(spec);
+            let result = ai.Agent.new(client = cl).run(spec);
             `${spec.default_client.id()}|${result.value}`
         },
     )
@@ -473,7 +473,7 @@ function explicit_resolve_selector_runs_against_the_mock() -> string {
                 base_url = mock.base_url(),
             );
             let spec = EnvRefResolvedEcho@spec("Say pong.");
-            let result = ai.Agent<string>.new(client = cl).run(spec);
+            let result = ai.Agent.new(client = cl).run(spec);
             `${spec.default_client.id()}|${result.value}`
         },
     )

@@ -7,14 +7,15 @@
 
 use std::{path::Path, sync::Arc};
 
-use baml_compiler2_emit::{CompileOptions, OptLevel, generate_project_bytecode_with_opt};
-use baml_project::ProjectDatabase;
+use baml_compiler2_emit::{OptLevel, generate_project_bytecode_with_opt};
+use baml_db::ProjectDatabase;
+use baml_tests::engine::TestDbExt;
 use bex_engine::{BexEngine, BexExternalValue, FunctionCallContextBuilder};
 use divan::{Bencher, black_box};
 use sys_native::{CallId, SysOpsExt};
 
 const OUTER_SOURCE: &str = r####"
-function package_compile_cold() -> int throws unknown {
+function package_compile_cold() -> int {
   let package = reflect.Package.compile({
     "schema.baml": "class ColdSchema { name string count int }"
   })
@@ -33,8 +34,8 @@ function static_stdlib_dispatch(n: int) -> int throws never {
   compare_hot<int>(7, n)
 }
 
-function runtime_stdlib_dispatch(n: int) -> int throws unknown {
-  let package = reflect.Package.compile({ "dispatch.baml": #"
+function runtime_stdlib_dispatch(n: int) -> int {
+  let package = reflect.Package.compile({ "dispatch.baml": `
 function compare_hot<T extends baml.ops.Compare>(value: T, n: int) -> int throws never {
   let count = 0
   for (let i = 0; i < n; i += 1) {
@@ -43,7 +44,7 @@ function compare_hot<T extends baml.ops.Compare>(value: T, n: int) -> int throws
   count
 }
 function run(n: int) -> int throws never { compare_hot<int>(7, n) }
-"# })
+` })
   let run = package.get_function<(int) -> int>("root.run") ?? throw "missing run"
   run(n)
 }
@@ -67,16 +68,10 @@ fn main() {
 
 fn engine() -> Arc<BexEngine> {
     let mut db = ProjectDatabase::new();
-    db.set_project_root(Path::new("."));
-    db.add_file("package_compile_bench.baml", OUTER_SOURCE);
-    let program = generate_project_bytecode_with_opt(
-        &db,
-        &CompileOptions {
-            emit_test_cases: false,
-        },
-        OptLevel::One,
-    )
-    .expect("compile Package.compile benchmark host");
+    let package = db.workspace(Path::new("."));
+    db.file("package_compile_bench.baml", OUTER_SOURCE);
+    let program = generate_project_bytecode_with_opt(&db, package, OptLevel::One)
+        .expect("compile Package.compile benchmark host");
     Arc::new(
         BexEngine::new_with_runtime_compiler(
             program,

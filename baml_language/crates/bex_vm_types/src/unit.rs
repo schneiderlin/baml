@@ -16,11 +16,10 @@
 //! local operands through the existing `relink` operand walkers.
 //!
 use baml_base::Name;
-use baml_type::{RealizedTy, RuntimeTy, TyTemplate};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    Object, TestCase,
+    Object, RealizedTy, TyTemplate,
     types::{InterfaceBound, LocalName},
 };
 
@@ -95,6 +94,8 @@ pub enum LocalRef {
     Enum(u32),
     /// Offset into the unit's `interfaces` bucket.
     Interface(u32),
+    /// Offset into the unit's `type_alias_objects` bucket.
+    TypeAlias(u32),
     /// Offset into the unit's `code` bucket (functions, lambdas, interned
     /// literals, local generic-fns).
     Code(u32),
@@ -132,20 +133,27 @@ pub struct ProgramPackageFrag {
     pub interfaces: Vec<(LocalName, String)>,
     /// Local exported free-function name to its fully-qualified symbol.
     pub functions: Vec<(LocalName, String)>,
-    /// Implemented-interface fully-qualified name to the impl rules declared for
-    /// it in this unit (the interface may live in a dependency package).
+    /// Implemented-interface fully-qualified name to the impl rules THIS
+    /// UNIT'S FILE declares for it (the interface may live in another file or
+    /// a dependency package). Rules ride their declaring unit — never a
+    /// package carrier — so each rule's provided-method bodies are objects in
+    /// this unit's own `code` bucket ([`ProgramMethodImplFrag::code_offset`]).
     pub impl_rules: Vec<(String, Vec<ProgramImplRuleFrag>)>,
-    /// Recursive type aliases, carried verbatim (they hold no object refs to
-    /// relocate).
-    pub recursive_type_aliases: Vec<(LocalName, RuntimeTy)>,
-    /// Whole-package enriched interface. Exactly one unit is its carrier.
+    /// Recursive type aliases defined in this unit, by fully-qualified name of
+    /// the emitted `Object::TypeAlias`. Non-recursive aliases are expanded at
+    /// lowering and never appear.
+    pub type_aliases: Vec<(LocalName, String)>,
+    /// Versioned artifact containing the whole-package enriched interface.
+    /// Exactly one unit is its carrier.
     pub interface_blob: Vec<u8>,
     /// Fully-qualified synthesized `$init_test` symbol, when present.
     pub test_init: Option<String>,
 }
 
-/// Symbolic twin of `ProgramImplRule`: `interface_head` and each method `fqn`
-/// are fully-qualified names the linker resolves to `ObjectIndex`es.
+/// Symbolic twin of `ProgramImplRule`: `interface_head` is a fully-qualified
+/// name the linker resolves to an `ObjectIndex`; each provided method
+/// references its body by `code_offset` into the declaring unit's own `code`
+/// bucket — a body has no name on any wire.
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct ProgramImplRuleFrag {
     /// Fully-qualified name of the interface this rule heads.
@@ -165,12 +173,17 @@ pub struct ProgramImplRuleFrag {
     pub field_links: Box<[u32]>,
 }
 
-/// Symbolic twin of `ProgramMethodImpl`: `fqn` is the callee function's
-/// fully-qualified name (resolved to an `ObjectIndex` at link).
+/// Symbolic twin of `ProgramMethodImpl`. Rule method tables are
+/// PROVIDED-ONLY, and a provided body is declared by the same file as its
+/// `implements` block — so the callee is always an object in the DECLARING
+/// unit's own `code` bucket, referenced by offset. An interface body has no
+/// name on any
+/// wire: an adopted interface default is not in this table at all (the
+/// resolver adopts it at dispatch through the interface's `default_fn`).
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct ProgramMethodImplFrag {
-    /// Fully-qualified name of the callee function.
-    pub fqn: String,
+    /// Offset of the callee body in the declaring unit's `code` bucket.
+    pub code_offset: u32,
     /// The callee's type-argument frame at the impl site.
     pub frame: Vec<TyTemplate>,
 }
@@ -199,6 +212,8 @@ pub struct CompilationUnit {
     pub enums: Vec<Object>,
     /// `Object::Interface` definitions.
     pub interfaces: Vec<Object>,
+    /// `Object::TypeAlias` definitions (recursive aliases only).
+    pub type_alias_objects: Vec<Object>,
     /// The pass-4 block: functions, lambdas, interned literals, and local
     /// generic-fn objects, in emit order.
     pub code: Vec<Object>,
@@ -214,8 +229,6 @@ pub struct CompilationUnit {
     // --- side-table fragments the whole-program passes consume at link ---
     /// This unit's symbolic contribution to its package's structure.
     pub package_fragment: ProgramPackageFrag,
-    /// Pass-8 compiled test cases defined in this file.
-    pub test_cases: Vec<TestCase>,
     /// `borsh(CallableThrowsFragment)` for this file. Opaque bytes
     /// because `bex_vm_types` sits below `baml_compiler2_hir_ty`, which owns the
     /// typed fragment — the same decoupling as the stdlib-interface blob. Empty

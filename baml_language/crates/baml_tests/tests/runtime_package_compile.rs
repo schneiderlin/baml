@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use baml_tests::baml_test;
 use bex_engine::{
-    BexEngine, BexExternalValue, CaptureDefaults, EngineError, FunctionCallContextBuilder,
-    value_capture::{TraceCaptureConfig, TraceCaptureProducer, TraceLogDrainReport},
+    BexEngine, BexExternalValue, EngineError, FunctionCallContextBuilder,
+    logger::{TraceLogDrainReport, TraceLogger},
 };
 use sys_native::SysOpsExt;
 
@@ -17,32 +17,34 @@ client TestClient = openai.ResponsesClient.new(
 
 function Extract<T>(document: string) -> T {
   client: TestClient
-  prompt: `Extract the document using this schema:\n${ctx.output_format}`
+  prompt: `Extract the document using this schema:\n${ctx.output_format()}`
 }
 
-function main() -> string throws unknown {
-  let source = #"
+function main() -> string {
+  let source = `
 class ExtractedRecord {
   account string
   amount int
 }
-"#
+`
   let pkg = reflect.Package.compile({ "schema.baml": source })
   let record_t = pkg.get_class("root.ExtractedRecord") ?? throw "missing ExtractedRecord"
-  let document_text = #"{"account":"AC-1","amount":42}"#
-  let record = Extract$parse<unreflect(record_t.as_type())>(document_text)
-  json.encode(record)
+  let document_text = `{"account":"AC-1","amount":42}`
+  type Record = unreflect(record_t.as_type())
+  let record = Extract@parse<Record>(document_text)
+  json.to_string(record)
 }
 
-function rendered_schema() -> string throws unknown {
+function rendered_schema() -> string {
   let pkg = reflect.Package.compile({
     "schema.baml": "class ExtractedRecord { account string amount int }"
   })
   let record_t = pkg.get_class("root.ExtractedRecord") ?? throw "missing ExtractedRecord"
-  Extract$render_prompt<unreflect(record_t.as_type())>("sample document").text()
+  type Record = unreflect(record_t.as_type())
+  Extract@render_prompt<Record>("sample document").text()
 }
 
-function mint_properties() -> bool throws unknown {
+function declaration_identity_properties() -> bool {
   let files = { "schema.baml": "class ExtractedRecord { account string amount int }" }
   let first = reflect.Package.compile(files)
   let second = reflect.Package.compile(files)
@@ -52,7 +54,7 @@ function mint_properties() -> bool throws unknown {
   a.as_type() == a_again.as_type() && a.as_type() != b.as_type()
 }
 
-function package_survives_gc() -> bool throws unknown {
+function package_survives_gc() -> bool {
   let pkg = reflect.Package.compile({
     "schema.baml": "class ExtractedRecord { account string amount int }"
   })
@@ -62,7 +64,7 @@ function package_survives_gc() -> bool throws unknown {
   before.as_type() == after.as_type()
 }
 
-function namespace_and_dependency_mounts() -> bool throws unknown {
+function namespace_and_dependency_mounts() -> bool {
   let base = reflect.Package.compile({
     "ns_models/base.baml": "class Base { id string }"
   })
@@ -75,15 +77,15 @@ function namespace_and_dependency_mounts() -> bool throws unknown {
     child.diagnostics().length() == 0
 }
 
-function mounted_runtime_interface_and_return_types_stay_hidden() -> bool throws unknown {
+function mounted_runtime_interface_and_return_types_stay_hidden() -> bool {
   let runtime_minted = reflect.class.new("RuntimeMinted", {
-    "value": type.of<string>(),
+    "value": reflect.Type.of<string>(),
   })
   let app = reflect.Package.current().with_types({
     "RuntimeMinted": runtime_minted,
   })
   let dependency = reflect.Package.compile({
-    "dependency.baml": #"
+    "dependency.baml": `
 interface CarriesRuntimeMint {
   item app.RuntimeMinted
 }
@@ -91,7 +93,7 @@ interface CarriesRuntimeMint {
 function make_runtime_minted() -> app.RuntimeMinted {
   app.RuntimeMinted { value: "ok" }
 }
-"#
+`
   }, packages = { "app": app })
   let consumer = reflect.Package.compile(
     { "consumer.baml": "function ready() -> bool { true }" },
@@ -102,8 +104,8 @@ function make_runtime_minted() -> app.RuntimeMinted {
 "####;
 
 const SUCCESSFUL_INIT_SOURCE: &str = r####"
-function main() -> bool throws unknown {
-  let pkg = reflect.Package.compile({ "schema.baml": #"
+function main() -> bool {
+  let pkg = reflect.Package.compile({ "schema.baml": `
 client InitClient = openai.ResponsesClient.new(
     model = "unused-network-free-init-check",
     api_key = "unused",
@@ -112,7 +114,7 @@ function init_ready() -> bool {
   InitClient != null
 }
 class Ready { value string }
-"# })
+` })
   let init_ready = pkg.get_function<() -> bool>("root.init_ready")
     ?? throw "missing init_ready"
   pkg.get_class("root.Ready") != null && init_ready()
@@ -120,17 +122,173 @@ class Ready { value string }
 "####;
 
 const REJECTED_INIT_SOURCE: &str = r####"
-function main() -> null throws unknown {
-  reflect.Package.compile({ "schema.baml": #"
+function main() -> null {
+  reflect.Package.compile({ "schema.baml": `
 client InitClient = openai.ResponsesClient.new(
     model = "unused-network-free-init-check",
     api_key = "unused",
 );
 class Broken { value MissingType }
-"# })
+` })
   null
 }
 "####;
+
+/// A host contract crossing a `Package.compile` mount in every method shape:
+/// a method-bearing interface the runtime-compiled source implements, and
+/// the host's inherent, static, `implements`-block, out-of-body, and default
+/// methods called from the runtime-compiled source.
+const MOUNTED_METHODS_SOURCE: &str = r####"
+interface Describable {
+  function describe(self) -> string throws never
+  function shout(self) -> string throws never { self.describe().to_upper_case() }
+}
+
+class Host {
+  name string
+  function greet(self, punct: string) -> string throws never { "hi " + self.name + punct }
+  function make(name: string) -> Host throws never { Host { name: name } }
+  implements Describable {
+    function describe(self) -> string throws never { "host<" + self.name + ">" }
+  }
+}
+
+class Other { id int }
+implement Describable for Other {
+  function describe(self) -> string throws never { "other#" + self.id.to_string() }
+}
+
+function describe_all(items: Describable[]) -> string throws never {
+  let out = ""
+  for (let item in items) { out = out + item.describe() + ";" }
+  out
+}
+
+function compile_plugin() -> reflect.Package {
+  reflect.Package.compile(
+    { "plugin.baml": `
+class Widget { name string }
+
+implement app.Describable for Widget {
+  function describe(self) -> string throws never { "widget<" + self.name + ">" }
+}
+
+function make_widget(name: string) -> Widget throws never { Widget { name: name } }
+function call_host_inherent(h: app.Host) -> string throws never { h.greet("!") }
+function call_host_static(name: string) -> string throws never { app.Host.make(name).greet("?") }
+function call_host_impl_block(h: app.Host) -> string throws never { h.describe() }
+function call_host_default(h: app.Host) -> string throws never { h.shout() }
+function call_other_out_of_body(o: app.Other) -> string throws never { o.describe() }
+function existential(d: app.Describable) -> string throws never { d.describe() }
+function pass_through(items: app.Describable[]) -> string throws never { app.describe_all(items) }
+` },
+    packages = { "app": reflect.Package.current() },
+  )
+}
+
+function mount_is_clean() -> bool {
+  compile_plugin().diagnostics().length() == 0
+}
+
+function main() -> string {
+  let pkg = compile_plugin()
+  let make_widget = pkg.get_function<(string) -> Describable>("root.make_widget")
+    ?? throw "missing make_widget"
+  let inherent = pkg.get_function<(Host) -> string>("root.call_host_inherent")
+    ?? throw "missing call_host_inherent"
+  let static_ = pkg.get_function<(string) -> string>("root.call_host_static")
+    ?? throw "missing call_host_static"
+  let impl_block = pkg.get_function<(Host) -> string>("root.call_host_impl_block")
+    ?? throw "missing call_host_impl_block"
+  let dflt = pkg.get_function<(Host) -> string>("root.call_host_default")
+    ?? throw "missing call_host_default"
+  let out_of_body = pkg.get_function<(Other) -> string>("root.call_other_out_of_body")
+    ?? throw "missing call_other_out_of_body"
+  let existential = pkg.get_function<(Describable) -> string>("root.existential")
+    ?? throw "missing existential"
+  let pass_through = pkg.get_function<(Describable[]) -> string>("root.pass_through")
+    ?? throw "missing pass_through"
+  let w = make_widget("w1")
+  let h = Host { name: "h" }
+  let parts = [
+    w.describe(),
+    w.shout(),
+    describe_all([w, h, Other { id: 7 }]),
+    inherent(h),
+    static_("s"),
+    impl_block(h),
+    dflt(h),
+    out_of_body(Other { id: 3 }),
+    existential(w),
+    pass_through([w, h]),
+  ]
+  let out = ""
+  for (let part in parts) { out = out + part + "|" }
+  out
+}
+"####;
+
+/// A method-bearing host interface is implementable across a mount, and
+/// every host method shape is callable from the runtime-compiled source.
+#[tokio::test]
+async fn method_bearing_interface_crosses_a_mount() {
+    let output = baml_test!(baml: MOUNTED_METHODS_SOURCE);
+    assert_eq!(
+        output.result,
+        Ok(BexExternalValue::String(
+            "widget<w1>|WIDGET<W1>|widget<w1>;host<h>;other#7;|hi h!|hi s?|host<h>|HOST<H>|\
+             other#3|widget<w1>|widget<w1>;host<h>;|"
+                .into()
+        ))
+    );
+}
+
+/// The mount's link stubs spell methods inside their owner's body, so no
+/// `ns_<Type>/` stub namespace shadows the type it belongs to (E0099).
+#[tokio::test]
+async fn mounted_method_stubs_do_not_shadow_their_owner() {
+    let output = baml_test!(baml: MOUNTED_METHODS_SOURCE, entry: "mount_is_clean");
+    assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
+}
+
+/// `baml.ToString` is implemented for `reflect.Type` out-of-body in the
+/// stdlib. A runtime compile has no stdlib source to devirtualize that call
+/// against, so it must dispatch — it used to reach the emitter as a static
+/// call to an interface body it could not name and panic the compiler.
+#[tokio::test]
+async fn runtime_compiled_to_string_on_a_reflected_type_dispatches() {
+    let output = baml_test!(
+        r####"
+function main() -> string {
+  let pkg = reflect.Package.compile({ "u.baml": `
+class C {}
+function render() -> string { reflect.Type.of_value(C {}).to_string() }
+` })
+  let render = pkg.get_function<() -> string>("root.render") ?? throw "missing render"
+  render()
+}
+"####
+    );
+    assert_eq!(output.result, Ok(BexExternalValue::String("C".into())));
+}
+
+#[tokio::test]
+async fn package_finish_refuses_session_compile_artifact() {
+    let output = baml_test!(
+        r####"
+function main() -> bool {
+  let session = reflect.Session.new()
+  let artifact = session._compile<int>(`1`)
+  let rejected = false
+  let _ = reflect.Package._finish(artifact, {}) catch (_) {
+    _ => { rejected = true },
+  }
+  rejected && session.eval<int>(`2`) == 2
+}
+"####
+    );
+    assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
+}
 
 const SCENARIO_6_SOURCE: &str = r####"
 class AgentState {
@@ -147,8 +305,8 @@ function Plan(state: AgentState) -> string {
   "planned " + state.goal
 }
 
-function main() -> string throws unknown {
-  let skill_source = #"
+function main() -> string {
+  let skill_source = `
 class PlanThenAct {
   summary string
   steps string[]
@@ -161,7 +319,7 @@ function Run(state: app.AgentState) -> PlanThenAct {
     steps: [],
   }
 }
-"#
+`
   let skill = reflect.Package.compile(
     { "skill.baml": skill_source },
     packages = { "app": reflect.Package.current() },
@@ -174,14 +332,14 @@ function Run(state: app.AgentState) -> PlanThenAct {
   action.summary
 }
 
-function absent_function_is_null() -> bool throws unknown {
+function absent_function_is_null() -> bool {
   let pkg = reflect.Package.compile({
     "main.baml": "function Present(value: string) -> string { value }"
   })
   pkg.get_function<(string) -> string>("root.Missing") == null
 }
 
-function mismatched_function_contract() -> null throws unknown {
+function mismatched_function_contract() -> null {
   let pkg = reflect.Package.compile({
     "main.baml": "function Present(value: string) -> string { value }"
   })
@@ -189,53 +347,47 @@ function mismatched_function_contract() -> null throws unknown {
   null
 }
 
-function unspecialized_generic_function_cannot_be_extracted() -> null throws unknown {
+function unspecialized_generic_function_cannot_be_extracted() -> null {
   let pkg = reflect.Package.compile({
-    "main.baml": #"
-client Dummy = openai.ResponsesClient.new(
+    "main.baml": `client Dummy = openai.ResponsesClient.new(
   model = "unused-reflection-only",
   api_key = "unused",
 )
 
 function Extract<T>(document: string) -> T {
   client: Dummy
-  prompt: `Extract ${document}`
-}
-"#
+  prompt: "Extract document"
+}`
   })
   let _ = pkg.get_function<(string) -> string>("root.Extract")
   null
 }
 
-function function_listing_includes_unspecialized_generics() -> bool throws unknown {
+function function_listing_omits_unspecialized_generics() -> bool {
   let pkg = reflect.Package.compile({
-    "main.baml": #"
+    "main.baml": `
 function identity<T>(value: T) -> T { value }
 function Present(value: string) -> string { value }
-"#
+`
   })
   let functions = pkg.functions()
-  let generic = functions.get("root.identity") ?? throw "root.identity not listed"
-  let concrete = functions.get("root.Present") ?? throw "root.Present not listed"
-  generic.is_generic() && !concrete.is_generic()
+  functions.get("root.identity") == null && functions.get("root.Present") != null
 }
 
-function generic_function_companion_extraction_is_refused() -> string throws unknown {
+function generic_function_companion_extraction_is_refused() -> string {
   let pkg = reflect.Package.compile({
-    "main.baml": #"
-client Dummy = openai.ResponsesClient.new(
+    "main.baml": `client Dummy = openai.ResponsesClient.new(
   model = "unused-reflection-only",
   api_key = "unused",
 )
 
 function Extract<T>(document: string) -> T {
   client: Dummy
-  prompt: `Extract ${document}`
-}
-"#
+  prompt: "Extract document"
+}`
   })
-  let extracted = pkg.get_function<(string) -> ai.Prompt>("root.Extract$render_prompt") catch (e) {
-    baml.reflect.errors.CompilationError => {
+  let extracted = pkg.get_function<(string) -> ai.Prompt>("root.Extract@render_prompt") catch (e) {
+    reflect.errors.CompilationError => {
       return e.diagnostics[0].code
     },
     _ => return "wrong error",
@@ -246,31 +398,29 @@ function Extract<T>(document: string) -> T {
   "did not throw"
 }
 
-function generic_function_companion_is_listed() -> bool throws unknown {
+function generic_function_companion_is_listed() -> bool {
   let pkg = reflect.Package.compile({
-    "main.baml": #"
-client Dummy = openai.ResponsesClient.new(
+    "main.baml": `client Dummy = openai.ResponsesClient.new(
   model = "unused-reflection-only",
   api_key = "unused",
 )
 
 function Extract<T>(document: string) -> T {
   client: Dummy
-  prompt: `Extract ${document}`
-}
-"#
+  prompt: "Extract document"
+}`
   })
-  pkg.functions().get("root.Extract$render_prompt") != null
+  pkg.functions().get("root.Extract@render_prompt") != null
 }
 
-function alias_order_and_reserved_names() -> bool throws unknown {
+function alias_order_and_reserved_names() -> bool {
   let root_package = reflect.Package.current()
   let generated = reflect.Package.compile(
-    { "main.baml": #"
+    { "main.baml": `
 function Read(state: app.AgentState) -> string {
   app.Plan(state) + ":" + baml.Array.length(["o", "k"]).to_string()
 }
-"# },
+` },
     packages = { "z_last": root_package, "app": root_package },
   )
   let read = generated.get_function<(AgentState) -> string>("root.Read")
@@ -282,7 +432,7 @@ function Read(state: app.AgentState) -> string {
     { "main.baml": "function main() -> int { 1 }" },
     packages = { "baml": root_package },
   ) catch (e) {
-    baml.reflect.errors.CompilationError => { rejected = true },
+    reflect.errors.CompilationError => { rejected = true },
     _ => throw e,
   }
   ordered && rejected
@@ -292,7 +442,7 @@ test "enumerated package test" {
   assert.equal(1, 1)
 }
 
-function enumerated_test_runs() -> bool throws unknown {
+function enumerated_test_runs() -> bool {
   let tests = reflect.Package.current().tests()
   let run = tests.get("root::enumerated package test") ?? throw "test not enumerated"
   run()
@@ -303,7 +453,7 @@ function enumerated_test_runs() -> bool throws unknown {
 async fn run_main_with_logs(
     source: &str,
 ) -> (Result<BexExternalValue, EngineError>, TraceLogDrainReport) {
-    let program = baml_project::testing::compile_source(source);
+    let program = baml_db::testing::compile_source(source);
     let engine = Arc::new(
         BexEngine::new_with_runtime_compiler(
             program,
@@ -313,17 +463,13 @@ async fn run_main_with_logs(
         )
         .expect("runtime-package test engine"),
     );
-    let logs = TraceCaptureProducer::new(TraceCaptureConfig::logs_only(16));
+    let logs = TraceLogger::bounded(16);
     let result = engine
         .call_function(
             "user.main",
             Vec::new(),
             FunctionCallContextBuilder::new(sys_types::CallId::next())
-                .with_capture_defaults(CaptureDefaults {
-                    values_enabled: false,
-                    logs_enabled: true,
-                })
-                .with_value_capture(logs.clone())
+                .with_logger(logs.clone())
                 .build(),
             true,
         )
@@ -357,8 +503,8 @@ function compare_hot<T extends baml.ops.Compare>(value: T, n: int) -> int throws
   count
 }
 
-function main() -> bool throws unknown {
-  let package = reflect.Package.compile({ "dispatch.baml": #"
+function main() -> bool {
+  let package = reflect.Package.compile({ "dispatch.baml": `
 function compare_hot<T extends baml.ops.Compare>(value: T, n: int) -> int throws never {
   let count = 0
   for (let i = 0; i < n; i += 1) {
@@ -367,7 +513,7 @@ function compare_hot<T extends baml.ops.Compare>(value: T, n: int) -> int throws
   count
 }
 function run(n: int) -> int throws never { compare_hot<int>(7, n) }
-"# })
+` })
   let run = package.get_function<(int) -> int>("root.run") ?? throw "missing run"
   let before_gc = run(100)
   baml.sys.collect_garbage()
@@ -387,7 +533,7 @@ class User {
   age int
 }
 
-function main() -> string throws unknown {
+function main() -> string {
   let original = User { name: "Ada", age: 30 }
   let encoded = original.to_json()
   let decoded = User.from_json(encoded)
@@ -409,13 +555,13 @@ async fn render_prompt_uses_runtime_package_schema() {
 }
 
 #[tokio::test]
-async fn package_mints_are_created_once_and_compiles_are_generative() {
-    let output = baml_test!(baml: SCENARIO_SOURCE, entry: "mint_properties");
+async fn package_declarations_are_created_once_and_compiles_are_generative() {
+    let output = baml_test!(baml: SCENARIO_SOURCE, entry: "declaration_identity_properties");
     assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
 }
 
 #[tokio::test]
-async fn runtime_package_and_mint_survive_major_collection() {
+async fn runtime_package_and_declarations_survive_major_collection() {
     let output = baml_test!(baml: SCENARIO_SOURCE, entry: "package_survives_gc");
     assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
 }
@@ -458,7 +604,7 @@ async fn rejected_compile_returns_real_diagnostic_without_running_init() {
     else {
         panic!("CompilationError throw was not an instance: {value:?}")
     };
-    assert_eq!(class_name, "baml.reflect.errors.CompilationError");
+    assert_eq!(class_name, "reflect.errors.CompilationError");
     let Some(BexExternalValue::Array { items, .. }) = fields.get("diagnostics") else {
         panic!("CompilationError did not contain diagnostics: {fields:?}")
     };
@@ -513,7 +659,7 @@ async fn get_function_mismatch_throws_compiler_subtyping_diagnostic() {
     else {
         panic!("expected CompilationError instance")
     };
-    assert_eq!(class_name, "baml.reflect.errors.CompilationError");
+    assert_eq!(class_name, "reflect.errors.CompilationError");
     let Some(BexExternalValue::Array { items, .. }) = fields.get("diagnostics") else {
         panic!("missing diagnostics: {fields:?}")
     };
@@ -540,7 +686,7 @@ async fn unspecialized_generic_get_function_reports_reflection_limit() {
     else {
         panic!("expected CompilationError instance")
     };
-    assert_eq!(class_name, "baml.reflect.errors.CompilationError");
+    assert_eq!(class_name, "reflect.errors.CompilationError");
     let Some(BexExternalValue::Array { items, .. }) = fields.get("diagnostics") else {
         panic!("missing diagnostics: {fields:?}")
     };
@@ -549,20 +695,21 @@ async fn unspecialized_generic_get_function_reports_reflection_limit() {
         BexExternalValue::Instance { fields, .. }
             if fields.get("code") == Some(&BexExternalValue::String("E0165".into()))
                 && fields.get("message") == Some(&BexExternalValue::String(
-                    "generic function `root.Extract` cannot be extracted by name through reflection: look it up in `Package.functions()` and `specialize` it first".into()
+                    "generic function `root.Extract` cannot be extracted through reflection: its signature still mentions its own type parameters".into()
                 ))
     )));
 }
 
-/// #4473 dropped unspecialized generics from `functions()` — not by decision
-/// but because `function_type` returned `None` when signature reconstruction
-/// failed. They are listed now, as descriptors that report `is_generic()` and
-/// take `specialize`; the omission was the dead end this API replaces.
+/// An unspecialized generic has no realized signature, so `functions()` has
+/// no `function.Type` to list it as and it is omitted — the pre-descriptor
+/// behavior, back in force since the descriptor surface was removed. When
+/// specialization returns on the reflection kind views, listing generics
+/// (as entries that take type arguments) should return with it.
 #[tokio::test]
-async fn function_listing_includes_unspecialized_generics() {
+async fn function_listing_omits_unspecialized_generics() {
     let output = baml_test!(
         baml: SCENARIO_6_SOURCE,
-        entry: "function_listing_includes_unspecialized_generics"
+        entry: "function_listing_omits_unspecialized_generics"
     );
     assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
 }
@@ -572,9 +719,7 @@ async fn function_listing_includes_unspecialized_generics() {
 /// body still materializes `T`, so calling it dies inside `LoadType` as an
 /// internal error no `catch` can see. The companion is still *listed* — see the
 /// test below — but extracting it **by name** still reports the same reflection
-/// limit its parent does: a name lookup has nowhere to put type arguments. The
-/// route that works is the descriptor's own `specialize` then `get` (see
-/// `reflect_specialize.rs`).
+/// limit its parent does: a name lookup has nowhere to put type arguments.
 #[tokio::test]
 async fn generic_function_companion_extraction_reports_reflection_limit() {
     let output = baml_test!(
@@ -602,5 +747,40 @@ async fn alias_maps_are_order_independent_and_cannot_shadow_stdlib() {
 #[tokio::test]
 async fn package_tests_enumerate_invocable_zero_arg_functions() {
     let output = baml_test!(baml: SCENARIO_6_SOURCE, entry: "enumerated_test_runs");
+    assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
+}
+
+/// One package object mounted under two aliases is one package in the
+/// consumer's compile world: a type reached as `app.Twin` and as
+/// `z_last.Twin` is the same type, so crossing the two spellings in one
+/// signature type-checks, and the value flows through unchanged.
+const ALIAS_TWINS_SOURCE: &str = r####"
+class Twin {
+  x int
+}
+
+function main() -> bool {
+  let root_package = reflect.Package.current()
+  let generated = reflect.Package.compile(
+    { "main.baml": `
+function cross(t: app.Twin) -> z_last.Twin {
+  let same: z_last.Twin = t
+  same
+}
+` },
+    packages = { "app": root_package, "z_last": root_package },
+  )
+  if (generated.diagnostics().length() != 0) {
+    throw generated.diagnostics()[0].message
+  }
+  let cross = generated.get_function<(Twin) -> Twin>("root.cross")
+    ?? throw "missing root.cross"
+  cross(Twin { x: 7 }).x == 7
+}
+"####;
+
+#[tokio::test]
+async fn one_package_under_two_aliases_is_one_package() {
+    let output = baml_test!(baml: ALIAS_TWINS_SOURCE, entry: "main");
     assert_eq!(output.result, Ok(BexExternalValue::Bool(true)));
 }
