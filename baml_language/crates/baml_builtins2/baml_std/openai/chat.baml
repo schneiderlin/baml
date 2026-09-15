@@ -40,6 +40,10 @@ class ChatClient {
     // records delivered through on_event. Status, headers, and timing are
     // always recorded; this flag only gates the bodies.
     capture_wire: bool,
+    // Replay assistant reasoning through the OpenAI-compatible
+    // `reasoning_content` field on later tool-loop turns. Keep false for
+    // ordinary OpenAI; Kimi preserved-thinking requires true.
+    replay_reasoning_content: bool,
 
     /// Creates a client. Construction reads no environment variable, so
     /// declaring one is always safe; credentials and endpoints resolve when a
@@ -60,6 +64,7 @@ class ChatClient {
         stop: string[]? = null,
         seed: int? = null,
         capture_wire: bool = true,
+        replay_reasoning_content: bool = false,
     ) -> ChatClient {
         ChatClient {
             model: model,
@@ -77,6 +82,7 @@ class ChatClient {
             stop: stop,
             seed: seed,
             capture_wire: capture_wire,
+            replay_reasoning_content: replay_reasoning_content,
         }
     }
 
@@ -105,6 +111,7 @@ class ChatClient {
             api_key_env = "OPENAI_API_KEY",
             api_key_required = true,
             send_stream_options = true,
+            replay_reasoning_content = self.replay_reasoning_content,
         )
     }
 

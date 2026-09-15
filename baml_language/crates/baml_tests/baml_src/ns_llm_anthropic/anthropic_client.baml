@@ -903,6 +903,7 @@ function anthropic_decode_tool_stream() -> string {
                 seen.push("done");
                 null
             },
+            _ => null,
         };
     }
     let calls: string[] = [];
