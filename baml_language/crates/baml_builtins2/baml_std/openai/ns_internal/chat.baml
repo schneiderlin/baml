@@ -181,6 +181,10 @@ class ChatCompat {
     // wrapper's `default_cache_args()`. Null sends nothing for it. Read only
     // when `cache_breakpoints` is set.
     default_cache_args: baml.json.json,
+    // Replay assistant reasoning through the OpenAI-compatible
+    // `reasoning_content` field. Kimi's preserved-thinking tool loop requires
+    // this; ordinary endpoints must not receive it.
+    replay_reasoning_content: bool,
 
     /// Every field defaults to the plain-OpenAI shape; a wrapper overrides the
     /// handful that differ.
@@ -200,6 +204,7 @@ class ChatCompat {
         compat_query: map<string, string>? = null,
         cache_breakpoints: bool = false,
         default_cache_args: baml.json.json = null,
+        replay_reasoning_content: bool = false,
     ) -> ChatCompat {
         let empty: map<string, string> = {};
         ChatCompat {
@@ -218,6 +223,7 @@ class ChatCompat {
             compat_query: compat_query ?? empty,
             cache_breakpoints: cache_breakpoints,
             default_cache_args: default_cache_args,
+            replay_reasoning_content: replay_reasoning_content,
         }
     }
 }
@@ -387,6 +393,7 @@ class ChatToolCall {
 class ChatMessage {
     role: string,
     content: ChatMessageContent?,
+    reasoning_content: string?,
     tool_calls: ChatToolCall[]?,
     tool_call_id: string?,
 }
@@ -881,6 +888,7 @@ function chat_lower_prompt(
             ChatMessage {
                 role: message.role,
                 content: _chat_content(message.parts, compat.collapse_text_content),
+                reasoning_content: null,
                 tool_calls: null,
                 tool_call_id: null,
             },
@@ -895,8 +903,9 @@ function chat_lower_prompt(
 /// `ai.Journal` -> chat-completions messages. Assistant turns carry their text
 /// in `content` and their calls in `tool_calls`; each result comes back as its
 /// own `role: "tool"` message keyed by `tool_call_id`. Journal-only events
-/// (`RunStarted`, `ToolRequested`, `Usage`, `FinalProduced`) and reasoning
-/// blocks lower to nothing.
+/// (`RunStarted`, `ToolRequested`, `Usage`, `FinalProduced`) lower to nothing.
+/// Reasoning is replayed only for compat profiles that explicitly support the
+/// `reasoning_content` assistant-message field.
 ///
 /// Callers pass the journal through `ai.wire.sanitize_for_client` first, so
 /// foreign reasoning, empty turns and unanswered tool calls are already handled.
@@ -919,6 +928,7 @@ function chat_lower_journal(
                     ChatMessage {
                         role: "user",
                         content: _chat_content(parts, true),
+                        reasoning_content: null,
                         tool_calls: null,
                         tool_call_id: null,
                     },
@@ -927,6 +937,7 @@ function chat_lower_journal(
             },
             let assistant: ai.events.AssistantMessage => {
                 let parts: ChatContentPart[] = [];
+                let reasoning = "";
                 let calls: ChatToolCall[] = [];
                 for (let block in assistant.content) {
                     match (block) {
@@ -947,8 +958,10 @@ function chat_lower_journal(
                             );
                             null
                         },
-                        // Reasoning has no replayable wire form here.
-                        let r: ai.content.Reasoning => null,
+                        let r: ai.content.Reasoning => {
+                            reasoning = `${reasoning}${r.summary}`;
+                            null
+                        },
                     };
                 }
                 let content: ChatMessageContent? = if (parts.length() == 0) {
@@ -966,6 +979,11 @@ function chat_lower_journal(
                         ChatMessage {
                             role: "assistant",
                             content: content,
+                            reasoning_content: if (compat.replay_reasoning_content) {
+                                reasoning
+                            } else {
+                                null
+                            },
                             tool_calls: tool_calls,
                             tool_call_id: null,
                         },
@@ -980,6 +998,7 @@ function chat_lower_journal(
                     ChatMessage {
                         role: "tool",
                         content: _chat_content(_chat_lower_blocks(completed.content, compat, preview = preview), true),
+                        reasoning_content: null,
                         tool_calls: null,
                         tool_call_id: completed.id,
                     },
@@ -992,6 +1011,7 @@ function chat_lower_journal(
                     ChatMessage {
                         role: "tool",
                         content: baml.json.stringify(baml.json.to_json(err)),
+                        reasoning_content: null,
                         tool_calls: null,
                         tool_call_id: failed.id,
                     },
@@ -1679,18 +1699,16 @@ class ChatToolCallBuffer {
 
 /// The stateful SSE decoder for one streamed turn.
 ///
-/// `ai.stream.Event` is `TextDelta | TurnMeta | TurnDone` and
-/// `TurnStream.final_turn()` only ever produces a single `Text` block, so
-/// streamed tool calls cannot reach the runner today (PLAN §6 — extending
-/// Event is its own stdlib change). They are still fully assembled here:
-/// `tool_uses()` returns them once the stream ends, which is what a future
-/// Event variant will emit and what the tests assert on.
+/// Reasoning and tool argument fragments are emitted as typed stream events.
+/// Tool arguments are also assembled here so a validated canonical ToolUseDone
+/// can be emitted before the turn terminates.
 class ChatStreamDecoder {
     provider: string,
     calls: ChatToolCallBuffer[],
+    calls_emitted: bool,
 
     function new(provider: string) -> ChatStreamDecoder {
-        ChatStreamDecoder { provider: provider, calls: [] }
+        ChatStreamDecoder { provider: provider, calls: [], calls_emitted: false }
     }
 
     /// (internal) Extend (or open) the buffer for one tool-call delta.
@@ -1753,6 +1771,11 @@ class ChatStreamDecoder {
                                     out.push(ai.stream.TextDelta { text: text });
                                 }
                             }
+                            if let reasoning: string = choice.delta?.reasoning_content {
+                                if (reasoning != "") {
+                                    out.push(ai.stream.ReasoningDelta { summary: reasoning });
+                                }
+                            }
                             if let refusal: string = choice.delta?.refusal {
                                 if (refusal != "") {
                                     out.push(ai.stream.TextDelta { text: refusal });
@@ -1768,17 +1791,47 @@ class ChatStreamDecoder {
                                     other_content = true;
                                 }
                                 self._absorb_call(call, position);
+                                out.push(
+                                    ai.stream.ToolUseDelta {
+                                        index: call.index ?? position,
+                                        id: call.id,
+                                        name: call.fn?.name,
+                                        arguments: call.fn?.arguments,
+                                    },
+                                );
                                 position += 1;
                             }
                             if (other_content) {
                                 out.push(ai.stream.ContentSeen {});
                             }
                             if let reason: string = choice.finish_reason {
+                                // Kimi may report a nonstandard finish reason after
+                                // sending a complete tool call. The assembled wire
+                                // content is authoritative in that case.
+                                let tool_uses = self.tool_uses();
+                                let has_complete_tool_uses = tool_uses.length() > 0
+                                    && tool_uses.every((tool_use) -> {
+                                        tool_use.id.trim().length() > 0
+                                            && tool_use.name.trim().length() > 0
+                                    });
+                                let stop_reason = if (has_complete_tool_uses) {
+                                    ai.content.StopReason.ToolUse
+                                } else {
+                                    chat_stop_reason(reason)
+                                };
+                                if (has_complete_tool_uses && !self.calls_emitted) {
+                                    for (let tool_use in tool_uses) {
+                                        out.push(ai.stream.ToolUseDone { tool_use: tool_use });
+                                    }
+                                    self.calls_emitted = true;
+                                }
                                 out.push(
                                     ai.stream.TurnMeta {
-                                        stop_reason: chat_stop_reason(reason),
+                                        stop_reason: stop_reason,
                                         input_tokens: null,
                                         output_tokens: null,
+                                        cached_input_tokens: null,
+                                        reasoning_tokens: null,
                                     },
                                 );
                             }

@@ -76,6 +76,27 @@ class TextDelta {
     text: string,
 }
 
+/// One incremental piece of model reasoning. Reasoning is kept separate from
+/// answer text so typed function streams never feed it to SAP while agent
+/// runners can still surface it as activity.
+class ReasoningDelta {
+    summary: string,
+}
+
+/// One incremental tool-call fragment. `arguments` is a JSON string fragment
+/// and is not required to parse until the provider emits ToolUseDone.
+class ToolUseDelta {
+    index: int,
+    id: string?,
+    name: string?,
+    arguments: string?,
+}
+
+/// A fully assembled and validated tool call.
+class ToolUseDone {
+    tool_use: root.content.ToolUse,
+}
+
 /// Turn metadata as it arrives on the wire. Providers send stop_reason and
 /// token counts on different events; each TurnMeta carries what its event had
 /// and TurnStream folds non-null fields together (last write wins). The token
@@ -112,10 +133,10 @@ class TurnDone {
 class ContentSeen {
 }
 
-/// One provider-agnostic event decoded from an SSE batch: a piece of
-/// assistant text, content that is not text, the turn metadata that arrived
-/// alongside it, or the provider's end-of-turn marker.
-type Event = TextDelta | ContentSeen | TurnMeta | TurnDone;
+/// One provider-agnostic event decoded from one SSE batch: assistant text,
+/// reasoning, tool activity, timeout-only content activity, turn metadata, or
+/// the provider's end-of-turn marker.
+type Event = TextDelta | ReasoningDelta | ToolUseDelta | ToolUseDone | ContentSeen | TurnMeta | TurnDone;
 
 /// The single end-of-stream marker returned by both raw turn streams and typed
 /// function streams. A nominal sentinel is required because null may itself be
@@ -130,8 +151,8 @@ class Done {
 /// format.
 type EventSource = () -> Event | Done throws root.errors.InvokeError;
 
-/// The raw text-delta stream of ONE model turn. Pull-based: nothing is read
-/// from the wire until `next()` or `final_turn()` is called.
+/// The raw content-event stream of ONE model turn. Pull-based: nothing is read
+/// from the wire until `next_event()`, `next()`, or `final_turn()` is called.
 ///
 /// `next()` yields DELTA chunks (each item is only the newly arrived text,
 /// never the accumulated prefix) and returns Done when the turn is over.
@@ -142,6 +163,7 @@ class TurnStream {
     // callback-backed streams: composite clients use this to relay normalized
     // events from a selected member without exposing provider wire details.
     _event_source: EventSource?,
+    _close_source: (() -> void throws never)?,
     // wire-backed streams: the SSE connection plus a per-provider decoder
     // that turns one `SseStream.next()` batch into StreamEvents.
     _sse: baml.http.SseStream?,
@@ -154,6 +176,8 @@ class TurnStream {
     _pcursor: int,
     // folded state.
     _text: string,
+    _reasoning: string,
+    _tool_uses: root.content.ToolUse[],
     _stop_reason: root.content.StopReason?,
     _input_tokens: int?,
     _output_tokens: int?,
@@ -238,6 +262,7 @@ class TurnStream {
         }
         TurnStream {
             _event_source: null,
+            _close_source: null,
             _sse: sse,
             _decode: decode,
             _chunks: [],
@@ -245,6 +270,8 @@ class TurnStream {
             _pending: [],
             _pcursor: 0,
             _text: "",
+            _reasoning: "",
+            _tool_uses: [],
             _stop_reason: null,
             _input_tokens: null,
             _output_tokens: null,
@@ -274,6 +301,7 @@ class TurnStream {
     function from_chunks(chunks: string[]) -> TurnStream {
         TurnStream {
             _event_source: null,
+            _close_source: null,
             _sse: null,
             _decode: null,
             _chunks: chunks,
@@ -281,6 +309,8 @@ class TurnStream {
             _pending: [],
             _pcursor: 0,
             _text: "",
+            _reasoning: "",
+            _tool_uses: [],
             _stop_reason: null,
             _input_tokens: null,
             _output_tokens: null,
@@ -308,9 +338,13 @@ class TurnStream {
     /// retaining TurnStream's ordinary accumulation and termination behavior.
     /// The source itself owns any retry/fallback policy; once it returns a
     /// TextDelta, that delta is immediately visible to the caller.
-    function from_event_source(next_event: EventSource) -> TurnStream {
+    function from_event_source(
+        next_event: EventSource,
+        close: (() -> void throws never)? = null,
+    ) -> TurnStream {
         TurnStream {
             _event_source: next_event,
+            _close_source: close,
             _sse: null,
             _decode: null,
             _chunks: [],
@@ -318,6 +352,8 @@ class TurnStream {
             _pending: [],
             _pcursor: 0,
             _text: "",
+            _reasoning: "",
+            _tool_uses: [],
             _stop_reason: null,
             _input_tokens: null,
             _output_tokens: null,
@@ -429,10 +465,22 @@ class TurnStream {
     /// (internal) Marks the turn over and releases the SSE connection
     /// behind it, if this stream has one.
     function _finish(self) -> void {
+        if (self._done) {
+            return;
+        }
         self._done = true;
         if let sse: baml.http.SseStream = self._sse {
             sse.close();
         }
+        if let close: () -> void throws never = self._close_source {
+            close();
+        }
+    }
+
+    /// Stop pulling and close the underlying request. This is idempotent so an
+    /// agent runner can safely cancel a stream when its own budget expires.
+    function close(self) -> void {
+        self._finish()
     }
 
     /// (internal) The strict-termination check: a no-op unless this stream required an
@@ -454,6 +502,134 @@ class TurnStream {
                 }
             }
         }
+    }
+
+    /// Return the next normalized provider event, or Done after the turn ends.
+    /// Every returned event has already been folded into final_turn() state.
+    function next_event(self) -> Event | Done {
+        while (true) {
+            if (self._done) {
+                return Done {  };
+            }
+            while (self._pcursor < self._pending.length()) {
+                let e = self._pending.at(self._pcursor);
+                self._pcursor += 1;
+                match (e) {
+                    let d: TextDelta => {
+                        self._stamp_first_delta();
+                        if (d.text != "") {
+                            self._saw_content();
+                        }
+                        self._text = `${self._text}${d.text}`;
+                        return d;
+                    },
+                    let d: ReasoningDelta => {
+                        if (d.summary != "") {
+                            self._saw_content();
+                        }
+                        self._reasoning = `${self._reasoning}${d.summary}`;
+                        return d;
+                    },
+                    let d: ToolUseDelta => {
+                        if (d.id != null || d.name != null || d.arguments != null) {
+                            self._saw_content();
+                        }
+                        return d;
+                    },
+                    let d: ToolUseDone => {
+                        self._saw_content();
+                        self._tool_uses.push(d.tool_use);
+                        return d;
+                    },
+                    let seen: ContentSeen => {
+                        self._saw_content();
+                        return seen;
+                    },
+                    let m: TurnMeta => {
+                        if let s: root.content.StopReason = m.stop_reason {
+                            self._stop_reason = s;
+                        }
+                        if let i: int = m.input_tokens {
+                            self._input_tokens = i;
+                        }
+                        if let o: int = m.output_tokens {
+                            self._output_tokens = o;
+                        }
+                        if let c: int = m.cached_input_tokens {
+                            self._cached_input_tokens = c;
+                        }
+                        if let w: int = m.cache_write_input_tokens {
+                            self._cache_write_input_tokens = w;
+                        }
+                        if let u: int = m.uncached_input_tokens {
+                            self._uncached_input_tokens = u;
+                        }
+                        if let r: int = m.reasoning_tokens {
+                            self._reasoning_tokens = r;
+                        }
+                        return m;
+                    },
+                    let d: TurnDone => {
+                        self._saw_terminal = true;
+                        self._finish();
+                        return d;
+                    },
+                    null => null,
+                };
+            }
+            if let source: EventSource = self._event_source {
+                match (source()) {
+                    let event: Event => {
+                        self._pending.push(event);
+                        null
+                    },
+                    let done: Done => {
+                        self._finish();
+                        return done;
+                    },
+                };
+                continue;
+            }
+            match (self._sse) {
+                let sse: baml.http.SseStream => {
+                    match (self._pull(sse)) {
+                        null => {
+                            self._finish();
+                            self._check_terminal();
+                            return Done {  };
+                        },
+                        let batch: string => {
+                            self._capture_batch(batch);
+                            if let decode: (string) -> Event[] throws root.errors.InvokeError = self._decode {
+                                for (let e in decode(batch)) {
+                                    self._pending.push(e);
+                                }
+                                null
+                            } else {
+                                null
+                            };
+                            null
+                        },
+                    };
+                    null
+                },
+                null => {
+                    match (self._chunks.at(self._cursor)) {
+                        let c: string => {
+                            self._stamp_first_delta();
+                            self._cursor += 1;
+                            self._text = `${self._text}${c}`;
+                            return TextDelta { text: c };
+                        },
+                        null => {
+                            self._finish();
+                            return Done {  };
+                        },
+                    }
+                },
+            };
+        }
+        baml.sys.panic("unreachable")
     }
 
     /// All READY text deltas, or Done when the turn is over. Metadata events
@@ -491,6 +667,24 @@ class TurnStream {
                     },
                     let seen: ContentSeen => {
                         self._saw_content();
+                        null
+                    },
+                    let d: ReasoningDelta => {
+                        if (d.summary != "") {
+                            self._saw_content();
+                        }
+                        self._reasoning = `${self._reasoning}${d.summary}`;
+                        null
+                    },
+                    let d: ToolUseDelta => {
+                        if (d.id != null || d.name != null || d.arguments != null) {
+                            self._saw_content();
+                        }
+                        null
+                    },
+                    let d: ToolUseDone => {
+                        self._saw_content();
+                        self._tool_uses.push(d.tool_use);
                         null
                     },
                     let m: TurnMeta => {
@@ -602,7 +796,7 @@ class TurnStream {
     /// truncated stream into a `StopReason.Complete` answer.
     function final_turn(self) -> root.ModelTurn {
         while (true) {
-            match (self.next()) {
+            match (self.next_event()) {
                 let d: Done => {
                     break;
                 },
@@ -613,7 +807,12 @@ class TurnStream {
         // covers a stream finished by some other route (a Done delivered from
         // an already-closed stream) before the terminal event was seen.
         self._check_terminal();
-        let usage: root.events.Usage? = if (self._input_tokens != null || self._output_tokens != null) {
+        let usage: root.events.Usage? = if (
+            self._input_tokens != null
+                || self._output_tokens != null
+                || self._cached_input_tokens != null
+                || self._reasoning_tokens != null
+        ) {
             root.events.Usage {
                 input_tokens: self._input_tokens ?? 0,
                 output_tokens: self._output_tokens ?? 0,
@@ -632,8 +831,18 @@ class TurnStream {
                 }
             }
         }
+        let content: root.content.ModelBlock[] = [];
+        if (self._reasoning != "") {
+            content.push(root.content.Reasoning { summary: self._reasoning });
+        }
+        // Keep the historical shape: even an empty stream contains one Text
+        // block, and reasoning never becomes input to typed SAP parsing.
+        content.push(root.content.Text { text: self._text });
+        for (let tool_use in self._tool_uses) {
+            content.push(tool_use);
+        }
         root.ModelTurn {
-            content: [root.content.Text { text: self._text }],
+            content: content,
             stop_reason: self._stop_reason ?? root.content.StopReason.Complete,
             usage: usage,
             calls: self._calls,

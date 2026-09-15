@@ -44,7 +44,13 @@ function make_script() -> StreamScript {
         events: [
             ai.stream.TextDelta { text: "{\"message\":" },
             ai.stream.TextDelta { text: " \"hi\"}" },
-            ai.stream.TurnMeta { stop_reason: ai.content.StopReason.Complete, input_tokens: 7, output_tokens: 11 },
+            ai.stream.TurnMeta {
+                stop_reason: ai.content.StopReason.Complete,
+                input_tokens: 7,
+                output_tokens: 11,
+                cached_input_tokens: null,
+                reasoning_tokens: null,
+            },
             ai.stream.TurnDone {  },
         ],
         cursor: 0,

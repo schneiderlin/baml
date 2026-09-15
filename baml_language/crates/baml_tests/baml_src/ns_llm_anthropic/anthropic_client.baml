@@ -1101,6 +1101,7 @@ function anthropic_decode_tool_stream() -> json {
             // Content with no text of its own (thinking, tool input): it only
             // feeds the token deadlines, so it is not part of what this checks.
             let c: ai.stream.ContentSeen => null,
+            _ => null,
         };
     }
     let calls: json[] = [];
