@@ -1066,6 +1066,8 @@ function _gm_decode_batch(batch: string, provider: string) -> ai.stream.Event[] 
                         stop_reason: stop,
                         input_tokens: usage?.promptTokenCount,
                         output_tokens: usage?.candidatesTokenCount,
+                        cached_input_tokens: null,
+                        reasoning_tokens: null,
                     },
                 );
                 null

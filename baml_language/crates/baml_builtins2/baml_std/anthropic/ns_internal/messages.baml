@@ -1116,6 +1116,8 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
                                 stop_reason: null,
                                 input_tokens: event.message?.usage?.input_tokens,
                                 output_tokens: event.message?.usage?.output_tokens,
+                                cached_input_tokens: null,
+                                reasoning_tokens: null,
                             },
                         );
                         null
@@ -1212,6 +1214,8 @@ function decode_batch(batch: string, state: AnthStreamState) -> ai.stream.Event[
                                 stop_reason: stop,
                                 input_tokens: event.usage?.input_tokens,
                                 output_tokens: event.usage?.output_tokens,
+                                cached_input_tokens: null,
+                                reasoning_tokens: null,
                             },
                         );
                         null

@@ -59,6 +59,8 @@ function contract_decode(batch: string) -> ai.stream.Event[] throws ai.errors.In
                     stop_reason: ai.content.StopReason.Complete,
                     input_tokens: 7,
                     output_tokens: 3,
+                    cached_input_tokens: null,
+                    reasoning_tokens: null,
                 },
             );
         }

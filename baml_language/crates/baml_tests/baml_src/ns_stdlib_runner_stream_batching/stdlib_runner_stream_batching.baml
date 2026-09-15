@@ -44,6 +44,7 @@ function make_backlog(n: int) -> ai.stream.TurnStream {
     pending.push(ai.stream.TurnDone {  });
     ai.stream.TurnStream {
         _event_source: null,
+        _close_source: null,
         _sse: null,
         _decode: null,
         _chunks: [],
@@ -51,9 +52,13 @@ function make_backlog(n: int) -> ai.stream.TurnStream {
         _pending: pending,
         _pcursor: 0,
         _text: "",
+        _reasoning: "",
+        _tool_uses: [],
         _stop_reason: null,
         _input_tokens: null,
         _output_tokens: null,
+        _cached_input_tokens: null,
+        _reasoning_tokens: null,
         _done: false,
         _require_terminal: null,
         _saw_terminal: false,

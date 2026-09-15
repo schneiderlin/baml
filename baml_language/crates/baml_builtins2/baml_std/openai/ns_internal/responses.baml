@@ -1173,6 +1173,8 @@ function _stream_events(
                         stop_reason: turn.stop_reason,
                         input_tokens: turn.usage?.input_tokens,
                         output_tokens: turn.usage?.output_tokens,
+                        cached_input_tokens: null,
+                        reasoning_tokens: null,
                     },
                 );
             };

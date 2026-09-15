@@ -83,6 +83,31 @@ function _chat_input_with_history() -> ai.ModelTurnInput {
     }
 }
 
+// Kimi requires preserved reasoning when an assistant tool turn is replayed.
+function _kimi_input_with_history() -> ai.ModelTurnInput {
+    let spec = ChatEcho@spec("and tomorrow?");
+    let args: map<string, unknown> = { "city": "SF" };
+    let journal = ai.Journal {
+        log: [
+            ai.events.UserMessage.of(["weather in SF?"]),
+            ai.events.AssistantMessage {
+                content: [
+                    ai.content.Reasoning { summary: "check the forecast" },
+                    ai.content.ToolUse { id: "call_1", name: "chat_get_weather", args: args },
+                ],
+                client_id: "openai-chat/kimi-for-coding",
+            },
+            ai.events.ToolCompleted.of("call_1", ["sunny in SF"]),
+        ],
+    };
+    ai.ModelTurnInput {
+        prompt: spec.prompt_template,
+        journal: journal,
+        toolbox: ai.tools.Toolbox.new([ai.tools.tool(chat_get_weather)]),
+        output_type: spec.output_type(),
+    }
+}
+
 function _chat_vision_input(photo: image) -> ai.ModelTurnInput {
     let spec = ChatVision@spec(photo);
     ai.ModelTurnInput {
@@ -159,6 +184,35 @@ test "chat_openai_request_shape" {
     assert.equal(
         chat_openai_request_shape(),
         "POST|/chat/completions|Bearer test-key|application/json|gpt-4o-mini|system|text|user|model,messages|pong|Complete|9/2/4/1",
+    )
+}
+
+function chat_kimi_compat_preserves_thinking_and_reasoning() -> string {
+    let cl = openai.ChatClient.new(
+        model = "kimi-for-coding",
+        base_url = "https://api.kimi.com/coding/v1",
+        api_key = "test-key",
+        replay_reasoning_content = true,
+        request_body = baml.json.to_json({
+            "thinking": { "type": "enabled", "keep": "all" },
+        }),
+    );
+    let request = cl.render(_kimi_input_with_history());
+    let body = baml.json.parse(request.body);
+    [
+        cl.id(),
+        request.url,
+        baml.json.path<string>(body, ".thinking.type"),
+        baml.json.path<string>(body, ".thinking.keep"),
+        baml.json.path<string>(body, ".messages[3].reasoning_content"),
+        baml.json.path<string>(body, ".messages[4].content"),
+    ].join("|")
+}
+
+test "chat_kimi_compat_preserves_thinking_and_reasoning" {
+    assert.equal(
+        chat_kimi_compat_preserves_thinking_and_reasoning(),
+        "openai-chat/kimi-for-coding|https://api.kimi.com/coding/v1/chat/completions|enabled|all|check the forecast|sunny in SF",
     )
 }
 
@@ -1124,17 +1178,16 @@ test "chat_generic_stream_time_to_first_token_timeout_ms" {
     assert.equal(chat_generic_stream_time_to_first_token_timeout_ms(), "20|Timeout")
 }
 
-// Streamed tool calls arrive as id/name once and argument fragments after.
-// `ai.stream.Event` cannot carry them to the runner yet (PLAN §6), so they
-// are buffered in the decoder and readable when the turn ends — this drives the
-// decoder over a real SSE connection and asserts the assembled call.
-function chat_sse_assembles_tool_calls() -> string {
+// Streamed tool calls are buffered and emitted when complete. The wire content
+// remains authoritative when a compatible provider uses a nonstandard finish
+// reason after delivering a valid tool call.
+function chat_sse_assembles_tool_calls(finish_reason: string = "tool_calls") -> string {
     root.llm_mock.mock_sse_serve(
         [
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"chat_get_weather\",\"arguments\":\"\"}}]}}]}"),
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}"),
             root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]}}]}"),
-            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"${finish_reason}"}]}`),
             root.llm_mock.sse_data(`[DONE]`),
         ],
         (mock: root.llm_mock.MockSseServer) -> {
@@ -1147,6 +1200,7 @@ function chat_sse_assembles_tool_calls() -> string {
             };
             let sse = baml.http.fetch_sse(request);
             let stops: string[] = [];
+            let completed: string[] = [];
             while (true) {
                 match (sse.next()) {
                     null => {
@@ -1159,6 +1213,10 @@ function chat_sse_assembles_tool_calls() -> string {
                                     if let reason: ai.content.StopReason = meta.stop_reason {
                                         stops.push(`${reason}`);
                                     }
+                                    null
+                                },
+                                let done: ai.stream.ToolUseDone => {
+                                    completed.push(`${done.tool_use.id}/${done.tool_use.name}`);
                                     null
                                 },
                                 _ => null,
@@ -1176,6 +1234,7 @@ function chat_sse_assembles_tool_calls() -> string {
                 use?.id ?? "-",
                 use?.name ?? "-",
                 baml.json.stringify(baml.json.to_json(use?.args)),
+                completed.join(","),
                 stops.join(","),
             ].join("|")
         },
@@ -1185,8 +1244,84 @@ function chat_sse_assembles_tool_calls() -> string {
 test "chat_sse_assembles_tool_calls" {
     assert.equal(
         chat_sse_assembles_tool_calls(),
-        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|ToolUse",
+        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|call_7/chat_get_weather|ToolUse",
     )
+}
+
+test "chat_sse_trusts_complete_tool_call_over_nonstandard_finish_reason" {
+    assert.equal(
+        chat_sse_assembles_tool_calls(finish_reason = "unexpected_state"),
+        "1|call_7|chat_get_weather|{\"city\":\"Paris\"}|call_7/chat_get_weather|ToolUse",
+    )
+}
+
+function chat_stream_preserves_reasoning_and_tools() -> string {
+    root.llm_mock.mock_sse_serve(
+        [
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{"reasoning_content":"plan "}}]}`),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{"reasoning_content":"first"}}]}`),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"chat_get_weather\",\"arguments\":\"\"}}]}}]}"),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}"),
+            root.llm_mock.sse_data("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]}}]}"),
+            root.llm_mock.sse_data(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`),
+            root.llm_mock.sse_data(`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":3}}}`),
+            root.llm_mock.sse_data(`[DONE]`),
+        ],
+        (mock: root.llm_mock.MockSseServer) -> {
+            let cl = openai.ChatClient.new(api_key = "k", base_url = mock.base_url());
+            let stream = cl.invoke_stream(_chat_input("hi"));
+            let seen: string[] = [];
+            while (true) {
+                match (stream.next_event()) {
+                    let reasoning: ai.stream.ReasoningDelta => {
+                        seen.push(`r:${reasoning.summary}`);
+                        null
+                    },
+                    let delta: ai.stream.ToolUseDelta => {
+                        seen.push(`td:${delta.index}:${delta.id ?? "-"}:${delta.name ?? "-"}:${delta.arguments ?? "-"}`);
+                        null
+                    },
+                    let done: ai.stream.ToolUseDone => {
+                        seen.push(`tool:${done.tool_use.id}:${done.tool_use.name}`);
+                        null
+                    },
+                    let meta: ai.stream.TurnMeta => {
+                        if let stop: ai.content.StopReason = meta.stop_reason {
+                            seen.push(`stop:${stop}`);
+                        }
+                        null
+                    },
+                    let done: ai.stream.TurnDone => {
+                        seen.push("turn-done");
+                        null
+                    },
+                    let done: ai.stream.Done => break,
+                    _ => null,
+                };
+            }
+            let turn = stream.final_turn();
+            let reasoning = "";
+            for (let block in turn.content) {
+                if let thought: ai.content.Reasoning = block {
+                    reasoning = thought.summary;
+                }
+            }
+            let tool = turn.tool_uses().at(0);
+            [
+                `events=${seen.join(",")}`,
+                `reasoning=${reasoning}`,
+                `text=${turn.terminal_text() ?? "null"}`,
+                `tool=${tool?.id ?? "-"}/${tool?.name ?? "-"}/${baml.json.stringify(baml.json.to_json(tool?.args))}`,
+                `usage=${turn.usage?.input_tokens ?? -1}/${turn.usage?.output_tokens ?? -1}/${turn.usage?.cached_input_tokens ?? -1}/${turn.usage?.reasoning_tokens ?? -1}`,
+            ].join("|")
+        },
+    )
+}
+
+test "chat_stream_preserves_reasoning_and_tools" {
+    let got = chat_stream_preserves_reasoning_and_tools();
+    assert.contains(got, "events=r:plan ,r:first,td:0:call_7:chat_get_weather:,td:0:-:-:{\"city\":,td:0:-:-:\"Paris\"},tool:call_7:chat_get_weather,stop:ToolUse,turn-done|");
+    assert.contains(got, "reasoning=plan first|text=|tool=call_7/chat_get_weather/{\"city\":\"Paris\"}|usage=11/8/5/3")
 }
 
 // ─── through the runner ──────────────────────────────────────────────────────

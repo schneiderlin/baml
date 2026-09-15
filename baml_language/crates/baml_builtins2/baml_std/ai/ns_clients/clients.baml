@@ -272,7 +272,7 @@ class Retry {
                 finished: false,
                 calls: [],
             };
-            let stream = root.stream.TurnStream.from_event_source(relay.next_event);
+            let stream = root.stream.TurnStream.from_event_source(relay.next_event, close = relay.close_current);
             // one list, two holders: the relay appends, final_turn() reads
             stream._calls = relay.calls;
             stream
@@ -517,7 +517,7 @@ class Fallback {
                 finished: false,
                 calls: [],
             };
-            let stream = root.stream.TurnStream.from_event_source(relay.next_event);
+            let stream = root.stream.TurnStream.from_event_source(relay.next_event, close = relay.close_current);
             stream._calls = relay.calls;
             stream
         }
@@ -639,6 +639,8 @@ class StreamRelay {
                                     stop_reason: turn.stop_reason,
                                     input_tokens: turn.usage?.input_tokens,
                                     output_tokens: turn.usage?.output_tokens,
+                                    cached_input_tokens: turn.usage?.cached_input_tokens,
+                                    reasoning_tokens: turn.usage?.reasoning_tokens,
                                 },
                                 root.stream.TurnDone {  },
                             ];
