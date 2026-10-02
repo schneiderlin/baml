@@ -1284,8 +1284,7 @@ test "oai_stream_status_error" {
     assert.equal(oai_stream_status_error(), "invalid_request:http 401")
 }
 
-// The decoder buffers streamed function-call arguments across batches (the
-// stream event types cannot carry a tool call yet — PLAN §6), and a
+// The decoder buffers streamed function-call arguments across batches, and an
 // `output_text.done` for an item that never streamed a delta emits it once.
 function oai_stream_decoder_buffers() -> string {
     let state = openai.internal.OaStreamState.new();
@@ -1322,6 +1321,46 @@ test "oai_stream_decoder_buffers" {
     // The two argument deltas carry no text: each yields one ContentSeen, which
     // only feeds the token deadlines.
     assert.equal(oai_stream_decoder_buffers(), "{\"city\":\"paris\"}|2|1|hello|unset")
+}
+
+// Codex's Responses endpoint can carry the completed function call only in
+// `response.output_item.done`; the terminal response's `output` is empty. The
+// normalized stream must retain that call and classify the turn as ToolUse.
+function oai_stream_tool_call_with_empty_terminal_output() -> string {
+    let output_item_done = `{"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","status":"completed","arguments":"{\\"dirPath\\":\\".\\"}","call_id":"call_1","name":"ls"},"output_index":1}`;
+    let completed = `{"type":"response.completed","response":{"status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":10,"output_tokens":3}}}`;
+    root.llm_mock.mock_sse_serve(
+        [
+            root.llm_mock.sse_data(output_item_done),
+            root.llm_mock.sse_data(completed),
+        ],
+        (mock: root.llm_mock.MockSseServer) -> {
+            let cl = openai.ResponsesClient.new(
+                model = "gpt-5.6-sol",
+                api_key = "test-key",
+                base_url = mock.base_url(),
+            );
+            let spec = OaiEcho@spec("List this directory.");
+            let turn = cl
+                .invoke_stream(_oai_input(spec, ai.Journal.new(spec), ai.tools.Toolbox.new([])))
+                .final_turn();
+            let tool = turn.tool_uses().at(0);
+            [
+                turn.stop_reason.to_string(),
+                turn.tool_uses().length().to_string(),
+                tool?.id ?? "-",
+                tool?.name ?? "-",
+                baml.json.stringify(baml.json.to_json(tool?.args)),
+            ].join("|")
+        },
+    )
+}
+
+test "oai_stream_tool_call_with_empty_terminal_output" {
+    assert.equal(
+        oai_stream_tool_call_with_empty_terminal_output(),
+        "ToolUse|1|call_1|ls|{\"dirPath\":\".\"}",
+    )
 }
 
 // The dedup key is the CONTENT PART, not the item: a message with two text
