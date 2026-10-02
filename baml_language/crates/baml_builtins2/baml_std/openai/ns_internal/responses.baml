@@ -902,6 +902,24 @@ function _response_failure(resp: OaResponse) -> ai.errors.Failure {
     }
 }
 
+/// Normalize one function-call output item. Streaming calls may supply the
+/// assembled arguments separately because some Responses endpoints omit the
+/// call from the terminal response object.
+function _function_call_tool_use(
+    item: OaOutputItem,
+    arguments: string? = null,
+) -> ai.content.ToolUse {
+    let args: map<string, unknown> = {};
+    if let raw: string = arguments ?? item.arguments {
+        // Provider-malformed output, not a bug in the caller's code: classify
+        // it like every other undecodable provider payload.
+        args = baml.json.from_string<map<string, unknown>>(raw) catch_all (e) {
+            _ => throw ai.errors.ParseFailed { provider: "openai", raw_output: raw },
+        };
+    };
+    ai.content.ToolUse { id: item.call_id ?? "", name: item.name ?? "", args: args }
+}
+
 /// One decoded response -> canonical content blocks and a stop reason.
 function parse(resp: OaResponse) -> ai.ModelTurn {
     // A 200 whose response object failed (background mode, and every
@@ -917,21 +935,7 @@ function parse(resp: OaResponse) -> ai.ModelTurn {
         match (item.type) {
             "function_call" => {
                 has_call = true;
-                let args: map<string, unknown> = {};
-                if let s: string = item.arguments {
-                    // Provider-malformed output, not a bug in the caller's code:
-                    // the raw baml baml.json.ParseError would escape as an untyped
-                    // UnknownError, so it is classified like every other
-                    // undecodable provider payload (ai.wire.send_as does the
-                    // same for the response body).
-                    args
-                        = baml.json.from_string<map<string, unknown>>(s) catch_all (e) {
-                            _ => throw ai.errors.ParseFailed { provider: "openai", raw_output: s },
-                        };
-                };
-                content.push(
-                    ai.content.ToolUse { id: item.call_id ?? "", name: item.name ?? "", args: args },
-                );
+                content.push(_function_call_tool_use(item));
                 null
             },
             "message" => {
@@ -1066,11 +1070,20 @@ class OaStreamState {
     model: string?,
     text_started: map<string, bool>,
     call_arguments: map<string, string>,
+    emitted_tool_uses: map<string, bool>,
+    has_tool_use: bool,
 
     function new() -> OaStreamState {
         let started: map<string, bool> = {};
         let buffered: map<string, string> = {};
-        OaStreamState { model: null, text_started: started, call_arguments: buffered }
+        let emitted: map<string, bool> = {};
+        OaStreamState {
+            model: null,
+            text_started: started,
+            call_arguments: buffered,
+            emitted_tool_uses: emitted,
+            has_tool_use: false,
+        }
     }
 }
 
@@ -1081,6 +1094,8 @@ class OaStreamState {
 /// `output_text.done` that is the only delivery of part 1.
 function _event_key(event: OaStreamEvent) -> string {
     let item = if let id: string = event.item_id {
+        id
+    } else if let id: string = event.item?.id {
         id
     } else if let index: int = event.output_index {
         `#${index}`
@@ -1151,9 +1166,6 @@ function _stream_events(
             null
         },
         "response.function_call_arguments.delta" => {
-            // ai.stream.Event cannot carry tool calls (PLAN §6), so the
-            // arguments accumulate here and the completed call is read from the
-            // terminal event's response object.
             if let delta: string = event.delta {
                 let key = _event_key(event);
                 let _ = state.call_arguments.set(key, (state.call_arguments.get(key) ?? "") + delta);
@@ -1166,13 +1178,41 @@ function _stream_events(
             };
             null
         },
+        "response.output_item.done" => {
+            if let item: OaOutputItem = event.item {
+                if item.type == "function_call" {
+                    let item_arguments = item.arguments ?? "";
+                    let arguments = if (item_arguments == "") {
+                        state.call_arguments.get(_event_key(event))
+                    } else {
+                        item.arguments
+                    };
+                    let tool_use = _function_call_tool_use(item, arguments = arguments);
+                    let _ = state.emitted_tool_uses.set(tool_use.id, true);
+                    state.has_tool_use = true;
+                    out.push(ai.stream.ToolUseDone { tool_use: tool_use });
+                };
+            };
+            null
+        },
         "response.failed" | "error" => throw _stream_failure(event),
         "response.completed" | "response.incomplete" => {
             if let final_response: OaResponse = event.response {
                 let turn = parse(final_response);
+                for (let tool_use in turn.tool_uses()) {
+                    if (!(state.emitted_tool_uses.get(tool_use.id) ?? false)) {
+                        let _ = state.emitted_tool_uses.set(tool_use.id, true);
+                        state.has_tool_use = true;
+                        out.push(ai.stream.ToolUseDone { tool_use: tool_use });
+                    };
+                }
                 out.push(
                     ai.stream.TurnMeta {
-                        stop_reason: turn.stop_reason,
+                        stop_reason: if (state.has_tool_use) {
+                            ai.content.StopReason.ToolUse
+                        } else {
+                            turn.stop_reason
+                        },
                         input_tokens: turn.usage?.input_tokens,
                         output_tokens: turn.usage?.output_tokens,
                         cached_input_tokens: turn.usage?.cached_input_tokens,
