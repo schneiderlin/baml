@@ -150,6 +150,16 @@ function _oai_first_text(events: ai.stream.Event[]) -> string {
     ""
 }
 
+function _oai_content_seen_count(events: ai.stream.Event[]) -> int {
+    let count = 0;
+    for (let event in events) {
+        if let _seen: ai.stream.ContentSeen = event {
+            count += 1;
+        }
+    }
+    count
+}
+
 // The classified failure, as a comparable string.
 function _oai_error_name(error: unknown) -> string {
     match (error) {
@@ -1057,6 +1067,38 @@ test "oai_stream_first_token_timeout" {
     assert.equal(oai_stream_first_token_timeout(), "Timeout:first_token_timeout:20")
 }
 
+// Opaque reasoning proves that the model is producing output even though the
+// Responses API exposes no text delta. It ends TTFT without leaking the payload.
+function oai_stream_encrypted_reasoning_ends_first_token_timeout() -> string {
+    let reasoning = `{"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","encrypted_content":"opaque"},"output_index":0}`;
+    let text = `{"type":"response.output_text.delta","item_id":"msg_1","delta":"pong"}`;
+    let completed = `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":1}}}`;
+    root.llm_mock.mock_sse_serve(
+        [
+            root.llm_mock.sse_data(reasoning),
+            root.llm_mock.sse_data(text),
+            root.llm_mock.sse_data(completed),
+        ],
+        (mock: root.llm_mock.MockSseServer) -> {
+            let cl = openai.ResponsesClient.new(
+                model = "gpt-5.6-sol",
+                api_key = "test-key",
+                base_url = mock.base_url(),
+                timeout = ai.LlmTimeoutOptions {
+                    timeout: baml.time.Duration.from_milliseconds(5000),
+                    first_token_timeout: baml.time.Duration.from_milliseconds(100),
+                },
+            );
+            _oai_stream_final(cl)
+        },
+        chunk_delay_ms = 200,
+    )
+}
+
+test "oai_stream_encrypted_reasoning_ends_first_token_timeout" {
+    assert.equal(oai_stream_encrypted_reasoning_ends_first_token_timeout(), "pong")
+}
+
 // A stream whose text arrives ONLY as `output_text.done` still yields it.
 function oai_stream_text_done_only() -> string {
     let completed = `{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":1}}}`;
@@ -1321,6 +1363,30 @@ test "oai_stream_decoder_buffers" {
     // The two argument deltas carry no text: each yields one ContentSeen, which
     // only feeds the token deadlines.
     assert.equal(oai_stream_decoder_buffers(), "{\"city\":\"paris\"}|2|1|hello|unset")
+}
+
+test "oai_stream_decoder_marks_encrypted_reasoning_as_content" {
+    let state = openai.internal.OaStreamState.new();
+    let item: map<string, unknown> = {
+        "id": "rs_1",
+        "type": "reasoning",
+        "encrypted_content": "opaque",
+    };
+    let added: map<string, unknown> = {
+        "type": "response.output_item.added",
+        "item": item,
+        "output_index": 0,
+    };
+    let done: map<string, unknown> = {
+        "type": "response.output_item.done",
+        "item": item,
+        "output_index": 0,
+    };
+    let events = openai.internal._decode_batch(
+        _oai_batch([_oai_json(added), _oai_json(done)]),
+        state,
+    );
+    assert.equal(_oai_content_seen_count(events), 2)
 }
 
 // Codex's Responses endpoint can carry the completed function call only in

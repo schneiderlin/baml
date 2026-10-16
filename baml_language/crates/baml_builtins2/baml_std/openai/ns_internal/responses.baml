@@ -158,6 +158,7 @@ class OaOutputItem {
     // message / reasoning
     content: OaContentPart[]?,
     summary: OaContentPart[]?,
+    encrypted_content: string?,
     // message: "commentary" or "final_answer" on models that split an answer
     phase: string?,
     // image_generation_call
@@ -1237,6 +1238,14 @@ function _stream_events(
             }
             null
         },
+        "response.output_item.added" => {
+            if let item: OaOutputItem = event.item {
+                if (item.type == "reasoning" && (item.encrypted_content ?? "") != "") {
+                    out.push(ai.stream.ContentSeen {});
+                }
+            };
+            null
+        },
         "response.function_call_arguments.done" => {
             if let full: string = event.arguments {
                 let _ = state.call_arguments.set(_event_key(event), full);
@@ -1245,7 +1254,9 @@ function _stream_events(
         },
         "response.output_item.done" => {
             if let item: OaOutputItem = event.item {
-                if item.type == "function_call" {
+                if (item.type == "reasoning" && (item.encrypted_content ?? "") != "") {
+                    out.push(ai.stream.ContentSeen {});
+                } else if item.type == "function_call" {
                     let item_arguments = item.arguments ?? "";
                     let arguments = if (item_arguments == "") {
                         state.call_arguments.get(_event_key(event))
