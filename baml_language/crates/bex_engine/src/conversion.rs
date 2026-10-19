@@ -4124,15 +4124,25 @@ fn find_matching_union_member(value: Value, members: &[RuntimeTy]) -> Option<&Ru
                             .iter()
                             .find(|member| matches!(member, RuntimeTy::Bigint))
                     }),
-                // Types that don't participate in union discrimination.
+                // A statically checked callable inhabits the sole function
+                // arm (e.g. Response | WsAccept). Select it before conversion
+                // erases the value to an opaque tagged handle. Multiple
+                // function arms still require signature discrimination.
                 Object::Function(_)
-                | Object::TypeAlias(_)
+                | Object::Closure(_)
+                | Object::BoundMethod(_)
+                | Object::GenericFunction(_) => {
+                    let mut functions = members
+                        .iter()
+                        .filter(|member| matches!(member, RuntimeTy::Function { .. }));
+                    let selected = functions.next()?;
+                    functions.next().is_none().then_some(selected)
+                }
+                // Types that don't participate in union discrimination.
+                Object::TypeAlias(_)
                 | Object::Interface(_)
                 | Object::Package(_)
                 | Object::ImplRule(_)
-                | Object::Closure(_)
-                | Object::BoundMethod(_)
-                | Object::GenericFunction(_)
                 | Object::HostClosure(_)
                 | Object::Cell(_)
                 | Object::Class(_)

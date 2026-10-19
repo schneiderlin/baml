@@ -763,11 +763,9 @@ enum WsOutcome {
 /// without re-entering the heap — while a `Response` crosses as a plain
 /// `Instance`.
 ///
-/// Deliberately not keyed on the handle's `ty`: closures do not participate in
-/// the engine's union discrimination, so a returned `WsAccept` is tagged with
-/// whichever union member happens to come first (here `Response`). The only
-/// other value the engine tags this way is an `ai.stream.Stream` instance,
-/// which this union cannot hold.
+/// The engine selects the function arm before converting the callable to a
+/// tagged handle, preserving its type and union metadata. Here only the rooted
+/// handle is needed to invoke it after the handshake.
 ///
 /// Anything that is not a tagged handle is the `Response` arm and is validated
 /// by [`wire_response`], which reports a malformed one as a 500 rather than
