@@ -1,0 +1,49 @@
+name: Build Windows CLI (fork)
+
+# Standalone workflow for the synapse fork: builds the two binaries the
+# synapse bin/baml wrapper needs (baml + baml-cli) for Windows x64 and
+# uploads them as an artifact. Trigger manually.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: baml_language
+
+      # Mirrors the protoc setup in build-cli-release.reusable.yaml; some
+      # workspace crates generate code at build time.
+      - name: Install protoc (Windows)
+        shell: bash
+        run: |
+          PROTOC_VERSION=29.3
+          curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-win64.zip"
+          unzip -q protoc-${PROTOC_VERSION}-win64.zip -d $HOME/.local
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          rm protoc-${PROTOC_VERSION}-win64.zip
+
+      - name: Install protoc-gen-go (Windows)
+        shell: bash
+        run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.1
+
+      - name: Build baml + baml-cli
+        shell: bash
+        run: cargo build --release -p baml -p baml_cli --manifest-path baml_language/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baml-windows-x64
+          path: |
+            baml_language/target/release/baml.exe
+            baml_language/target/release/baml-cli.exe
+          retention-days: 30
